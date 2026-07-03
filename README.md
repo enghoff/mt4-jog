@@ -30,6 +30,7 @@ python jog_keyboard.py --port COM6
 | W/S | J2 shoulder |
 | E/D | J3 elbow |
 | R/F | J4 wrist |
+| T/G | Gripper ramp open / closed (hold key) |
 | H | Home J1 + J2 (seek limits, pull off) |
 | SPACE | Status |
 | 0 | Stop, drivers off |
@@ -80,5 +81,7 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 | J4 wrist | A | D35 | D36 | — |
 
 Shared enable: **D40** (active low).
+
+Gripper PWM: **D7** (Timer4 OC4B). Limits and sweep run **on the MT4** (S120–S285). Client sends **`g o`** / **`g c`** on key down, **`g stop`** on release. Manual: **`g <120-285>`** or query with **`g`**.
 
 Investigation notes and disassembly artifacts are in `docs/archive/`.

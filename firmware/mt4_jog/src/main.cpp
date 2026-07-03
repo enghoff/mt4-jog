@@ -10,6 +10,8 @@
  * Jog: Timer1 @ JOG_STEP_PERIOD_US fires parallel STEP pulses on all active
  *      drive pins; Timer3 clears pulse after STEP_PULSE_US (Grbl-style).
  *   home [j1 j2]    seek I21/I20, pull off
+ *   g o | g c | g stop   gripper sweep open/close (S120–S285 on device)
+ *   g <120-285>           set S clamped to limits (manual)
  *   ? | s           status / limits
  */
 
@@ -56,7 +58,26 @@ static const uint16_t J1_HOME_CENTER_DEFAULT = 4580;
 static const uint16_t J2_HOME_PULL_DEFAULT = 1000;
 static const uint32_t HOME_SEEK_MAX = 25000;
 
+static const uint16_t GRIPPER_S_PWM_SCALE = 1000;
+static const uint16_t GRIPPER_S_OPEN = 120;
+static const uint16_t GRIPPER_S_CLOSED = 285;
+static const uint16_t GRIPPER_SWEEP_RATE = 120; // S units per second
+static const uint16_t GRIPPER_SWEEP_TICK_MS = 10;
+static const uint16_t GRIPPER_PWM_TOP = 0x447A;
+
+enum GripperSweepDir : int8_t {
+  GRIP_SWEEP_STOP = 0,
+  GRIP_SWEEP_OPEN = -1,
+  GRIP_SWEEP_CLOSE = 1,
+};
+
 static uint8_t step_pin = 0;
+static uint16_t gripper_s =
+    static_cast<uint16_t>((GRIPPER_S_OPEN + GRIPPER_S_CLOSED) / 2);
+static bool gripper_pwm_on = false;
+static int8_t gripper_sweep = GRIP_SWEEP_STOP;
+static unsigned long gripper_last_ms = 0;
+static uint32_t gripper_sweep_carry = 0;
 static uint8_t jog_pins[4];
 static uint8_t jog_pin_count = 0;
 static StepPinIO jog_pin_io[4];
@@ -70,6 +91,198 @@ static bool last_limit_valid = false;
 
 static char line_buf[48];
 static uint8_t line_len = 0;
+
+static void gripperEnablePins();
+static void gripperPwmOff();
+static void gripperPwmOn();
+
+static uint16_t gripperSToOcr(uint16_t s) {
+  if (s == 0) {
+    return 0;
+  }
+  if (s > GRIPPER_S_PWM_SCALE) {
+    s = GRIPPER_S_PWM_SCALE;
+  }
+  return static_cast<uint16_t>((uint32_t)s * GRIPPER_PWM_TOP / GRIPPER_S_PWM_SCALE);
+}
+
+static bool gripperSValid(long s) {
+  return s == 0 || (s >= GRIPPER_S_OPEN && s <= GRIPPER_S_CLOSED);
+}
+
+static uint16_t clampGripperS(uint16_t s) {
+  if (s == 0) {
+    return 0;
+  }
+  if (s < GRIPPER_S_OPEN) {
+    return GRIPPER_S_OPEN;
+  }
+  if (s > GRIPPER_S_CLOSED) {
+    return GRIPPER_S_CLOSED;
+  }
+  return s;
+}
+
+static void applyGripperPwm(uint16_t s) {
+  s = clampGripperS(s);
+  gripper_s = s;
+  gripperEnablePins();
+  gripperPwmOn();
+  OCR4B = gripperSToOcr(s);
+  gripper_pwm_on = true;
+}
+
+static void gripperPwmRelease() {
+  gripper_pwm_on = false;
+  gripperPwmOff();
+}
+
+static bool gripperAtOpen() {
+  return gripper_s <= GRIPPER_S_OPEN;
+}
+
+static bool gripperAtClosed() {
+  return gripper_s >= GRIPPER_S_CLOSED;
+}
+
+static void gripperSweepStop() {
+  gripper_sweep = GRIP_SWEEP_STOP;
+  gripper_sweep_carry = 0;
+  gripperPwmRelease();
+}
+
+static void gripperSweepStart(int8_t dir) {
+  if (dir == GRIP_SWEEP_STOP) {
+    gripperSweepStop();
+    return;
+  }
+
+  gripper_sweep_carry = 0;
+  gripper_last_ms = millis();
+
+  if (dir == GRIP_SWEEP_OPEN && gripperAtOpen()) {
+    gripper_s = GRIPPER_S_OPEN;
+    gripper_sweep = GRIP_SWEEP_STOP;
+    gripperPwmRelease();
+    return;
+  }
+  if (dir == GRIP_SWEEP_CLOSE && gripperAtClosed()) {
+    gripper_s = GRIPPER_S_CLOSED;
+    gripper_sweep = GRIP_SWEEP_STOP;
+    gripperPwmRelease();
+    return;
+  }
+
+  if (!gripper_pwm_on) {
+    applyGripperPwm(gripper_s);
+  }
+  gripper_sweep = dir;
+}
+
+static void gripperSweepTick() {
+  if (gripper_sweep == GRIP_SWEEP_STOP) {
+    return;
+  }
+
+  const unsigned long now = millis();
+  const unsigned long elapsed = now - gripper_last_ms;
+  if (elapsed < GRIPPER_SWEEP_TICK_MS) {
+    return;
+  }
+
+  const uint32_t advance =
+      static_cast<uint32_t>(GRIPPER_SWEEP_RATE) * elapsed + gripper_sweep_carry;
+  const uint16_t step = static_cast<uint16_t>(advance / 1000U);
+  gripper_sweep_carry = advance % 1000U;
+  if (step == 0) {
+    return;
+  }
+  gripper_last_ms = now;
+
+  uint16_t next = gripper_s;
+  if (gripper_sweep == GRIP_SWEEP_OPEN) {
+    if (next <= GRIPPER_S_OPEN + step) {
+      next = GRIPPER_S_OPEN;
+      gripper_s = next;
+      gripper_sweep = GRIP_SWEEP_STOP;
+      gripper_sweep_carry = 0;
+      gripperPwmRelease();
+      return;
+    }
+    next = static_cast<uint16_t>(next - step);
+  } else if (gripper_sweep == GRIP_SWEEP_CLOSE) {
+    if (next + step >= GRIPPER_S_CLOSED) {
+      next = GRIPPER_S_CLOSED;
+      gripper_s = next;
+      gripper_sweep = GRIP_SWEEP_STOP;
+      gripper_sweep_carry = 0;
+      gripperPwmRelease();
+      return;
+    }
+    next = static_cast<uint16_t>(next + step);
+  }
+
+  applyGripperPwm(next);
+}
+
+static void printGripperStatus() {
+  Serial.print(F("grip S="));
+  Serial.print(gripper_s);
+  Serial.print(F(" lim="));
+  Serial.print(GRIPPER_S_OPEN);
+  Serial.print('-');
+  Serial.print(GRIPPER_S_CLOSED);
+  Serial.print(F(" pwm="));
+  Serial.print(gripper_pwm_on ? F("on") : F("off"));
+  Serial.print(F(" sweep="));
+  if (gripper_sweep == GRIP_SWEEP_OPEN) {
+    Serial.println(F("open"));
+  } else if (gripper_sweep == GRIP_SWEEP_CLOSE) {
+    Serial.println(F("close"));
+  } else {
+    Serial.println(F("stop"));
+  }
+}
+
+static void gripperEnablePins() {
+  DDRH |= (1 << PH4);
+  DDRE |= (1 << PE3);
+  PORTE |= (1 << PE5);
+}
+
+static void gripperPwmInit() {
+  gripperEnablePins();
+  TCCR4A = 0x23;
+  TCCR4B = (TCCR4B & 0xE0) | 0x1A;
+  ICR4 = GRIPPER_PWM_TOP;
+  OCR4A = 0xFFFF;
+  OCR4B = 0;
+}
+
+static void gripperPwmOff() {
+  OCR4B = 0;
+  TCCR4A &= static_cast<uint8_t>(~0x20);
+}
+
+static void gripperPwmOn() {
+  TCCR4A |= 0x20;
+}
+
+static void setGripperS(uint16_t s) {
+  gripper_sweep = GRIP_SWEEP_STOP;
+  gripper_sweep_carry = 0;
+  if (s == 0) {
+    gripperPwmRelease();
+    return;
+  }
+  s = clampGripperS(s);
+  gripper_s = s;
+  if (gripperAtOpen() || gripperAtClosed()) {
+    gripperPwmRelease();
+    return;
+  }
+  applyGripperPwm(s);
+}
 
 static int8_t lab_index(uint8_t pin) {
   for (uint8_t i = 0; i < LAB_PIN_COUNT; ++i) {
@@ -281,6 +494,18 @@ static void print_status() {
   }
   Serial.print(F("  LIM "));
   print_limits();
+  Serial.print(F("  GRIP S="));
+  Serial.print(gripper_s);
+  Serial.print(F(" pwm="));
+  Serial.print(gripper_pwm_on ? F("on") : F("off"));
+  Serial.print(F(" sweep="));
+  if (gripper_sweep == GRIP_SWEEP_OPEN) {
+    Serial.println(F("open"));
+  } else if (gripper_sweep == GRIP_SWEEP_CLOSE) {
+    Serial.println(F("close"));
+  } else {
+    Serial.println(F("stop"));
+  }
   Serial.println(F("---------------"));
 }
 
@@ -435,6 +660,50 @@ static void handle_line(char *line) {
     print_limits();
     return;
   }
+  if (line[0] == 'g' || line[0] == 'G') {
+    const char *arg = line + 1;
+    while (*arg == ' ') {
+      ++arg;
+    }
+    if (*arg == '\0') {
+      printGripperStatus();
+      return;
+    }
+    if (!strcmp(arg, "stop") || !strcmp(arg, "0")) {
+      gripperSweepStop();
+      Serial.println(F("ok grip stop"));
+      return;
+    }
+    if (!strcmp(arg, "o") || !strcmp(arg, "open")) {
+      gripperSweepStart(GRIP_SWEEP_OPEN);
+      if (gripperAtOpen() && gripper_sweep == GRIP_SWEEP_STOP) {
+        Serial.println(F("ok grip at open"));
+      } else {
+        Serial.println(F("ok grip open"));
+      }
+      return;
+    }
+    if (!strcmp(arg, "c") || !strcmp(arg, "close")) {
+      gripperSweepStart(GRIP_SWEEP_CLOSE);
+      if (gripperAtClosed() && gripper_sweep == GRIP_SWEEP_STOP) {
+        Serial.println(F("ok grip at closed"));
+      } else {
+        Serial.println(F("ok grip close"));
+      }
+      return;
+    }
+    long v = atol(arg);
+    if (!gripperSValid(v)) {
+      Serial.print(F("err grip stop|o|c|"));
+      Serial.print(GRIPPER_S_OPEN);
+      Serial.print('-');
+      Serial.println(GRIPPER_S_CLOSED);
+      return;
+    }
+    setGripperS(static_cast<uint16_t>(v));
+    Serial.println(F("ok grip"));
+    return;
+  }
   if (!strcmp(line, "home") || !strcmp(line, "$H")) {
     do_home(J1_HOME_CENTER_DEFAULT, J2_HOME_PULL_DEFAULT);
     return;
@@ -585,6 +854,7 @@ void setup() {
   drivers_enabled = false;
   step_pin = 0;
   jog_timers_init();
+  gripperPwmInit();
 
   Serial.begin(115200);
   delay(400);
@@ -609,4 +879,5 @@ void loop() {
     }
   }
   poll_limits();
+  gripperSweepTick();
 }

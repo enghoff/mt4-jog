@@ -10,6 +10,8 @@ import time
 from mt4_jog.joints import (
     DEFAULT_BAUD,
     DEFAULT_PORT,
+    GRIPPER_S_CLOSED,
+    GRIPPER_S_OPEN,
     J1_HOME_CENTER_STEPS,
     J2_HOME_PULLOFF_STEPS,
     KEYBOARD_JOINTS,
@@ -45,6 +47,8 @@ VK = {
     "space": 0x20,
     "0": 0x30,
     "h": 0x48,
+    "t": 0x54,
+    "g": 0x47,
 }
 
 
@@ -59,6 +63,10 @@ def print_help() -> None:
         )
     print()
     print("  H       home J1 + J2 (on-device)")
+    print(
+        f"  T / G   gripper sweep open / close "
+        f"(S{GRIPPER_S_OPEN}–S{GRIPPER_S_CLOSED} on MT4; release = stop)"
+    )
     print("  SPACE   status")
     print("  0       stop, drivers off")
     print("  ESC     quit")
@@ -151,6 +159,42 @@ def run_home(ser, buf: list[str], j1: int, j2: int, verbose: bool) -> None:
     print("Homing timed out.", file=sys.stderr)
 
 
+def gripper_sweep_open(ser) -> None:
+    send_quick(ser, "g o")
+
+
+def gripper_sweep_close(ser) -> None:
+    send_quick(ser, "g c")
+
+
+def gripper_sweep_stop(ser) -> None:
+    send_quick(ser, "g stop")
+
+
+def gripper_key_state() -> str | None:
+    """Return 'open', 'close', or None when T/G not held (or both held)."""
+    t = key_down("t")
+    g = key_down("g")
+    if t and not g:
+        return "open"
+    if g and not t:
+        return "close"
+    return None
+
+
+def sync_gripper_state(ser, state: str | None, prev: str | None) -> str | None:
+    """Send one sweep command when T/G state changes."""
+    if state == prev:
+        return prev
+    if state == "open":
+        gripper_sweep_open(ser)
+    elif state == "close":
+        gripper_sweep_close(ser)
+    else:
+        gripper_sweep_stop(ser)
+    return state
+
+
 def pressed_jog_keys() -> set[str]:
     chosen: set[str] = set()
     for idx in range(len(KEYBOARD_JOINTS)):
@@ -185,6 +229,7 @@ def main() -> int:
     poll_s = args.poll_ms / 1000.0
     buf: list[str] = [""]
     active_keys: set[str] = set()
+    grip_state: str | None = None
 
     with open_serial(args.port, args.baud) as ser:
         time.sleep(1.0)
@@ -205,6 +250,7 @@ def main() -> int:
                 if key_down("space"):
                     stop_jog(ser)
                     active_keys.clear()
+                    grip_state = sync_gripper_state(ser, None, grip_state)
                     for line in send(ser, "?", wait=1.0):
                         print(line)
                     while key_down("space"):
@@ -214,6 +260,7 @@ def main() -> int:
                 if key_down("0"):
                     stop_jog(ser)
                     active_keys.clear()
+                    grip_state = sync_gripper_state(ser, None, grip_state)
                     send(ser, "e0", wait=0.2)
                     send(ser, "all f", wait=0.3)
                     while key_down("0"):
@@ -223,6 +270,7 @@ def main() -> int:
                 if key_down("h"):
                     stop_jog(ser)
                     active_keys.clear()
+                    grip_state = sync_gripper_state(ser, None, grip_state)
                     run_home(ser, buf, args.j1_center, args.j2_pull, args.verbose)
                     while key_down("h"):
                         time.sleep(poll_s)
@@ -233,11 +281,14 @@ def main() -> int:
                     sync_jog(ser, desired_keys)
                     active_keys = desired_keys
 
+                grip_state = sync_gripper_state(ser, gripper_key_state(), grip_state)
+
                 time.sleep(poll_s)
         except KeyboardInterrupt:
             print()
         finally:
             stop_jog(ser)
+            gripper_sweep_stop(ser)
             send(ser, "e0", wait=0.2)
             send(ser, "all f", wait=0.3)
 
