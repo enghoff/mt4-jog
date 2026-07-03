@@ -34,10 +34,8 @@ JOINTS: tuple[Joint, ...] = (
 
 JOINT_BY_GCODE: dict[str, Joint] = {j.gcode: j for j in JOINTS}
 
-# Keyboard layout: Q/A=Y, W/S=Z, E/D=X, R/F=A
-KEYBOARD_JOINTS: tuple[Joint, ...] = tuple(
-    JOINT_BY_GCODE[g] for g in ("Y", "Z", "X", "A")
-)
+# Keyboard layout (left to right): Q/A=J1, W/S=J2, E/D=J3, R/F=J4
+KEYBOARD_JOINTS: tuple[Joint, ...] = JOINTS
 
 LIMIT_JOINTS: dict[str, str] = {
     f"I{j.limit_pin}": j.label for j in JOINTS if j.limit_pin is not None

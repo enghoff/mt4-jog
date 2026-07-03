@@ -26,9 +26,9 @@ python jog_keyboard.py --port COM6
 
 | Key | Action |
 |-----|--------|
-| Q/A | J2 shoulder |
-| W/S | J3 elbow |
-| E/D | J1 base |
+| Q/A | J1 base |
+| W/S | J2 shoulder |
+| E/D | J3 elbow |
 | R/F | J4 wrist |
 | H | Home J1 + J2 (seek limits, pull off) |
 | SPACE | Status |
