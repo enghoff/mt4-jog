@@ -1,0 +1,46 @@
+{
+  "device": "WLKATA MT4 extender box",
+  "mcu": "ESP32-WROOM-32E",
+  "tag": "2026-07-03",
+  "port": "COM6",
+  "baud": 921600,
+  "flash_size_bytes": 4194304,
+  "flash_file": "extender_esp32_flash_2026-07-03.bin",
+  "flash_sha256": "72253e79d9cd801255d05b47d7186a9664a6763f4ca81e9f86e3f0148be1cae5",
+  "efuse_summary": "extender_esp32_efuse_2026-07-03.txt",
+  "chip": {
+    "type": "ESP32-D0WD-V3",
+    "revision": "v3.1",
+    "crystal_mhz": 40,
+    "mac": "d4:8c:49:a8:e3:d4"
+  },
+  "flash_chip": {
+    "manufacturer": "0x5e",
+    "device": "0x4016",
+    "size_mb": 4,
+    "voltage": "3.3V"
+  },
+  "partitions": [
+    {"label": "nvs", "offset": "0x9000", "size": "0x5000"},
+    {"label": "otadata", "offset": "0xE000", "size": "0x2000"},
+    {"label": "app0", "offset": "0x10000", "size": "0x300000"},
+    {"label": "spiffs", "offset": "0x310000", "size": "0xE0000"},
+    {"label": "coredump", "offset": "0x3F0000", "size": "0x10000"}
+  ],
+  "firmware_notes": [
+    "Arduino ESP32 core 2.0.6 (build paths in binary)",
+    "Features visible in strings: RS485, BLE 4.0, Wi-Fi, SPIFFS, M20/M21 coordinate modes",
+    "SPIFFS contains /red.gcode, /green.gcode, /blue.gcode"
+  ],
+  "security": {
+    "flash_encryption": false,
+    "secure_boot": false,
+    "uart_download_disabled": false
+  },
+  "restore_command": "python restore_extender.py --port COM6 --bin backups/extender/extender_esp32_flash_2026-07-03.bin --manifest backups/extender/extender_esp32_manifest_2026-07-03.json --erase-all --yes",
+  "notes": [
+    "Full raw flash image includes bootloader, partition table, app, SPIFFS, and NVS.",
+    "eFuses are chip-specific and are not rewritten by restore_extender.py.",
+    "UART download mode must be available (CH340 DTR/RTS auto-reset, or hold BOOT + tap RESET)."
+  ]
+}

@@ -1,0 +1,14 @@
+﻿python : 
+At C:\Users\enghoff\AppData\Local\Temp\ps-script-be5ae190-0d9a-4386-b295-32843442f305.ps1:84 char:134
++ ... 07-03.txt"; python -m espefuse --port COM6 dump --format json 2>&1 |  ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+A fatal error occurred: Could not open COM6, the port is busy or doesn't exist.
+(could not open port 'COM6': PermissionError(13, 'Access is denied.', None, 5))
+
+Hint: Check if the port is not used by another task
+
+espefuse v5.3.1
+Please make sure you specified the right port with --port.
