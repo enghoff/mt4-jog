@@ -17,11 +17,20 @@ CENCER_HEIGHT = 140.0  # shoulder pivot height
 HEAD_OFFSET = 35.0  # wrist pivot -> TCP, horizontal (head stays level)
 HEAD_HEIGHT = 14.43  # TCP below wrist pivot
 
-# Model angles at the homed pose (firmware step counters = 0): upper arm
-# vertical, forearm horizontal — factory firmware reports TCP (230, 0, 255.57).
+# Model angles at the homed pose (firmware step counters = 0). Measured
+# directly 2026-07-06 (J2-J4 straight-line distance 184mm + J4 height above
+# base 279mm, solved via the two-link geometry above and cross-checked
+# against a direct measurement of J2's pivot height, 140mm = CENCER_HEIGHT
+# exactly) -- NOT the upper-arm-vertical/forearm-horizontal (0, 90, 0) pose
+# previously assumed. That assumption was only ever self-consistency-checked
+# against the factory-reported home TCP (230, 0, 255.57), which reflects the
+# *factory* firmware's own homing pull-off distances, not this custom
+# firmware's (mt4_jog/joints.py J1_HOME_CENTER_STEPS / J2_HOME_PULLOFF_STEPS)
+# -- there's no reason the two should reach the same physical pose, and they
+# don't: FK at (103, 4.7) reports TCP (200.2, 0, 264.6).
 HOME_J1_DEG = 0.0
-HOME_J2_DEG = 90.0
-HOME_J3_DEG = 0.0
+HOME_J2_DEG = 103.0
+HOME_J3_DEG = 4.7
 HOME_J4_DEG = 0.0
 
 # All four measured 2026-07-06 (J2-J4 with a phone clinometer against the

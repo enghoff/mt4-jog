@@ -57,9 +57,13 @@ of `firmware/mt4_jog/src/main.cpp`.
 
 Kinematic model: the MT4 is a parallel-link (palletizing) arm — J2 sets the upper-arm
 absolute angle, J3 sets the forearm absolute angle through the link rods (independent of
-J2), and the head platform stays level. At the homed pose (upper arm vertical, forearm
-horizontal) the model reproduces the factory-reported TCP **(230.000, 0, 255.570)** exactly
-from the EEPROM geometry (L1 130, L2 150, base 45/140, head 35/14.43).
+J2), and the head platform stays level, using EEPROM link/offset geometry (L1 130, L2 150,
+base 45/140, head 35/14.43). The homed pose (step counters = 0) is **q2 = 103°, q3 =
+4.7°** — measured directly (J2-J4 straight-line distance + J4 height above the base), not
+the upper-arm-vertical/forearm-horizontal (90°, 0°) previously assumed. This custom
+firmware's homing pull-off distances don't reach the same physical pose the factory
+firmware's own homing does, so the model no longer matches the factory-reported home TCP
+(230, 0, 255.57) — it reports (200.2, 0, 264.6) instead.
 
 Per-joint calibration (`MT4_STEPS_PER_DEG` / `J_STEP_SIGN`, duplicated in
 `firmware/mt4_jog/src/kinematics.{h,cpp}`, `mt4_jog/joints.py`, and

@@ -9,8 +9,8 @@
  *    does NOT rotate when J2 moves.
  *  - The head platform stays level: HEAD_OFFSET is horizontal (radially out),
  *    HEAD_HEIGHT drops the TCP below the wrist pivot.
- * Home pose q = (0, 90, 0): upper arm vertical, forearm horizontal — matches
- * the factory-reported TCP (230.000, 0, 255.570) exactly.
+ * Home pose q = (0, 103, 4.7): measured directly (see kinematics.h), not the
+ * upper-arm-vertical/forearm-horizontal (0, 90, 0) previously assumed.
  */
 static const float LINKAGE1 = 130.0f;      /* shoulder -> elbow */
 static const float LINKAGE2 = 150.0f;      /* elbow -> wrist pivot */
