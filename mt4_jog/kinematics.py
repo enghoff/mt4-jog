@@ -143,12 +143,20 @@ def cartesian_step_rates(
         return None
 
     steps = [J_STEP_SIGN[i] * rates[i] * STEPS_PER_DEG[i] for i in range(4)]
-    peak = max(abs(s) for s in steps)
+
+    # Peak/master-scale is based on the POSITION joints (J1-J3) only. J4's
+    # wrist-unwind is a small angular correction, but its steps/deg (852) is
+    # ~19x J1's (44), so including it in the peak lets a modest orientation
+    # hold dominate the DDA timing budget and throttle the primary motion.
+    # J4 is scaled the same as the position joints and clamped to the
+    # achievable +/-1-step-per-tick range (best effort).
+    peak = max(abs(s) for s in steps[:3])
     if peak < 1e-9:
         return None
 
     scale = master_scale / peak
     ints = [int(round(s * scale)) for s in steps]
+    ints[3] = max(-master_scale, min(master_scale, ints[3]))
     return ints[0], ints[1], ints[2], ints[3], master_scale
 
 

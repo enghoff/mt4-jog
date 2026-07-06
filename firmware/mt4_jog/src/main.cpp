@@ -1,14 +1,32 @@
 /*
- * MT4 jog firmware — 4-axis step/dir jog + J1/J2 limit homing.
+ * MT4 jog firmware — 4-axis step/dir jog + J1/J2 limit homing + Cartesian jog.
  * Serial @ 115200 (host: DTR/RTS off).
  *
- * Commands used by jog_keyboard.py:
+ * Joint jog (legacy):
  *   all f | e0 | e1
  *   d<pin> f|l|h    direction / float
  *   x<pin> | x+<pin> | x-<pin> | xc   step pin(s) for jog
- *   j | stop          start/stop Timer1 jog ISR
- * Jog: Timer1 @ JOG_STEP_PERIOD_US fires parallel STEP pulses on all active
- *      drive pins; Timer3 clears pulse after STEP_PULSE_US (Grbl-style).
+ *   j | stop          start/stop Timer1 jog ISR (equal step rate on active axes)
+ *
+ * Cartesian jog:
+ *   cj +x|-x|+y|-y|+z|-z   world-frame TCP jog (multi-axis DDA on device)
+ *   cj <dx> <dy> <dz>      direction vector (integer components, normalized)
+ *   orient on|off|<gain>   J4 wrist unwind when J1 moves (default on, gain 0.82)
+ *   pos                      print joint step counters (since last home)
+ *   setpos <j1> <j2> <j3> <j4>
+ *       Directly overwrite the joint step counters (no motion) -- for
+ *       correcting drift after an external reference (e.g. a soft-contact
+ *       seek on an unreferenced joint like J3, which has no limit switch).
+ *
+ * Relative move (bounded, coordinated):
+ *   m <dj1> <dj2> <dj3> <dj4> [dg]
+ *       Move each joint by the signed number of steps relative to the current
+ *       position (multi-axis DDA, proportional rates, all joints finish
+ *       together) and sweep the gripper by dg S-units relative to its current
+ *       S (clamped to S120-285). Replies "ok m" on accept, then an async
+ *       "m done pos ..." line when the joint motion completes. Drivers are
+ *       left ENABLED (holding) after the move.
+ *
  *   home [j1 j2]    widen J2/J3 off their min-angle extremes, home J1 (seek
  *                     I21, return to center), seek J2 to its raw I20
  *                     trigger, drive J3 into interference with J2 until I20
@@ -23,6 +41,9 @@
 #include <Arduino.h>
 #include <avr/io.h>
 #include <avr/interrupt.h>
+#include <math.h>
+
+#include "kinematics.h"
 
 struct StepPinIO {
   volatile uint8_t *port;
@@ -31,7 +52,10 @@ struct StepPinIO {
 
 enum PinModeSetting : uint8_t { PIN_FLOAT = 0, PIN_LOW = 1, PIN_HIGH = 2 };
 
-static const uint16_t TIMER_TICK_US = 1; // Timer1/3 prescaler 8 @ 16 MHz
+// Timer1/3 run at 16 MHz / prescaler 8 = 2 MHz, i.e. 2 ticks per us. The
+// previous TIMER_TICK_US = 1 assumption made every jog step at DOUBLE the
+// intended rate, costing stepper torque exactly where the arm is weakest.
+static const uint16_t TIMER_TICKS_PER_US = 2;
 
 static const uint8_t LAB_PINS[] = {
     22, 23, 24, 25, 26, 27, 28, 29,
@@ -45,7 +69,10 @@ static const uint8_t LIMIT_PINS[] = {20, 21};
 static const uint8_t LIMIT_PIN_COUNT = 2;
 
 static const uint16_t STEP_PULSE_US = 10;
-static const uint16_t JOG_STEP_PERIOD_US = 1067; // 75% of 800 µs full jog rate
+static const uint16_t JOG_STEP_PERIOD_US = 1524; // 70% of prior 1067 µs tick rate
+static const uint16_t CJ_REFRESH_MS = 40;
+/* J4 is 852 steps/deg, so generous; ~2 full sweeps of any joint. */
+static const long MOVE_MAX_STEPS = 100000L;
 static const uint16_t HOME_STEP_PERIOD_US = 800;
 static const uint16_t ENABLE_SETTLE_MS = 5;
 static const bool ENABLE_ACTIVE_LOW = true;
@@ -59,6 +86,14 @@ static const uint8_t J2_DIR = 24;
 static const uint8_t J2_LIMIT = 20;
 static const uint8_t J3_DRIVE = 27;
 static const uint8_t J3_DIR = 26;
+static const uint8_t J4_DRIVE = 35;
+static const uint8_t J4_DIR = 36;
+static const uint8_t J_DRIVE[MT4_NUM_JOINTS] = {J1_DRIVE, J2_DRIVE, J3_DRIVE,
+                                                J4_DRIVE};
+static const uint8_t J_DIR_PIN[MT4_NUM_JOINTS] = {J1_DIR, J2_DIR, J3_DIR,
+                                                  J4_DIR};
+static const bool J_DIR_POS_HIGH[MT4_NUM_JOINTS] = {false, false, false,
+                                                    false};
 static const bool J1_HOME_DIR_HIGH = true;
 static const bool J2_HOME_DIR_HIGH = true;
 // J3 has no limit switch of its own. This is the direction that drives it
@@ -93,9 +128,32 @@ static bool gripper_pwm_on = false;
 static int8_t gripper_sweep = GRIP_SWEEP_STOP;
 static unsigned long gripper_last_ms = 0;
 static uint32_t gripper_sweep_carry = 0;
-static uint8_t jog_pins[4];
-static uint8_t jog_pin_count = 0;
-static StepPinIO jog_pin_io[4];
+/* Target-bounded sweep (`m` command's dg): sweep stops at gripper_target
+ * instead of the full open/closed endpoint, PWM left on to hold position. */
+static uint16_t gripper_target = 0;
+static bool gripper_target_active = false;
+
+static volatile int32_t joint_steps[MT4_NUM_JOINTS];
+static bool cart_orient_hold = true;
+static float cart_orient_gain = MT4_ORIENT_GAIN_DEFAULT;
+static bool cart_jog_mode = false;
+static Vec3 cart_dir_active = {0.0f, 0.0f, 0.0f};
+static bool cart_dir_active_valid = false;
+static unsigned long cart_refresh_ms = 0;
+
+static volatile uint8_t dda_axis_mask = 0;
+static volatile int32_t dda_master = MT4_CJ_MASTER;
+static volatile int32_t dda_delta[MT4_NUM_JOINTS];
+static volatile int32_t dda_accum[MT4_NUM_JOINTS];
+static StepPinIO dda_pin_io[MT4_NUM_JOINTS];
+
+/* Bounded relative move (`m` command): per-joint steps left; ISR clears an
+ * axis from the DDA mask when its count hits zero and raises done_pending
+ * for the main loop to finalize + report. */
+static volatile bool move_mode = false;
+static volatile bool move_done_pending = false;
+static volatile int32_t move_remaining[MT4_NUM_JOINTS];
+
 static volatile bool jog_active = false;
 static volatile bool homing_active = false;
 static volatile bool step_pulse_high = false;
@@ -104,12 +162,13 @@ static PinModeSetting pin_mode[LAB_PIN_COUNT];
 static int8_t last_limit_raw[2];
 static bool last_limit_valid = false;
 
-static char line_buf[48];
+static char line_buf[64];
 static uint8_t line_len = 0;
 
 static void gripperEnablePins();
 static void gripperPwmOff();
 static void gripperPwmOn();
+static void set_dir(uint8_t dir_pin, bool high);
 
 static uint16_t gripperSToOcr(uint16_t s) {
   if (s == 0) {
@@ -167,6 +226,7 @@ static void gripperSweepStop() {
 }
 
 static void gripperSweepStart(int8_t dir) {
+  gripper_target_active = false;
   if (dir == GRIP_SWEEP_STOP) {
     gripperSweepStop();
     return;
@@ -194,6 +254,27 @@ static void gripperSweepStart(int8_t dir) {
   gripper_sweep = dir;
 }
 
+/* Sweep to an absolute S target (clamped) and hold there with PWM on. */
+static void gripperSweepToS(long target) {
+  if (target < GRIPPER_S_OPEN) {
+    target = GRIPPER_S_OPEN;
+  } else if (target > GRIPPER_S_CLOSED) {
+    target = GRIPPER_S_CLOSED;
+  }
+  const uint16_t t = static_cast<uint16_t>(target);
+  if (t == gripper_s) {
+    return;
+  }
+  gripper_sweep_carry = 0;
+  gripper_last_ms = millis();
+  gripper_target = t;
+  gripper_target_active = true;
+  if (!gripper_pwm_on) {
+    applyGripperPwm(gripper_s);
+  }
+  gripper_sweep = (t > gripper_s) ? GRIP_SWEEP_CLOSE : GRIP_SWEEP_OPEN;
+}
+
 static void gripperSweepTick() {
   if (gripper_sweep == GRIP_SWEEP_STOP) {
     return;
@@ -216,22 +297,35 @@ static void gripperSweepTick() {
 
   uint16_t next = gripper_s;
   if (gripper_sweep == GRIP_SWEEP_OPEN) {
-    if (next <= GRIPPER_S_OPEN + step) {
-      next = GRIPPER_S_OPEN;
-      gripper_s = next;
+    const uint16_t bound =
+        gripper_target_active ? gripper_target : GRIPPER_S_OPEN;
+    if (next <= bound + step) {
+      gripper_s = bound;
       gripper_sweep = GRIP_SWEEP_STOP;
       gripper_sweep_carry = 0;
-      gripperPwmRelease();
+      if (gripper_target_active) {
+        /* positioned move: hold at target with PWM on */
+        gripper_target_active = false;
+        applyGripperPwm(bound);
+      } else {
+        gripperPwmRelease();
+      }
       return;
     }
     next = static_cast<uint16_t>(next - step);
   } else if (gripper_sweep == GRIP_SWEEP_CLOSE) {
-    if (next + step >= GRIPPER_S_CLOSED) {
-      next = GRIPPER_S_CLOSED;
-      gripper_s = next;
+    const uint16_t bound =
+        gripper_target_active ? gripper_target : GRIPPER_S_CLOSED;
+    if (next + step >= bound) {
+      gripper_s = bound;
       gripper_sweep = GRIP_SWEEP_STOP;
       gripper_sweep_carry = 0;
-      gripperPwmRelease();
+      if (gripper_target_active) {
+        gripper_target_active = false;
+        applyGripperPwm(bound);
+      } else {
+        gripperPwmRelease();
+      }
       return;
     }
     next = static_cast<uint16_t>(next + step);
@@ -374,38 +468,173 @@ static void print_limits() {
   Serial.println(digitalRead(21));
 }
 
-static void clear_jog_pins() {
-  jog_pin_count = 0;
-  step_pin = 0;
+static int8_t drive_to_joint(uint8_t drive) {
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    if (J_DRIVE[i] == drive) {
+      return static_cast<int8_t>(i);
+    }
+  }
+  return -1;
 }
 
-static void refresh_jog_pin_io() {
-  for (uint8_t i = 0; i < jog_pin_count; ++i) {
-    const uint8_t pin = jog_pins[i];
-    jog_pin_io[i].port = portOutputRegister(digitalPinToPort(pin));
-    jog_pin_io[i].mask = digitalPinToBitMask(pin);
+static JointAnglesDeg angles_from_steps() {
+  JointAnglesDeg q;
+  q.j1 = MT4_HOME_J1_DEG + MT4_J1_STEP_SIGN *
+                               static_cast<float>(joint_steps[0]) /
+                               MT4_STEPS_PER_DEG[0];
+  q.j2 = MT4_HOME_J2_DEG + MT4_J2_STEP_SIGN *
+                               static_cast<float>(joint_steps[1]) /
+                               MT4_STEPS_PER_DEG[1];
+  q.j3 = MT4_HOME_J3_DEG + MT4_J3_STEP_SIGN *
+                               static_cast<float>(joint_steps[2]) /
+                               MT4_STEPS_PER_DEG[2];
+  q.j4 = MT4_HOME_J4_DEG + MT4_J4_STEP_SIGN *
+                               static_cast<float>(joint_steps[3]) /
+                               MT4_STEPS_PER_DEG[3];
+  return q;
+}
+
+static void reset_joint_steps() {
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    joint_steps[i] = 0;
+    dda_accum[i] = 0;
+    dda_delta[i] = 0;
+  }
+  dda_axis_mask = 0;
+  cart_jog_mode = false;
+  cart_dir_active_valid = false;
+}
+
+static void set_joint_dir(uint8_t joint, bool positive) {
+  const bool high = positive ? J_DIR_POS_HIGH[joint] : !J_DIR_POS_HIGH[joint];
+  set_dir(J_DIR_PIN[joint], high);
+}
+
+static void clear_jog_axes() {
+  dda_axis_mask = 0;
+  cart_jog_mode = false;
+  move_mode = false;
+  move_done_pending = false;
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    dda_delta[i] = 0;
+    dda_accum[i] = 0;
+    move_remaining[i] = 0;
+  }
+}
+
+static void refresh_dda_pin_io() {
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    if (!(dda_axis_mask & (1 << i))) {
+      continue;
+    }
+    const uint8_t pin = J_DRIVE[i];
+    dda_pin_io[i].port = portOutputRegister(digitalPinToPort(pin));
+    dda_pin_io[i].mask = digitalPinToBitMask(pin);
     pinMode(pin, OUTPUT);
-    *jog_pin_io[i].port &= ~jog_pin_io[i].mask;
+    *dda_pin_io[i].port &= ~dda_pin_io[i].mask;
   }
 }
 
 static void jog_pulse_low_all() {
-  for (uint8_t i = 0; i < jog_pin_count; ++i) {
-    *jog_pin_io[i].port &= ~jog_pin_io[i].mask;
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    if (dda_axis_mask & (1 << i)) {
+      *dda_pin_io[i].port &= ~dda_pin_io[i].mask;
+    }
   }
   step_pulse_high = false;
+}
+
+static bool add_jog_axis(uint8_t joint) {
+  if (joint >= MT4_NUM_JOINTS) {
+    return false;
+  }
+  dda_axis_mask |= static_cast<uint8_t>(1 << joint);
+  dda_delta[joint] = dda_master;
+  dda_accum[joint] = 0;
+  step_pin = J_DRIVE[joint];
+  return true;
+}
+
+static bool remove_jog_axis(uint8_t joint) {
+  if (joint >= MT4_NUM_JOINTS) {
+    return false;
+  }
+  if (!(dda_axis_mask & (1 << joint))) {
+    return false;
+  }
+  dda_axis_mask &= static_cast<uint8_t>(~(1 << joint));
+  dda_delta[joint] = 0;
+  dda_accum[joint] = 0;
+  step_pin = 0;
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    if (dda_axis_mask & (1 << i)) {
+      step_pin = J_DRIVE[i];
+      break;
+    }
+  }
+  return true;
+}
+
+static bool setup_cartesian_jog(const Vec3 *dir) {
+  const JointAnglesDeg q = angles_from_steps();
+  CartesianRates rates;
+  if (!mt4_cartesian_rates(&q, dir, cart_orient_hold, cart_orient_gain,
+                           &rates)) {
+    return false;
+  }
+
+  clear_jog_axes();
+  cart_jog_mode = true;
+  dda_master = rates.master;
+
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    int32_t delta = 0;
+    switch (i) {
+    case 0:
+      delta = rates.j1;
+      break;
+    case 1:
+      delta = rates.j2;
+      break;
+    case 2:
+      delta = rates.j3;
+      break;
+    case 3:
+      delta = rates.j4;
+      break;
+    }
+    if (delta == 0) {
+      continue;
+    }
+    set_joint_dir(i, delta > 0);
+    dda_delta[i] = delta > 0 ? delta : -delta;
+    dda_accum[i] = 0;
+    dda_axis_mask |= static_cast<uint8_t>(1 << i);
+  }
+  return dda_axis_mask != 0;
+}
+
+static void print_joint_pos() {
+  Serial.print(F("pos J1="));
+  Serial.print(joint_steps[0]);
+  Serial.print(F(" J2="));
+  Serial.print(joint_steps[1]);
+  Serial.print(F(" J3="));
+  Serial.print(joint_steps[2]);
+  Serial.print(F(" J4="));
+  Serial.println(joint_steps[3]);
 }
 
 static void jog_timers_init() {
   TCCR1A = 0;
   TCCR1B = 0;
   TCNT1 = 0;
-  OCR1A = static_cast<uint16_t>(JOG_STEP_PERIOD_US / TIMER_TICK_US - 1);
+  OCR1A = static_cast<uint16_t>(JOG_STEP_PERIOD_US * TIMER_TICKS_PER_US - 1);
 
   TCCR3A = 0;
   TCCR3B = 0;
   TCNT3 = 0;
-  OCR3A = static_cast<uint16_t>(STEP_PULSE_US / TIMER_TICK_US - 1);
+  OCR3A = static_cast<uint16_t>(STEP_PULSE_US * TIMER_TICKS_PER_US - 1);
 }
 
 static void jog_timer_stop() {
@@ -419,7 +648,7 @@ static void jog_timer_stop() {
 }
 
 static void jog_timer_start() {
-  refresh_jog_pin_io();
+  refresh_dda_pin_io();
   cli();
   TIMSK1 = 0;
   TCCR1B = 0;
@@ -434,12 +663,46 @@ static void jog_timer_start() {
 }
 
 ISR(TIMER1_COMPA_vect) {
-  if (!jog_active || homing_active || jog_pin_count == 0 || step_pulse_high) {
+  if (!jog_active || homing_active || dda_axis_mask == 0 || step_pulse_high) {
     return;
   }
-  for (uint8_t i = 0; i < jog_pin_count; ++i) {
-    *jog_pin_io[i].port |= jog_pin_io[i].mask;
+
+  uint8_t step_mask = 0;
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    if (!(dda_axis_mask & (1 << i))) {
+      continue;
+    }
+    const int32_t mag = dda_delta[i];
+    if (mag <= 0) {
+      continue;
+    }
+    dda_accum[i] += mag;
+    if (dda_accum[i] >= dda_master) {
+      dda_accum[i] -= dda_master;
+      step_mask |= static_cast<uint8_t>(1 << i);
+    }
   }
+  if (step_mask == 0) {
+    return;
+  }
+
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    if (!(step_mask & (1 << i))) {
+      continue;
+    }
+    *dda_pin_io[i].port |= dda_pin_io[i].mask;
+    const bool high = digitalRead(J_DIR_PIN[i]) == HIGH;
+    const bool positive = high == J_DIR_POS_HIGH[i];
+    joint_steps[i] += positive ? 1 : -1;
+    if (move_mode && move_remaining[i] > 0 && --move_remaining[i] == 0) {
+      dda_axis_mask &= static_cast<uint8_t>(~(1 << i));
+      dda_delta[i] = 0;
+    }
+  }
+  if (move_mode && dda_axis_mask == 0) {
+    move_done_pending = true;
+  }
+
   step_pulse_high = true;
   TCNT3 = 0;
   TCCR3A = 0;
@@ -454,49 +717,49 @@ ISR(TIMER3_COMPA_vect) {
 }
 
 static bool add_jog_pin(uint8_t pin) {
-  for (uint8_t i = 0; i < jog_pin_count; ++i) {
-    if (jog_pins[i] == pin) {
-      return true;
-    }
-  }
-  if (jog_pin_count >= sizeof(jog_pins)) {
+  const int8_t joint = drive_to_joint(pin);
+  if (joint < 0) {
     return false;
   }
-  jog_pins[jog_pin_count++] = pin;
-  step_pin = jog_pins[0];
-  return true;
+  if (dda_axis_mask == 0) {
+    cart_jog_mode = false;
+    dda_master = MT4_CJ_MASTER;
+  }
+  return add_jog_axis(static_cast<uint8_t>(joint));
 }
 
 static bool remove_jog_pin(uint8_t pin) {
-  for (uint8_t i = 0; i < jog_pin_count; ++i) {
-    if (jog_pins[i] != pin) {
-      continue;
-    }
-    for (uint8_t j = i + 1; j < jog_pin_count; ++j) {
-      jog_pins[j - 1] = jog_pins[j];
-    }
-    --jog_pin_count;
-    step_pin = jog_pin_count > 0 ? jog_pins[0] : 0;
-    return true;
+  const int8_t joint = drive_to_joint(pin);
+  if (joint < 0) {
+    return false;
   }
-  return false;
+  return remove_jog_axis(static_cast<uint8_t>(joint));
 }
 
 static void print_status() {
   Serial.println(F("--- MT4 jog ---"));
+  Serial.print(F("MODE="));
+  Serial.print(cart_jog_mode ? F("cart") : F("joint"));
+  Serial.print(F("  ORIENT="));
+  Serial.print(cart_orient_hold ? F("hold") : F("free"));
+  Serial.print(F(" gain="));
+  Serial.println(cart_orient_gain, 3);
+  print_joint_pos();
   Serial.print(F("STEP="));
-  if (jog_pin_count == 0) {
+  if (dda_axis_mask == 0) {
     Serial.println(F("none"));
-  } else if (jog_pin_count == 1) {
-    Serial.print(F("D"));
-    Serial.println(jog_pins[0]);
   } else {
-    for (uint8_t i = 0; i < jog_pin_count; ++i) {
-      if (i > 0) {
+    bool first = true;
+    for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+      if (!(dda_axis_mask & (1 << i))) {
+        continue;
+      }
+      if (!first) {
         Serial.print('+');
       }
       Serial.print(F("D"));
-      Serial.print(jog_pins[i]);
+      Serial.print(J_DRIVE[i]);
+      first = false;
     }
     Serial.println();
   }
@@ -504,7 +767,7 @@ static void print_status() {
   Serial.print(drivers_enabled ? F("on") : F("off"));
   Serial.print(F("  JOG="));
   Serial.print(jog_active ? F("on") : F("off"));
-  if (jog_active && jog_pin_count > 0) {
+  if (jog_active && dda_axis_mask != 0) {
     Serial.print(F(" T1"));
   }
   Serial.print(F("  LIM "));
@@ -664,6 +927,7 @@ static void do_home(uint16_t j1_center, uint16_t j2_pull) {
   stop_jog();
   step_pin = 0;
   homing_active = false;
+  reset_joint_steps();
   Serial.println(F("home ok"));
 }
 
@@ -697,6 +961,165 @@ static bool parse_pin(const char *token, uint8_t *out) {
   return true;
 }
 
+static void normalize_vec3(Vec3 *v) {
+  const float n =
+      sqrtf(v->x * v->x + v->y * v->y + v->z * v->z);
+  if (n < 1e-6f) {
+    return;
+  }
+  v->x /= n;
+  v->y /= n;
+  v->z /= n;
+}
+
+static bool parse_cj_vec(const char *arg, Vec3 *out) {
+  while (*arg == ' ') {
+    ++arg;
+  }
+  if (*arg == '\0') {
+    return false;
+  }
+
+  // Single-axis shorthand: an optional sign followed by x/y/z (e.g. "-x").
+  // Peek at a separate cursor so a leading '-' on the general signed-triple
+  // form below (e.g. "-1 0 0") is NOT consumed here.
+  int sign = 1;
+  const char *p = arg;
+  if (*p == '+' || *p == '-') {
+    sign = (*p == '-') ? -1 : 1;
+    ++p;
+  }
+
+  if ((p[0] == 'x' || p[0] == 'X') && p[1] == '\0') {
+    out->x = static_cast<float>(sign);
+    out->y = 0.0f;
+    out->z = 0.0f;
+    return true;
+  }
+  if ((p[0] == 'y' || p[0] == 'Y') && p[1] == '\0') {
+    out->x = 0.0f;
+    out->y = static_cast<float>(sign);
+    out->z = 0.0f;
+    return true;
+  }
+  if ((p[0] == 'z' || p[0] == 'Z') && p[1] == '\0') {
+    out->x = 0.0f;
+    out->y = 0.0f;
+    out->z = static_cast<float>(sign);
+    return true;
+  }
+
+  // General signed triple, parsed from the ORIGINAL (unstripped) arg so
+  // each component keeps its own sign.
+  long dx = 0;
+  long dy = 0;
+  long dz = 0;
+  if (sscanf(arg, "%ld %ld %ld", &dx, &dy, &dz) == 3) {
+    out->x = static_cast<float>(dx);
+    out->y = static_cast<float>(dy);
+    out->z = static_cast<float>(dz);
+    return fabsf(out->x) + fabsf(out->y) + fabsf(out->z) > 1e-6f;
+  }
+  return false;
+}
+
+static void start_cartesian_jog(Vec3 dir) {
+  normalize_vec3(&dir);
+  cart_dir_active = dir;
+  cart_dir_active_valid = true;
+  cart_refresh_ms = millis();
+
+  const bool was_active = jog_active;
+  if (!was_active) {
+    stop_jog();
+    apply_all(PIN_FLOAT);
+    set_enable(true);
+    delay(ENABLE_SETTLE_MS);
+  }
+
+  if (!setup_cartesian_jog(&dir)) {
+    Serial.println(F("err cj"));
+    return;
+  }
+
+  if (!was_active) {
+    jog_active = true;
+    jog_timer_start();
+  } else {
+    refresh_dda_pin_io();
+  }
+  Serial.println(F("ok cj"));
+}
+
+/* `m` command: bounded relative move of all joints (+ optional gripper
+ * delta). Joint deltas are signed steps; the DDA runs each axis at a rate
+ * proportional to its distance so all joints finish together. Replies
+ * "ok m" immediately; "m done pos ..." is emitted from loop() when the
+ * joint motion completes. Drivers stay enabled (holding) afterwards. */
+static void start_relative_move(const long d[MT4_NUM_JOINTS], long dg) {
+  clear_jog_axes();
+
+  int32_t master = 0;
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    const int32_t mag = d[i] < 0 ? static_cast<int32_t>(-d[i])
+                                 : static_cast<int32_t>(d[i]);
+    if (mag > master) {
+      master = mag;
+    }
+  }
+
+  if (dg != 0) {
+    gripperSweepToS(static_cast<long>(gripper_s) + dg);
+  }
+
+  if (master == 0) {
+    /* gripper-only (or no-op) request: nothing to step */
+    Serial.println(F("ok m"));
+    Serial.print(F("m done "));
+    print_joint_pos();
+    return;
+  }
+
+  apply_all(PIN_FLOAT);
+  set_enable(true);
+  delay(ENABLE_SETTLE_MS);
+
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    if (d[i] == 0) {
+      continue;
+    }
+    const int32_t mag = d[i] < 0 ? static_cast<int32_t>(-d[i])
+                                 : static_cast<int32_t>(d[i]);
+    set_joint_dir(i, d[i] > 0);
+    dda_delta[i] = mag;
+    move_remaining[i] = mag;
+    dda_accum[i] = 0;
+    dda_axis_mask |= static_cast<uint8_t>(1 << i);
+  }
+  dda_master = master;
+  move_mode = true;
+  jog_active = true;
+  jog_timer_start();
+  Serial.println(F("ok m"));
+}
+
+static void refresh_cartesian_jog_if_due() {
+  if (!cart_jog_mode || !cart_dir_active_valid || !jog_active) {
+    return;
+  }
+  const unsigned long now = millis();
+  if (now - cart_refresh_ms < CJ_REFRESH_MS) {
+    return;
+  }
+  cart_refresh_ms = now;
+  if (!setup_cartesian_jog(&cart_dir_active)) {
+    stop_jog();
+    Serial.println(F("err cj refresh"));
+  } else {
+    refresh_dda_pin_io();
+  }
+}
+
 static void handle_line(char *line) {
   while (*line == ' ' || *line == '\t') {
     ++line;
@@ -707,7 +1130,7 @@ static void handle_line(char *line) {
 
   if (strcmp(line, "!") && strcmp(line, "stop") && strcmp(line, "j") &&
       strcmp(line, "jog") && strcmp(line, "home") && strcmp(line, "$H") &&
-      strncmp(line, "home ", 5)) {
+      strncmp(line, "home ", 5) && strncmp(line, "cj ", 3)) {
     stop_jog();
   }
 
@@ -784,8 +1207,92 @@ static void handle_line(char *line) {
     do_home(static_cast<uint16_t>(j1), static_cast<uint16_t>(j2));
     return;
   }
+  if (!strcmp(line, "pos")) {
+    print_joint_pos();
+    return;
+  }
+  if (!strncmp(line, "setpos ", 7)) {
+    long v[MT4_NUM_JOINTS] = {0, 0, 0, 0};
+    if (sscanf(line + 7, "%ld %ld %ld %ld", &v[0], &v[1], &v[2], &v[3]) != 4) {
+      Serial.println(F("err setpos <j1> <j2> <j3> <j4>"));
+      return;
+    }
+    stop_jog();
+    for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+      joint_steps[i] = v[i];
+    }
+    Serial.print(F("ok "));
+    print_joint_pos();
+    return;
+  }
+  if (!strncmp(line, "orient ", 7)) {
+    const char *arg = line + 7;
+    while (*arg == ' ') {
+      ++arg;
+    }
+    if (!strcmp(arg, "on") || !strcmp(arg, "hold")) {
+      cart_orient_hold = true;
+    } else if (!strcmp(arg, "off") || !strcmp(arg, "free")) {
+      cart_orient_hold = false;
+    } else {
+      char *end = nullptr;
+      const float gain = strtod(arg, &end);
+      if (end == arg || *end != '\0') {
+        Serial.println(F("err orient on|off|<gain>"));
+        return;
+      }
+      cart_orient_gain = gain;
+      cart_orient_hold = gain != 0.0f;
+    }
+    Serial.print(F("ok orient "));
+    Serial.print(cart_orient_hold ? F("hold gain=") : F("free gain="));
+    Serial.println(cart_orient_gain, 3);
+    return;
+  }
+  if (!strncmp(line, "cj ", 3)) {
+    Vec3 dir = {0.0f, 0.0f, 0.0f};
+    if (!parse_cj_vec(line + 3, &dir)) {
+      Serial.println(F("err cj +x|-x|+y|-y|+z|-z|dx dy dz"));
+      return;
+    }
+    start_cartesian_jog(dir);
+    return;
+  }
+  if ((line[0] == 'm' || line[0] == 'M') && line[1] == ' ') {
+    long d[MT4_NUM_JOINTS] = {0, 0, 0, 0};
+    long dg = 0;
+    const int n = sscanf(line + 2, "%ld %ld %ld %ld %ld",
+                         &d[0], &d[1], &d[2], &d[3], &dg);
+    if (n < 4) {
+      Serial.println(F("err m <dj1> <dj2> <dj3> <dj4> [dg]"));
+      return;
+    }
+    if (n == 4) {
+      /* avr-libc's sscanf does not reliably leave a trailing unmatched %ld
+       * argument untouched -- force the optional gripper delta to 0 rather
+       * than trust whatever it wrote. */
+      dg = 0;
+    }
+    for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+      if (d[i] > MOVE_MAX_STEPS || d[i] < -MOVE_MAX_STEPS) {
+        Serial.println(F("err m step delta too large"));
+        return;
+      }
+    }
+    /* GRIPPER_S_* are uint16_t: their difference promotes to unsigned int,
+     * and negating an unsigned value wraps instead of going negative (165
+     * became 65371, not -165) -- cast to a signed type first. */
+    const long gripper_span =
+        static_cast<long>(GRIPPER_S_CLOSED) - static_cast<long>(GRIPPER_S_OPEN);
+    if (dg > gripper_span || dg < -gripper_span) {
+      Serial.println(F("err m gripper delta too large"));
+      return;
+    }
+    start_relative_move(d, dg);
+    return;
+  }
   if (!strcmp(line, "j") || !strcmp(line, "jog")) {
-    if (jog_pin_count == 0) {
+    if (dda_axis_mask == 0) {
       Serial.println(F("err no step pin"));
       return;
     }
@@ -796,6 +1303,8 @@ static void handle_line(char *line) {
   }
   if (!strcmp(line, "!") || !strcmp(line, "stop")) {
     stop_jog();
+    move_mode = false;
+    move_done_pending = false;
     Serial.println(F("ok stop"));
     return;
   }
@@ -803,7 +1312,7 @@ static void handle_line(char *line) {
     stop_jog();
     apply_all(PIN_FLOAT);
     drivers_enabled = false;
-    clear_jog_pins();
+    clear_jog_axes();
     Serial.println(F("ok all float"));
     return;
   }
@@ -825,10 +1334,10 @@ static void handle_line(char *line) {
       ++tok;
     }
     if (!strcmp(tok, "c") || !strcmp(tok, "C")) {
-      clear_jog_pins();
-      Serial.println(F("ok step clear"));
-      return;
-    }
+    clear_jog_axes();
+    Serial.println(F("ok step clear"));
+    return;
+  }
     uint8_t pin = 0;
     if (!parse_pin(tok, &pin)) {
       Serial.println(F("err x<pin>|x+<pin>|x-<pin>|xc"));
@@ -845,7 +1354,7 @@ static void handle_line(char *line) {
         return;
       }
     } else {
-      clear_jog_pins();
+      clear_jog_axes();
       if (!add_jog_pin(pin)) {
         Serial.println(F("err step"));
         return;
@@ -917,7 +1426,8 @@ void setup() {
 
   Serial.begin(115200);
   delay(400);
-  Serial.println(F("MT4 jog firmware ready"));
+  reset_joint_steps();
+  Serial.println(F("MT4 jog firmware ready (joint + cartesian)"));
   print_status();
 }
 
@@ -939,4 +1449,13 @@ void loop() {
   }
   poll_limits();
   gripperSweepTick();
+  refresh_cartesian_jog_if_due();
+
+  if (move_done_pending) {
+    move_done_pending = false;
+    stop_jog();
+    move_mode = false;
+    Serial.print(F("m done "));
+    print_joint_pos();
+  }
 }

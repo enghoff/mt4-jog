@@ -10,6 +10,8 @@ DEFAULT_BAUD = 115200
 J1_HOME_CENTER_STEPS = 4580
 J2_HOME_PULLOFF_STEPS = 1000
 
+STEPS_PER_DEG: tuple[float, float, float, float] = (44.001, 35.556, 35.556, 852.0)
+
 # Enforced in jog firmware (g o / g c sweep); client only starts/stops sweep.
 GRIPPER_S_OPEN = 120
 GRIPPER_S_CLOSED = 285

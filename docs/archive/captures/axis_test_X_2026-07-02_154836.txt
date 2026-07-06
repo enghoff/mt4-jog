@@ -1,8 +1,0 @@
-State: Alarm -> Idle
-Commanded X delta: +3.000 deg
-Measured joint deltas (deg):
-  X: +3.009 <-- primary
-  Y: +0.000
-  Z: +0.000
-  A: +0.000
-PASS: only the commanded axis moved significantly.
