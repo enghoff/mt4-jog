@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Keyboard jog for MT4 custom jog firmware — hold key(s) to move, H to home."""
+"""Keyboard jog for MT4 custom jog firmware — hold key(s) to move, H to home.
+
+Cartesian-only jog (world-frame TCP motion via firmware `cj`, on-device
+Jacobian/DLS resolved-rate) plus J4 wrist roll and the gripper. Direct
+per-joint jog (J1-J3) has been dropped -- Cartesian jog is the only motion
+mode now.
+"""
 
 from __future__ import annotations
 
@@ -16,55 +22,65 @@ from mt4_jog.joints import (
     J2_HOME_PULLOFF_STEPS,
     KEYBOARD_JOINTS,
     LIMIT_JOINTS,
-    Joint,
 )
+from mt4_jog.kinematics import DEFAULT_ORIENT_GAIN
 from mt4_jog.serial import drain_lines, open_serial, read_lines, send, send_quick
 
 POLL_MS = 10
 HOME_WAIT_S = 180.0
+CJ_RESEND_S = 0.05
+SPEED_STEP_US = 100
+SPEED_MIN_US = 700
+SPEED_MAX_US = 4000
+DEFAULT_SPEED_US = 1524
+# `speed <us>` is a plain idempotent set command (no start/stop state), so
+# holding -/= just re-sends it on a repeat timer -- no protocol change needed.
+SPEED_REPEAT_S = 0.08
 
-KEY_BINDINGS: dict[str, tuple[int, bool]] = {
-    "q": (0, False),
-    "a": (0, True),
-    "w": (1, False),
-    "s": (1, True),
-    "e": (2, False),
-    "d": (2, True),
-    "r": (3, False),
-    "f": (3, True),
+J4_JOINT = KEYBOARD_JOINTS[3]
+
+# World-frame TCP jog (mm/s direction; firmware normalizes).
+CART_BINDINGS: dict[str, tuple[int, int, int]] = {
+    "i": (0, 0, 1),
+    "k": (0, 0, -1),
+    "s": (0, 1, 0),
+    "w": (0, -1, 0),
+    "a": (1, 0, 0),
+    "d": (-1, 0, 0),
 }
 
 VK = {
-    "q": 0x51,
-    "a": 0x41,
-    "w": 0x57,
+    "i": 0x49,
+    "k": 0x4B,
     "s": 0x53,
-    "e": 0x45,
+    "w": 0x57,
+    "a": 0x41,
     "d": 0x44,
-    "r": 0x52,
-    "f": 0x46,
+    "j": 0x4A,
+    "l": 0x4C,
+    "q": 0x51,
+    "e": 0x45,
     "esc": 0x1B,
     "space": 0x20,
     "0": 0x30,
     "h": 0x48,
-    "t": 0x54,
-    "g": 0x47,
+    "minus": 0xBD,
+    "plus": 0xBB,
 }
 
 
 def print_help() -> None:
     print("MT4 keyboard jog — hold one or more keys to move, release to stop")
     print()
-    for key_neg, key_pos, joint in zip("qwer", "asdf", KEYBOARD_JOINTS):
-        print(
-            f"  {key_neg.upper()} / {key_pos.upper()}  "
-            f"{joint.gcode} {joint.label}  "
-            f"(drive D{joint.drive}, dir D{joint.direction})"
-        )
+    print("  I / K     world +Z / -Z")
+    print("  S / W     world +Y / -Y")
+    print("  A / D     world +X / -X")
+    print("  J / L     J4 wrist roll (when no Cartesian key held)")
+    print("  -  / =    nudge jog speed slower / faster (live)")
     print()
     print("  H       home J1 + J2 (on-device)")
     print(
-        f"  T / G   gripper sweep open / close "
+        f"  Q / E   gripper sweep open / close "
         f"(S{GRIPPER_S_OPEN}–S{GRIPPER_S_CLOSED} on MT4; release = stop)"
     )
     print("  SPACE   status")
@@ -92,8 +108,10 @@ def drain_async(ser, buf: list[str], verbose: bool) -> None:
     for line in drain_lines(ser, buf):
         if line.startswith("lim "):
             print(f"LIMIT: {format_limit(line[4:])}")
-        elif line.startswith("home "):
+        elif line.startswith("home ") or line.startswith("pos ") or line.startswith("ok speed "):
             print(line)
+        elif line.startswith("err cj"):
+            print(f"CART: {line}")
         elif verbose:
             print(line, file=sys.stderr)
 
@@ -112,30 +130,42 @@ def stop_jog(ser) -> None:
     time.sleep(0.02)
 
 
-def sync_jog(ser, keys: set[str]) -> None:
-    """Configure firmware for all currently held jog keys."""
-    if not keys:
+def pressed_cart_vector() -> tuple[int, int, int] | None:
+    vec = [0, 0, 0]
+    for key, delta in CART_BINDINGS.items():
+        if key_down(key):
+            for i in range(3):
+                vec[i] += delta[i]
+    if vec == [0, 0, 0]:
+        return None
+    return vec[0], vec[1], vec[2]
+
+
+def sync_cart_jog(ser, vector: tuple[int, int, int] | None) -> None:
+    if vector is None:
         stop_jog(ser)
         return
-    send_quick(ser, "stop")
-    send_quick(ser, "e1")
-    send_quick(ser, "xc")
-    for key in sorted(keys):
-        idx, dir_high = KEY_BINDINGS[key]
-        joint = KEYBOARD_JOINTS[idx]
-        level = "h" if dir_high else "l"
-        send_quick(ser, f"d{joint.direction} {level}")
-        send_quick(ser, f"x+{joint.drive}")
-        time.sleep(0.01)
-    send_quick(ser, "j")
+    send_quick(ser, f"cj {vector[0]} {vector[1]} {vector[2]}")
 
 
-def start_jog(ser, joint: Joint, dir_high: bool) -> None:
-    """Single-axis jog (legacy helper)."""
+def sync_j4_jog(ser, dir_high: bool | None) -> None:
+    if dir_high is None:
+        return
     level = "h" if dir_high else "l"
-    for cmd in ("stop", "e1", "xc", f"d{joint.direction} {level}", f"x{joint.drive}", "j"):
+    for cmd in ("stop", "e1", "xc", f"d{J4_JOINT.direction} {level}", f"x+{J4_JOINT.drive}", "j"):
         send_quick(ser, cmd)
-        time.sleep(0.02)
+        time.sleep(0.01)
+
+
+def j4_key_state() -> bool | None:
+    """Return dir_high for J4 roll, or None when J/L not held (or both held)."""
+    j = key_down("j")
+    l = key_down("l")
+    if j and not l:
+        return False
+    if l and not j:
+        return True
+    return None
 
 
 def run_home(ser, buf: list[str], j1: int, j2: int, verbose: bool) -> None:
@@ -172,18 +202,18 @@ def gripper_sweep_stop(ser) -> None:
 
 
 def gripper_key_state() -> str | None:
-    """Return 'open', 'close', or None when T/G not held (or both held)."""
-    t = key_down("t")
-    g = key_down("g")
-    if t and not g:
+    """Return 'open', 'close', or None when Q/E not held (or both held)."""
+    q = key_down("q")
+    e = key_down("e")
+    if q and not e:
         return "open"
-    if g and not t:
+    if e and not q:
         return "close"
     return None
 
 
 def sync_gripper_state(ser, state: str | None, prev: str | None) -> str | None:
-    """Send one sweep command when T/G state changes."""
+    """Send one sweep command when Q/E state changes."""
     if state == prev:
         return prev
     if state == "open":
@@ -195,19 +225,6 @@ def sync_gripper_state(ser, state: str | None, prev: str | None) -> str | None:
     return state
 
 
-def pressed_jog_keys() -> set[str]:
-    chosen: set[str] = set()
-    for idx in range(len(KEYBOARD_JOINTS)):
-        held = [
-            key
-            for key, (joint_idx, _) in KEY_BINDINGS.items()
-            if joint_idx == idx and key_down(key)
-        ]
-        if len(held) == 1:
-            chosen.add(held[0])
-    return chosen
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="MT4 keyboard jog")
     parser.add_argument("--port", default=DEFAULT_PORT)
@@ -215,6 +232,18 @@ def main() -> int:
     parser.add_argument("--poll-ms", type=int, default=POLL_MS)
     parser.add_argument("--j1-center", type=int, default=J1_HOME_CENTER_STEPS)
     parser.add_argument("--j2-pull", type=int, default=J2_HOME_PULLOFF_STEPS)
+    parser.add_argument(
+        "--no-orient",
+        action="store_true",
+        help="disable J4 wrist unwind during Cartesian jog",
+    )
+    parser.add_argument(
+        "--orient-gain",
+        type=float,
+        default=None,
+        help="initial J4 wrist-unwind gain (default: firmware default 1.0); "
+        "nudge live with -/= keys",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -228,8 +257,13 @@ def main() -> int:
 
     poll_s = args.poll_ms / 1000.0
     buf: list[str] = [""]
-    active_keys: set[str] = set()
+    active_j4: bool | None = None
+    active_cart: tuple[int, int, int] | None = None
     grip_state: str | None = None
+    last_cj_send = 0.0
+    orient_gain = DEFAULT_ORIENT_GAIN if args.orient_gain is None else args.orient_gain
+    speed_us = DEFAULT_SPEED_US
+    last_speed_adjust = 0.0
 
     with open_serial(args.port, args.baud) as ser:
         time.sleep(1.0)
@@ -239,6 +273,13 @@ def main() -> int:
         else:
             drain_async(ser, buf, False)
         send(ser, "all f", wait=0.5)
+        if args.no_orient:
+            send(ser, "orient off", wait=0.3)
+        elif args.orient_gain is not None:
+            for line in send(ser, f"orient {orient_gain}", wait=0.3):
+                print(line)
+        else:
+            send(ser, "orient on", wait=0.3)
 
         try:
             while True:
@@ -249,7 +290,8 @@ def main() -> int:
 
                 if key_down("space"):
                     stop_jog(ser)
-                    active_keys.clear()
+                    active_j4 = None
+                    active_cart = None
                     grip_state = sync_gripper_state(ser, None, grip_state)
                     for line in send(ser, "?", wait=1.0):
                         print(line)
@@ -259,7 +301,8 @@ def main() -> int:
 
                 if key_down("0"):
                     stop_jog(ser)
-                    active_keys.clear()
+                    active_j4 = None
+                    active_cart = None
                     grip_state = sync_gripper_state(ser, None, grip_state)
                     send(ser, "e0", wait=0.2)
                     send(ser, "all f", wait=0.3)
@@ -269,17 +312,47 @@ def main() -> int:
 
                 if key_down("h"):
                     stop_jog(ser)
-                    active_keys.clear()
+                    active_j4 = None
+                    active_cart = None
                     grip_state = sync_gripper_state(ser, None, grip_state)
                     run_home(ser, buf, args.j1_center, args.j2_pull, args.verbose)
                     while key_down("h"):
                         time.sleep(poll_s)
                     continue
 
-                desired_keys = pressed_jog_keys()
-                if desired_keys != active_keys:
-                    sync_jog(ser, desired_keys)
-                    active_keys = desired_keys
+                minus = key_down("minus")
+                plus = key_down("plus")
+                now_t = time.monotonic()
+                if (minus or plus) and now_t - last_speed_adjust >= SPEED_REPEAT_S:
+                    # Lower period = faster; "=" (plus) speeds up. Keeps
+                    # repeating for as long as the key is held.
+                    speed_us += -SPEED_STEP_US if plus else SPEED_STEP_US
+                    speed_us = max(SPEED_MIN_US, min(SPEED_MAX_US, speed_us))
+                    send_quick(ser, f"speed {speed_us}")
+                    last_speed_adjust = now_t
+
+                # Cartesian keys take priority over J4 roll when held.
+                desired_cart = pressed_cart_vector()
+                now = time.monotonic()
+                if desired_cart is not None:
+                    if active_j4 is not None:
+                        stop_jog(ser)
+                        active_j4 = None
+                    if desired_cart != active_cart or now - last_cj_send >= CJ_RESEND_S:
+                        sync_cart_jog(ser, desired_cart)
+                        active_cart = desired_cart
+                        last_cj_send = now
+                else:
+                    if active_cart is not None:
+                        stop_jog(ser)
+                        active_cart = None
+                    j4 = j4_key_state()
+                    if j4 != active_j4:
+                        if j4 is None:
+                            stop_jog(ser)
+                        else:
+                            sync_j4_jog(ser, j4)
+                        active_j4 = j4
 
                 grip_state = sync_gripper_state(ser, gripper_key_state(), grip_state)
 

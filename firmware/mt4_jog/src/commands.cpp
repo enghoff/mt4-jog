@@ -1,0 +1,369 @@
+#include "commands.h"
+
+#include <Arduino.h>
+#include <math.h>
+
+#include "config.h"
+#include "gripper.h"
+#include "homing.h"
+#include "kinematics.h"
+#include "motion.h"
+#include "pins.h"
+
+static bool parse_pin(const char *token, uint8_t *out) {
+  if (!token || !*token) {
+    return false;
+  }
+  if (token[0] == 'd' || token[0] == 'D') {
+    ++token;
+  }
+  const long pin = atol(token);
+  if (pin < 2 || pin > 53) {
+    return false;
+  }
+  *out = static_cast<uint8_t>(pin);
+  return true;
+}
+
+static bool parse_cj_vec(const char *arg, Vec3 *out) {
+  while (*arg == ' ') {
+    ++arg;
+  }
+  if (*arg == '\0') {
+    return false;
+  }
+
+  // Single-axis shorthand: an optional sign followed by x/y/z (e.g. "-x").
+  // Peek at a separate cursor so a leading '-' on the general signed-triple
+  // form below (e.g. "-1 0 0") is NOT consumed here.
+  int sign = 1;
+  const char *p = arg;
+  if (*p == '+' || *p == '-') {
+    sign = (*p == '-') ? -1 : 1;
+    ++p;
+  }
+
+  if ((p[0] == 'x' || p[0] == 'X') && p[1] == '\0') {
+    out->x = static_cast<float>(sign);
+    out->y = 0.0f;
+    out->z = 0.0f;
+    return true;
+  }
+  if ((p[0] == 'y' || p[0] == 'Y') && p[1] == '\0') {
+    out->x = 0.0f;
+    out->y = static_cast<float>(sign);
+    out->z = 0.0f;
+    return true;
+  }
+  if ((p[0] == 'z' || p[0] == 'Z') && p[1] == '\0') {
+    out->x = 0.0f;
+    out->y = 0.0f;
+    out->z = static_cast<float>(sign);
+    return true;
+  }
+
+  // General signed triple, parsed from the ORIGINAL (unstripped) arg so
+  // each component keeps its own sign.
+  long dx = 0;
+  long dy = 0;
+  long dz = 0;
+  if (sscanf(arg, "%ld %ld %ld", &dx, &dy, &dz) == 3) {
+    out->x = static_cast<float>(dx);
+    out->y = static_cast<float>(dy);
+    out->z = static_cast<float>(dz);
+    return fabsf(out->x) + fabsf(out->y) + fabsf(out->z) > 1e-6f;
+  }
+  return false;
+}
+
+void handle_line(char *line) {
+  while (*line == ' ' || *line == '\t') {
+    ++line;
+  }
+  if (*line == '\0') {
+    return;
+  }
+
+  if (strcmp(line, "!") && strcmp(line, "stop") && strcmp(line, "j") &&
+      strcmp(line, "jog") && strcmp(line, "home") && strcmp(line, "$H") &&
+      strncmp(line, "home ", 5) && strncmp(line, "cj ", 3) &&
+      strncmp(line, "speed ", 6)) {
+    stop_jog();
+  }
+
+  if (!strcmp(line, "?") || !strcmp(line, "d")) {
+    print_status();
+    return;
+  }
+  if (!strcmp(line, "s")) {
+    print_limits();
+    return;
+  }
+  if (line[0] == 'g' || line[0] == 'G') {
+    const char *arg = line + 1;
+    while (*arg == ' ') {
+      ++arg;
+    }
+    if (*arg == '\0') {
+      printGripperStatus();
+      return;
+    }
+    if (!strcmp(arg, "stop") || !strcmp(arg, "0")) {
+      gripperSweepStop();
+      Serial.println(F("ok grip stop"));
+      return;
+    }
+    if (!strcmp(arg, "o") || !strcmp(arg, "open")) {
+      gripperSweepStart(GRIP_SWEEP_OPEN);
+      if (gripper_s <= GRIPPER_S_OPEN && gripper_sweep == GRIP_SWEEP_STOP) {
+        Serial.println(F("ok grip at open"));
+      } else {
+        Serial.println(F("ok grip open"));
+      }
+      return;
+    }
+    if (!strcmp(arg, "c") || !strcmp(arg, "close")) {
+      gripperSweepStart(GRIP_SWEEP_CLOSE);
+      if (gripper_s >= GRIPPER_S_CLOSED && gripper_sweep == GRIP_SWEEP_STOP) {
+        Serial.println(F("ok grip at closed"));
+      } else {
+        Serial.println(F("ok grip close"));
+      }
+      return;
+    }
+    long v = atol(arg);
+    if (!gripperSValid(v)) {
+      Serial.print(F("err grip stop|o|c|"));
+      Serial.print(GRIPPER_S_OPEN);
+      Serial.print('-');
+      Serial.println(GRIPPER_S_CLOSED);
+      return;
+    }
+    setGripperS(static_cast<uint16_t>(v));
+    Serial.println(F("ok grip"));
+    return;
+  }
+  if (!strcmp(line, "home") || !strcmp(line, "$H")) {
+    do_home(J1_HOME_CENTER_DEFAULT, J2_HOME_PULL_DEFAULT);
+    return;
+  }
+  if (!strncmp(line, "home ", 5)) {
+    long j1 = atol(line + 5);
+    long j2 = J2_HOME_PULL_DEFAULT;
+    char *rest = strchr(line + 5, ' ');
+    if (rest) {
+      while (*rest == ' ') {
+        ++rest;
+      }
+      j2 = atol(rest);
+    }
+    if (j1 <= 0 || j1 > 20000 || j2 <= 0 || j2 > 20000) {
+      Serial.println(F("err home <j1> <j2>"));
+      return;
+    }
+    do_home(static_cast<uint16_t>(j1), static_cast<uint16_t>(j2));
+    return;
+  }
+  if (!strcmp(line, "pos")) {
+    print_joint_pos();
+    return;
+  }
+  if (!strncmp(line, "setpos ", 7)) {
+    long v[MT4_NUM_JOINTS] = {0, 0, 0, 0};
+    if (sscanf(line + 7, "%ld %ld %ld %ld", &v[0], &v[1], &v[2], &v[3]) != 4) {
+      Serial.println(F("err setpos <j1> <j2> <j3> <j4>"));
+      return;
+    }
+    motion_set_joint_steps(v);
+    return;
+  }
+  if (!strncmp(line, "speed ", 6)) {
+    const char *arg = line + 6;
+    while (*arg == ' ') {
+      ++arg;
+    }
+    char *end = nullptr;
+    long us = strtol(arg, &end, 10);
+    if (end == arg || *end != '\0') {
+      Serial.println(F("err speed <us>"));
+      return;
+    }
+    motion_set_speed_us(us);
+    return;
+  }
+  if (!strncmp(line, "orient ", 7)) {
+    const char *arg = line + 7;
+    while (*arg == ' ') {
+      ++arg;
+    }
+    if (!strcmp(arg, "on") || !strcmp(arg, "hold")) {
+      cart_orient_hold = true;
+    } else if (!strcmp(arg, "off") || !strcmp(arg, "free")) {
+      cart_orient_hold = false;
+    } else {
+      char *end = nullptr;
+      const float gain = strtod(arg, &end);
+      if (end == arg || *end != '\0') {
+        Serial.println(F("err orient on|off|<gain>"));
+        return;
+      }
+      cart_orient_gain = gain;
+      cart_orient_hold = gain != 0.0f;
+    }
+    Serial.print(F("ok orient "));
+    Serial.print(cart_orient_hold ? F("hold gain=") : F("free gain="));
+    Serial.println(cart_orient_gain, 3);
+    return;
+  }
+  if (!strncmp(line, "cj ", 3)) {
+    Vec3 dir = {0.0f, 0.0f, 0.0f};
+    if (!parse_cj_vec(line + 3, &dir)) {
+      Serial.println(F("err cj +x|-x|+y|-y|+z|-z|dx dy dz"));
+      return;
+    }
+    start_cartesian_jog(dir);
+    return;
+  }
+  if ((line[0] == 'm' || line[0] == 'M') && line[1] == ' ') {
+    long d[MT4_NUM_JOINTS] = {0, 0, 0, 0};
+    long dg = 0;
+    const int n = sscanf(line + 2, "%ld %ld %ld %ld %ld",
+                         &d[0], &d[1], &d[2], &d[3], &dg);
+    if (n < 4) {
+      Serial.println(F("err m <dj1> <dj2> <dj3> <dj4> [dg]"));
+      return;
+    }
+    if (n == 4) {
+      /* avr-libc's sscanf does not reliably leave a trailing unmatched %ld
+       * argument untouched -- force the optional gripper delta to 0 rather
+       * than trust whatever it wrote. */
+      dg = 0;
+    }
+    for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+      if (d[i] > MOVE_MAX_STEPS || d[i] < -MOVE_MAX_STEPS) {
+        Serial.println(F("err m step delta too large"));
+        return;
+      }
+    }
+    /* GRIPPER_S_* are uint16_t: their difference promotes to unsigned int,
+     * and negating an unsigned value wraps instead of going negative (165
+     * became 65371, not -165) -- cast to a signed type first. */
+    const long gripper_span =
+        static_cast<long>(GRIPPER_S_CLOSED) - static_cast<long>(GRIPPER_S_OPEN);
+    if (dg > gripper_span || dg < -gripper_span) {
+      Serial.println(F("err m gripper delta too large"));
+      return;
+    }
+    start_relative_move(d, dg);
+    return;
+  }
+  if (!strcmp(line, "j") || !strcmp(line, "jog")) {
+    motion_start_jog();
+    return;
+  }
+  if (!strcmp(line, "!") || !strcmp(line, "stop")) {
+    stop_jog();
+    motion_cancel_move();
+    Serial.println(F("ok stop"));
+    return;
+  }
+  if (!strcmp(line, "all f")) {
+    stop_jog();
+    apply_all(PIN_FLOAT);
+    drivers_enabled = false;
+    clear_jog_axes();
+    Serial.println(F("ok all float"));
+    return;
+  }
+  if (!strcmp(line, "e0")) {
+    set_enable(false);
+    Serial.println(F("ok enable off"));
+    return;
+  }
+  if (!strcmp(line, "e1")) {
+    set_enable(true);
+    Serial.println(F("ok enable on"));
+    return;
+  }
+  if (line[0] == 'x' || line[0] == 'X') {
+    const bool add = line[1] == '+';
+    const bool remove = line[1] == '-';
+    const char *tok = line + 1;
+    if (add || remove) {
+      ++tok;
+    }
+    if (!strcmp(tok, "c") || !strcmp(tok, "C")) {
+      clear_jog_axes();
+      Serial.println(F("ok step clear"));
+      return;
+    }
+    uint8_t pin = 0;
+    if (!parse_pin(tok, &pin)) {
+      Serial.println(F("err x<pin>|x+<pin>|x-<pin>|xc"));
+      return;
+    }
+    if (remove) {
+      if (!remove_jog_pin(pin)) {
+        Serial.println(F("err step missing"));
+        return;
+      }
+    } else if (add) {
+      if (!add_jog_pin(pin)) {
+        Serial.println(F("err step full"));
+        return;
+      }
+    } else {
+      clear_jog_axes();
+      if (!add_jog_pin(pin)) {
+        Serial.println(F("err step"));
+        return;
+      }
+    }
+    Serial.println(F("ok step"));
+    return;
+  }
+  if ((line[0] == 'd' || line[0] == 'D') && line[1] >= '0' && line[1] <= '9') {
+    char *sp = strchr(line, ' ');
+    if (!sp) {
+      Serial.println(F("err d<pin> f|l|h"));
+      return;
+    }
+    *sp = '\0';
+    uint8_t pin = 0;
+    if (!parse_pin(line, &pin)) {
+      Serial.println(F("err d<pin> f|l|h"));
+      return;
+    }
+    const char *m = sp + 1;
+    while (*m == ' ') {
+      ++m;
+    }
+    PinModeSetting mode;
+    if (!strcmp(m, "f")) {
+      mode = PIN_FLOAT;
+    } else if (!strcmp(m, "l")) {
+      mode = PIN_LOW;
+    } else if (!strcmp(m, "h")) {
+      mode = PIN_HIGH;
+    } else {
+      Serial.println(F("err mode f|l|h"));
+      return;
+    }
+    const int8_t idx = lab_index(pin);
+    if (idx >= 0) {
+      apply_pin(static_cast<uint8_t>(idx), mode);
+    } else {
+      pinMode(pin, mode == PIN_FLOAT ? INPUT : OUTPUT);
+      if (mode != PIN_FLOAT) {
+        digitalWrite(pin, mode == PIN_HIGH ? HIGH : LOW);
+      }
+    }
+    if (pin == step_pin && mode == PIN_FLOAT) {
+      remove_jog_pin(pin);
+    }
+    Serial.println(F("ok pin"));
+    return;
+  }
+
+  Serial.println(F("err unknown"));
+}

@@ -24,7 +24,13 @@ HOME_J2_DEG = 90.0
 HOME_J3_DEG = 0.0
 HOME_J4_DEG = 0.0
 
-STEPS_PER_DEG: tuple[float, float, float, float] = (44.001, 35.556, 35.556, 852.0)
+# All four measured 2026-07-06 (J2-J4 with a phone clinometer against the
+# link; J1 by direct measurement of its yaw rotation), replacing the
+# factory-EEPROM-derived guesses -- J1/J2/J3 share a physical motor/gearbox
+# design (~35 steps/deg each). J3's own EEPROM setting was missing from the
+# dump entirely (the old 35.556 was borrowed from unrelated extra axes), and
+# J4's old value (852) was a wrong axis-letter assumption ("d" = J4).
+STEPS_PER_DEG: tuple[float, float, float, float] = (35.0, 35.0, 35.0, 45.0)
 
 # +1 if positive step count increases firmware joint angle, -1 if driver is inverted.
 # J3 confirmed inverted 2026-07-06: a +299-step probe raised the forearm tip
@@ -94,7 +100,7 @@ def jacobian_mm_per_deg(q: JointAnglesDeg) -> np.ndarray:
     return j
 
 
-DEFAULT_ORIENT_GAIN = 0.82  # empirical; tune to match the real J1/J4 coupling
+DEFAULT_ORIENT_GAIN = 1.0  # empirical; tune to match the real J1/J4 coupling
 
 
 def cartesian_joint_rates_deg(
@@ -143,6 +149,13 @@ def cartesian_step_rates(
         return None
 
     steps = [J_STEP_SIGN[i] * rates[i] * STEPS_PER_DEG[i] for i in range(4)]
+
+    # Peak/master-scale spans all four joints. This used to be a problem
+    # when J4's steps/deg (852, an axis-letter misassignment) was ~19x J1's,
+    # letting a modest orientation-hold correction dominate the DDA timing
+    # budget. Now that J4 is correctly calibrated (~45, close to J1's ~44),
+    # including it here costs at most a few percent of speed and gives exact
+    # wrist-unwind fidelity instead of clamping J4 short of orient_gain.
     peak = max(abs(s) for s in steps)
     if peak < 1e-9:
         return None

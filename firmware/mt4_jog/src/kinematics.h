@@ -29,7 +29,7 @@ extern "C" {
 
 /* Default wrist-unwind gain (dq4 = -orient_gain * dq1); empirical, runtime
  * tunable via the `orient <gain>` serial command. */
-#define MT4_ORIENT_GAIN_DEFAULT 0.82f
+#define MT4_ORIENT_GAIN_DEFAULT 1.0f
 
 extern const float MT4_STEPS_PER_DEG[MT4_NUM_JOINTS];
 
