@@ -201,18 +201,11 @@ void handle_line(char *line) {
     } else if (!strcmp(arg, "off") || !strcmp(arg, "free")) {
       cart_orient_hold = false;
     } else {
-      char *end = nullptr;
-      const float gain = strtod(arg, &end);
-      if (end == arg || *end != '\0') {
-        Serial.println(F("err orient on|off|<gain>"));
-        return;
-      }
-      cart_orient_gain = gain;
-      cart_orient_hold = gain != 0.0f;
+      Serial.println(F("err orient on|off"));
+      return;
     }
     Serial.print(F("ok orient "));
-    Serial.print(cart_orient_hold ? F("hold gain=") : F("free gain="));
-    Serial.println(cart_orient_gain, 3);
+    Serial.println(cart_orient_hold ? F("hold") : F("free"));
     return;
   }
   if (!strncmp(line, "cj ", 3)) {

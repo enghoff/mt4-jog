@@ -42,15 +42,14 @@ python jog_keyboard.py --port COM6
 | 0 | Stop, drivers off |
 | ESC | Quit |
 
-Use `--no-orient` to disable J4 wrist unwind during Cartesian moves, or
-`--orient-gain <g>` to set an initial gain (default 1.0; also live-tunable via
-serial `orient <gain>`).
+Use `--no-orient` to disable J4 wrist unwind during Cartesian moves (also
+live-toggleable via serial `orient on|off`). When on, J4 counters J1's yaw 1:1.
 
 Gripper and J4-roll commands resend on a ~50ms timer while their key is held, so a
 single dropped serial line can't strand them mid-motion — same fix already applied
 to Cartesian jog's `cj` resend.
 
-Firmware serial commands: `cj +x|-x|+y|-y|+z|-z|<dx> <dy> <dz>`, `orient on|off|<gain>`,
+Firmware serial commands: `cj +x|-x|+y|-y|+z|-z|<dx> <dy> <dz>`, `orient on|off`,
 `speed <us>` (live jog step period, 700-4000us), `pos`, `setpos <j1> <j2> <j3> <j4>`,
 `m <dj1> <dj2> <dj3> <dj4> [dg]` (bounded relative move, all axes finish together),
 `home [j1 j2]`, `g o|c|stop|<120-285>`, `?`/`s`. Full reference in the header comment

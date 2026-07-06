@@ -136,8 +136,7 @@ static bool solve_dls3(const float j[3][3], const float v[3], float dq[3]) {
 }
 
 bool mt4_cartesian_rates(const JointAnglesDeg *q, const Vec3 *dir_unit,
-                         bool hold_orient, float orient_gain,
-                         CartesianRates *out) {
+                         bool hold_orient, CartesianRates *out) {
   float j[3][MT4_NUM_JOINTS];
   jacobian_mm_per_deg(q, j);
 
@@ -154,13 +153,12 @@ bool mt4_cartesian_rates(const JointAnglesDeg *q, const Vec3 *dir_unit,
     return false;
   }
 
-  /* dq is in model-angle space; wrist unwind counters base yaw before the
-   * per-driver step signs are applied. orient_gain is empirical (real J1/J4
-   * axis alignment and any mechanical wrist coupling are not modeled) and is
-   * runtime-tunable via the `orient <gain>` serial command. */
+  /* dq is in model-angle space; wrist unwind counters base yaw 1:1 before the
+   * per-driver step signs are applied (real J1/J4 axis alignment and any
+   * mechanical wrist coupling are assumed exact). */
   float dq4 = 0.0f;
   if (hold_orient && fabsf(dq[0]) > 1e-4f) {
-    dq4 = -orient_gain * dq[0];
+    dq4 = -dq[0];
   }
 
   const float steps[4] = {
@@ -175,7 +173,7 @@ bool mt4_cartesian_rates(const JointAnglesDeg *q, const Vec3 *dir_unit,
    * DDA timing budget and throttle the primary motion to a crawl. Now that
    * J4 is correctly calibrated (~45, close to J1's ~44), including it here
    * costs at most a few percent of speed and gives exact wrist-unwind
-   * fidelity instead of clamping J4 short of the commanded orient_gain. */
+   * fidelity instead of clamping J4 short. */
   float peak = 0.0f;
   for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
     const float v = fabsf(steps[i]);

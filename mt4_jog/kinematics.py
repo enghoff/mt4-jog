@@ -100,22 +100,17 @@ def jacobian_mm_per_deg(q: JointAnglesDeg) -> np.ndarray:
     return j
 
 
-DEFAULT_ORIENT_GAIN = 1.0  # empirical; tune to match the real J1/J4 coupling
-
-
 def cartesian_joint_rates_deg(
     q: JointAnglesDeg,
     direction: Vec3,
     *,
     hold_orientation: bool = True,
-    orient_gain: float = DEFAULT_ORIENT_GAIN,
 ) -> tuple[float, float, float, float] | None:
     """Model-space joint deg rates for unit world velocity along direction.
 
-    orient_gain scales the J4 wrist-unwind counter-rotation against J1 yaw;
-    it's empirical (real axis alignment / mechanical coupling aren't modeled)
-    and matches the firmware's `orient <gain>` serial command default.
-    Driver step signs are applied in cartesian_step_rates().
+    When hold_orientation, J4 counters base yaw 1:1 (dq4 = -dq1), matching the
+    firmware's `orient on` behavior. Driver step signs are applied in
+    cartesian_step_rates().
     """
     v = direction.normalized()
     if abs(v.x) + abs(v.y) + abs(v.z) < 1e-9:
@@ -131,7 +126,7 @@ def cartesian_joint_rates_deg(
 
     dq4 = 0.0
     if hold_orientation and abs(dq123[0]) > 1e-6:
-        dq4 = -orient_gain * dq123[0]
+        dq4 = -dq123[0]
 
     return float(dq123[0]), float(dq123[1]), float(dq123[2]), dq4
 
@@ -155,7 +150,7 @@ def cartesian_step_rates(
     # letting a modest orientation-hold correction dominate the DDA timing
     # budget. Now that J4 is correctly calibrated (~45, close to J1's ~44),
     # including it here costs at most a few percent of speed and gives exact
-    # wrist-unwind fidelity instead of clamping J4 short of orient_gain.
+    # wrist-unwind fidelity instead of clamping J4 short.
     peak = max(abs(s) for s in steps)
     if peak < 1e-9:
         return None
@@ -224,19 +219,19 @@ def ik_position(
     z: float,
     *,
     near: JointAnglesDeg,
-    orient_gain: float = DEFAULT_ORIENT_GAIN,
+    hold_orientation: bool = True,
 ) -> JointAnglesDeg | None:
     """Full position IK: TCP (x, y, z) mm -> joint angles, elbow branch and
-    J1 wrap chosen nearest `near`. J4 gets the empirical wrist-unwind
-    counter-rotation against the J1 change (same convention as the jog IK);
-    pass orient_gain=0 to leave J4 untouched.
+    J1 wrap chosen nearest `near`. When hold_orientation, J4 counters the J1
+    change 1:1 (same convention as the jog IK); pass False to leave J4
+    untouched.
     """
     q1 = math.degrees(math.atan2(y, x))
     q1 = near.j1 + _wrap_deg(q1 - near.j1)
     sol = ik_q2_q3(math.hypot(x, y), z, near.j2, near.j3)
     if sol is None:
         return None
-    q4 = near.j4 - orient_gain * (q1 - near.j1)
+    q4 = near.j4 - (q1 - near.j1) if hold_orientation else near.j4
     return JointAnglesDeg(q1, sol[0], sol[1], q4)
 
 

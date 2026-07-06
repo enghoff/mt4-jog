@@ -13,7 +13,7 @@
  * Cartesian jog:
  *   cj +x|-x|+y|-y|+z|-z   world-frame TCP jog (multi-axis DDA on device)
  *   cj <dx> <dy> <dz>      direction vector (integer components, normalized)
- *   orient on|off|<gain>   J4 wrist unwind when J1 moves (default on, gain 1.0)
+ *   orient on|off          J4 wrist unwind when J1 moves (default on, 1:1)
  *   pos                      print joint step counters (since last home)
  *   setpos <j1> <j2> <j3> <j4>
  *       Directly overwrite the joint step counters (no motion) -- for

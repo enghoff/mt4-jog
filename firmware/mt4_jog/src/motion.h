@@ -6,10 +6,10 @@
 #include "config.h"
 #include "kinematics.h"
 
-// Cartesian wrist-unwind config (`orient` command); plain data, no
-// hardware-register concerns like the DDA/speed state in dda.h.
+// Cartesian wrist-unwind on/off (`orient on|off` command); plain data, no
+// hardware-register concerns like the DDA/speed state in dda.h. When on,
+// J4 counters base yaw 1:1 (dq4 = -dq1).
 extern bool cart_orient_hold;
-extern float cart_orient_gain;
 
 void motion_init();
 void reset_joint_steps();

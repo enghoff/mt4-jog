@@ -7,7 +7,6 @@
 #include "pins.h"
 
 bool cart_orient_hold = true;
-float cart_orient_gain = MT4_ORIENT_GAIN_DEFAULT;
 
 static bool cart_jog_mode = false;
 static Vec3 cart_dir_active = {0.0f, 0.0f, 0.0f};
@@ -72,9 +71,7 @@ void print_status() {
   Serial.print(F("MODE="));
   Serial.print(cart_jog_mode ? F("cart") : F("joint"));
   Serial.print(F("  ORIENT="));
-  Serial.print(cart_orient_hold ? F("hold") : F("free"));
-  Serial.print(F(" gain="));
-  Serial.println(cart_orient_gain, 3);
+  Serial.println(cart_orient_hold ? F("hold") : F("free"));
   print_joint_pos();
   Serial.print(F("STEP="));
   if (dda_axis_mask == 0) {
@@ -161,8 +158,7 @@ static void normalize_vec3(Vec3 *v) {
 static bool setup_cartesian_jog(const Vec3 *dir) {
   const JointAnglesDeg q = angles_from_steps();
   CartesianRates rates;
-  if (!mt4_cartesian_rates(&q, dir, cart_orient_hold, cart_orient_gain,
-                           &rates)) {
+  if (!mt4_cartesian_rates(&q, dir, cart_orient_hold, &rates)) {
     return false;
   }
   cart_jog_mode = true;

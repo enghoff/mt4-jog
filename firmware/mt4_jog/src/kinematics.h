@@ -27,10 +27,6 @@ extern "C" {
 #define MT4_HOME_J3_DEG 0.0f
 #define MT4_HOME_J4_DEG 0.0f
 
-/* Default wrist-unwind gain (dq4 = -orient_gain * dq1); empirical, runtime
- * tunable via the `orient <gain>` serial command. */
-#define MT4_ORIENT_GAIN_DEFAULT 1.0f
-
 extern const float MT4_STEPS_PER_DEG[MT4_NUM_JOINTS];
 
 typedef struct {
@@ -56,8 +52,7 @@ typedef struct {
 
 void mt4_fk_tcp(const JointAnglesDeg *q, Vec3 *out);
 bool mt4_cartesian_rates(const JointAnglesDeg *q, const Vec3 *dir_unit,
-                         bool hold_orient, float orient_gain,
-                         CartesianRates *out);
+                         bool hold_orient, CartesianRates *out);
 
 #ifdef __cplusplus
 }

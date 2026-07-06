@@ -23,7 +23,6 @@ from mt4_jog.joints import (
     KEYBOARD_JOINTS,
     LIMIT_JOINTS,
 )
-from mt4_jog.kinematics import DEFAULT_ORIENT_GAIN
 from mt4_jog.serial import drain_lines, open_serial, read_lines, send, send_quick
 
 POLL_MS = 10
@@ -235,13 +234,6 @@ def main() -> int:
         action="store_true",
         help="disable J4 wrist unwind during Cartesian jog",
     )
-    parser.add_argument(
-        "--orient-gain",
-        type=float,
-        default=None,
-        help="initial J4 wrist-unwind gain (default: firmware default 1.0); "
-        "nudge live with -/= keys",
-    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -261,7 +253,6 @@ def main() -> int:
     last_cj_send = 0.0
     last_j4_send = 0.0
     last_grip_send = 0.0
-    orient_gain = DEFAULT_ORIENT_GAIN if args.orient_gain is None else args.orient_gain
     speed_us = DEFAULT_SPEED_US
     last_speed_adjust = 0.0
 
@@ -273,13 +264,7 @@ def main() -> int:
         else:
             drain_async(ser, buf, False)
         send(ser, "all f", wait=0.5)
-        if args.no_orient:
-            send(ser, "orient off", wait=0.3)
-        elif args.orient_gain is not None:
-            for line in send(ser, f"orient {orient_gain}", wait=0.3):
-                print(line)
-        else:
-            send(ser, "orient on", wait=0.3)
+        send(ser, "orient off" if args.no_orient else "orient on", wait=0.3)
 
         try:
             while True:
