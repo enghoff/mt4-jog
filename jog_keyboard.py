@@ -29,6 +29,11 @@ from mt4_jog.serial import drain_lines, open_serial, read_lines, send, send_quic
 POLL_MS = 10
 HOME_WAIT_S = 180.0
 CJ_RESEND_S = 0.05
+# Gripper/J4 commands used to be sent once per key-transition only; a single
+# dropped serial line then left them stuck until the next transition. Resend
+# on a timer while held, same fix already applied to Cartesian jog above.
+GRIP_RESEND_S = 0.05
+J4_RESEND_S = 0.05
 SPEED_STEP_US = 100
 SPEED_MIN_US = 700
 SPEED_MAX_US = 4000
@@ -157,6 +162,12 @@ def sync_j4_jog(ser, dir_high: bool | None) -> None:
         time.sleep(0.01)
 
 
+def resend_j4_jog(ser) -> None:
+    """Cheap keep-alive while J/L stays held: re-arms the jog ISR without the
+    stop/dir/axis-select preamble, so a dropped `j` can't strand it mid-jog."""
+    send_quick(ser, "j")
+
+
 def j4_key_state() -> bool | None:
     """Return dir_high for J4 roll, or None when J/L not held (or both held)."""
     j = key_down("j")
@@ -212,19 +223,6 @@ def gripper_key_state() -> str | None:
     return None
 
 
-def sync_gripper_state(ser, state: str | None, prev: str | None) -> str | None:
-    """Send one sweep command when Q/E state changes."""
-    if state == prev:
-        return prev
-    if state == "open":
-        gripper_sweep_open(ser)
-    elif state == "close":
-        gripper_sweep_close(ser)
-    else:
-        gripper_sweep_stop(ser)
-    return state
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="MT4 keyboard jog")
     parser.add_argument("--port", default=DEFAULT_PORT)
@@ -261,6 +259,8 @@ def main() -> int:
     active_cart: tuple[int, int, int] | None = None
     grip_state: str | None = None
     last_cj_send = 0.0
+    last_j4_send = 0.0
+    last_grip_send = 0.0
     orient_gain = DEFAULT_ORIENT_GAIN if args.orient_gain is None else args.orient_gain
     speed_us = DEFAULT_SPEED_US
     last_speed_adjust = 0.0
@@ -292,7 +292,8 @@ def main() -> int:
                     stop_jog(ser)
                     active_j4 = None
                     active_cart = None
-                    grip_state = sync_gripper_state(ser, None, grip_state)
+                    gripper_sweep_stop(ser)
+                    grip_state = None
                     for line in send(ser, "?", wait=1.0):
                         print(line)
                     while key_down("space"):
@@ -303,7 +304,8 @@ def main() -> int:
                     stop_jog(ser)
                     active_j4 = None
                     active_cart = None
-                    grip_state = sync_gripper_state(ser, None, grip_state)
+                    gripper_sweep_stop(ser)
+                    grip_state = None
                     send(ser, "e0", wait=0.2)
                     send(ser, "all f", wait=0.3)
                     while key_down("0"):
@@ -314,7 +316,8 @@ def main() -> int:
                     stop_jog(ser)
                     active_j4 = None
                     active_cart = None
-                    grip_state = sync_gripper_state(ser, None, grip_state)
+                    gripper_sweep_stop(ser)
+                    grip_state = None
                     run_home(ser, buf, args.j1_center, args.j2_pull, args.verbose)
                     while key_down("h"):
                         time.sleep(poll_s)
@@ -347,14 +350,30 @@ def main() -> int:
                         stop_jog(ser)
                         active_cart = None
                     j4 = j4_key_state()
-                    if j4 != active_j4:
-                        if j4 is None:
+                    if j4 is None:
+                        if active_j4 is not None:
                             stop_jog(ser)
-                        else:
-                            sync_j4_jog(ser, j4)
+                            active_j4 = None
+                    elif j4 != active_j4:
+                        sync_j4_jog(ser, j4)
                         active_j4 = j4
+                        last_j4_send = now
+                    elif now - last_j4_send >= J4_RESEND_S:
+                        resend_j4_jog(ser)
+                        last_j4_send = now
 
-                grip_state = sync_gripper_state(ser, gripper_key_state(), grip_state)
+                desired_grip = gripper_key_state()
+                if desired_grip is None:
+                    if grip_state is not None:
+                        gripper_sweep_stop(ser)
+                        grip_state = None
+                elif desired_grip != grip_state or now - last_grip_send >= GRIP_RESEND_S:
+                    if desired_grip == "open":
+                        gripper_sweep_open(ser)
+                    else:
+                        gripper_sweep_close(ser)
+                    grip_state = desired_grip
+                    last_grip_send = now
 
                 time.sleep(poll_s)
         except KeyboardInterrupt:
