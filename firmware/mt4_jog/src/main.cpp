@@ -623,11 +623,10 @@ static void do_home(uint16_t j1_center, uint16_t j2_pull) {
 
   // 1) Back J2/J3 off their minimum-angle extremes first, so J1 can't lock
   // up mechanically against either of them while it rotates to find its own
-  // limit and center. J2's switch sits at its WIDE extreme, so widening
-  // matches its seek-toward-limit direction. J3's interference reference is
-  // reached by FOLDING toward J2 (the narrow side), so J3 widens the
-  // opposite direction from its seek-toward-interference below.
-  move_steps(J2_DRIVE, J2_DIR, J2_HOME_DIR_HIGH, J23_PREWIDEN_STEPS);
+  // limit and center. J3's interference reference is reached by FOLDING
+  // toward J2 (the narrow side), so J3 widens the opposite direction from
+  // its seek-toward-interference below.
+  move_steps(J2_DRIVE, J2_DIR, !J2_HOME_DIR_HIGH, J23_PREWIDEN_STEPS);
   move_steps(J3_DRIVE, J3_DIR, !J3_HOME_DIR_HIGH, J23_PREWIDEN_STEPS);
 
   // 2) Home J1: seek its limit switch, then return to center.
