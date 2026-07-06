@@ -1,7 +1,9 @@
-# WLKATA MT4 — Architecture & Connectivity Reference
+# WLKATA MT4 — Architecture & Protocol Reference
 
-Document compiled from USB investigation, firmware backup analysis, PCB observations,
-and control experiments in this repository. **Last updated:** 2026-07-02.
+Hardware, pin map, and the stock firmware's serial protocol for the WLKATA MT4 arm.
+This describes the stock Grbl-derived firmware the arm ships with (relevant when
+running `restore_stock.py`); for the current custom jog firmware and client, see the
+top-level `README.md`.
 
 ---
 
@@ -12,14 +14,13 @@ The WLKATA MT4 arm controller is an **ATmega2560-based motion controller** with 
 `MT4,20240820`. A PC talks G-code-like commands over **115200 baud** serial; the MCU
 generates **STEP/DIR/ENABLE** signals to **TMC2209-class** stepper driver modules.
 
-| Layer | Component | Status |
-|-------|-----------|--------|
-| PC host | Python + pyserial (`mt4_client.py`) | Verified |
-| USB bridge | CH340C (`VID:PID 1A86:7523`) | Verified on COM6 |
-| MCU | ATmega2560 (`signature 0x1E9801`) | Verified via avrdude |
-| Bootloader | Wiring / STK500v2 (`Arduino explorer stk500V2 by MLS`) | Verified (`-c wiring`) |
-| Application | Grbl 0.9j fork + WLKATA extensions | Confirmed in flash image |
-| Motor drivers | StepStick TMC2209-LA (STEP/DIR/EN) | Observed on PCB (not traced in FW yet) |
+| Layer | Component |
+|-------|-----------|
+| USB bridge | CH340C (`VID:PID 1A86:7523`) |
+| MCU | ATmega2560 (`signature 0x1E9801`) |
+| Bootloader | Wiring / STK500v2 (`Arduino explorer stk500V2 by MLS`) |
+| Stock application | Grbl 0.9j fork + WLKATA extensions |
+| Motor drivers | StepStick TMC2209-LA (STEP/DIR/EN) |
 
 ---
 
@@ -44,14 +45,14 @@ generates **STEP/DIR/ENABLE** signals to **TMC2209-class** stepper driver module
                                               Joint stepper motors (4+ axes)
 ```
 
-**Not controlled by ATmega flash image:**
+**Not controlled by the ATmega application flash:**
 
 - CH340 USB enumeration and drivers (separate chip firmware)
 - TMC2209 chopper/microstep config if set by module jumpers (standalone mode)
 
 ---
 
-## 3. Hardware (PCB observations + verification)
+## 3. Hardware
 
 ### 3.1 Main components
 
@@ -61,34 +62,66 @@ generates **STEP/DIR/ENABLE** signals to **TMC2209-class** stepper driver module
 | Clock | 16 MHz crystal | Standard Mega-class timing |
 | USB bridge | CH340C | Near USB connector; presents as virtual COM port |
 | Stepper drivers | TMC2209-LA on StepStick modules | Labels: VMOT, GND, 2B, 2A, 1A, 1B, VDD, STEP, DIR, EN |
-| Test pads | R / T near USB | Likely UART RX/TX test points (CH340 or MCU side — unconfirmed) |
 
-### 3.2 Verified USB identity (this unit)
+### 3.2 USB identity (this unit)
 
 | Field | Value |
 |-------|-------|
-| OS | Windows 10 |
+| OS | Windows |
 | Port | `COM6` |
 | VID:PID | `1A86:7523` |
 | Description | USB-SERIAL CH340 (COM6) |
 | Manufacturer | wch.cn |
-| Working baud | **115200** |
+| Baud | **115200** |
 
-### 3.3 Electrical / mechanical interfaces (inferred)
+### 3.3 Electrical / mechanical interfaces
 
-| Interface | Evidence |
-|-----------|----------|
+| Interface | Notes |
+|-----------|-------|
 | 4 primary joint axes (J1–J4) | Angle-mode G-code uses X/Y/Z/A; status `Angle(ABCDXYZ)` |
-| Additional axes (5–7) | Firmware strings: “7th axis home”, axis 6 calibration `M42`/`M43` |
-| Gripper | `M3S<pwm>` — PWM range ~40 (open) – 60 (closed) in project code |
+| Additional axes (5–7) | Firmware strings: "7th axis home", axis 6 calibration `M42`/`M43`; not driven by this project |
+| Gripper | `M3S<pwm>` — PWM range ~40 (open) – 60 (closed) in stock firmware |
 | Suction / pump | Status fields `Pump PWM`, `Valve PWM` |
 | Color sensor | `M60` query RGB; enable via `$52 = 1` |
-| Limits / homing | Grbl-style `$H`, hard/soft limit errors; **hardware limits on D20/D21** (see `MT4_PIN_MAP.md`) |
+| Limits / homing | Grbl-style `$H`, hard/soft limit errors; hardware limits on D20/D21 only (see §3.4) |
 
-**MCU pin map (empirical, 2026-07-03)** — see **`MT4_PIN_MAP.md`** and
-`firmware/minimal_x/pin_map.py`. Four drive lines D23/D25/D27/D35, DIR
-D22/D24/D26/D36, shared ENABLE D40, limits I20 (J2) / I21 (J1). Static RE
-details in `MT4_DISASM_STEPPER.md`.
+### 3.4 Pin map (canonical)
+
+| Joint | Name | G-code | Drive (STEP) | DIR | Limit |
+|-------|------|--------|--------------|-----|-------|
+| **J1** | Base | X | **D23** (PA1) | **D22** (PA0) | **I21** (D21) |
+| **J2** | Shoulder | Y | **D25** (PA3) | **D24** (PA2) | **I20** (D20) |
+| **J3** | Elbow | Z | **D27** (PA5) | **D26** (PA4) | — (none) |
+| **J4** | Wrist | A | **D35** (PC2) | **D36** (PC3) | — (none) |
+
+| Signal | Pin | Notes |
+|--------|-----|-------|
+| Shared driver **ENABLE** | **D40** (PG1) | Active low |
+| Limit inputs | **D20**, **D21** | Active-low, pull-up; not Grbl's default D10–D12 / PCINT0 |
+
+The MCU channel order D23 → D25 → D27 → D35 does **not** follow J1 → J4 — always map
+by joint using this table, not by pin-number order. This matches
+`firmware/mt4_jog/src/config.h` in the current custom firmware.
+
+**Limit switches:**
+
+| Pin | MCU | Interrupt | Joint |
+|-----|-----|-----------|-------|
+| **I20** (D20) | PD1 | INT1 | **J2 shoulder** |
+| **I21** (D21) | PD0 | INT0 | **J1 base** |
+
+This MT4 unit has **two physical limit switches** (J1/J2) and none on J3/J4. In stock
+firmware, J3/J4 travel is enforced by firmware soft limits (`$130`–`$146`). In the
+custom firmware, J3 is homed indirectly by driving it into interference with J2 until
+that displaces J2 enough to release J2's own limit switch (`firmware/mt4_jog/src/homing.cpp`);
+J4 has no homing reference at all and relies on step counters staying valid since power-on.
+
+**Pin-driving safety:**
+
+- Only drive pins you understand — STEP, one DIR, ENABLE. Float everything else; a
+  floating DIR can lock a motor to one direction regardless of software.
+- Holding an unrecognized pin HIGH/LOW can disturb driver modules — prefer
+  float-all + single-pin tests when probing new wiring.
 
 ---
 
@@ -96,7 +129,7 @@ details in `MT4_DISASM_STEPPER.md`.
 
 ### 4.1 Backup artifacts (`backups/`)
 
-Captured 2026-07-02 with read-only avrdude:
+Read-only captures via avrdude:
 
 | File | Size | SHA-256 |
 |------|------|---------|
@@ -110,6 +143,8 @@ Restore (when needed):
 avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U flash:w:backups\mt4_flash_2026-07-02.hex:i
 avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom_2026-07-02.hex:i
 ```
+
+(Or `python restore_stock.py --port COM6 --yes` — see `README.md`.)
 
 ### 4.2 Version strings (from flash)
 
@@ -130,13 +165,11 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 | EEPROM | 4 KB | `$` settings, calibration, tool offsets |
 | Bootloader | Tail of flash | STK500v2-compatible serial bootloader |
 
-First flash bytes (`0c940608…`) are consistent with AVR interrupt vector table (RJMP to init).
+First flash bytes (`0c940608…`) are consistent with an AVR interrupt vector table (RJMP to init).
 
 ---
 
 ## 5. USB programming path
-
-Verified read-only on this hardware:
 
 ```powershell
 avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -v
@@ -148,37 +181,39 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -v
 | `-c wiring` | **Works** — use this for flash/EEPROM read/write |
 | `-c stk500v2` | Hung / unreliable on this board — prefer `wiring` |
 
-Close any serial client (`exercise_arm.py`, etc.) before avrdude. Bootloader may share the same CH340 COM port as runtime firmware.
+Close any other serial client before running avrdude. The bootloader shares the same
+CH340 COM port as the runtime firmware.
 
 ---
 
-## 6. Host communication protocol
+## 6. Host communication protocol (stock firmware)
 
 ### 6.1 Transport
 
 | Parameter | Value |
 |-----------|-------|
 | Physical | USB → CH340 → UART |
-| Baud | **115200** 8N1 (default) |
+| Baud | **115200** 8N1 |
 | Framing | Lines terminated with `\n` (CRLF also accepted) |
 | Encoding | ASCII |
 
 ### 6.2 Startup banner
 
-On connect / reset, firmware may emit:
+On connect / reset, firmware emits:
 
 ```text
 WLKATA Robot started successfully.Firmware version:MT4,20240820
 <Alarm,Angle(ABCDXYZ):...,Cartesian coordinate(XYZ RxRyRz):...,Pump PWM:0,Valve PWM:0,Motion_MODE:0>
 ```
 
-Blank line or `?` often returns `ok`.
+Blank line or `?` returns `ok`.
 
 ### 6.3 Status query (`?`)
 
-Primary real-time status mechanism. **Marlin commands `M114`/`M115`/`M119` are not supported** (`Error,E112,Unsupported command`).
+Primary real-time status mechanism. Marlin commands `M114`/`M115`/`M119` are **not
+supported** (`Error,E112,Unsupported command`).
 
-**Status line format** (parsed in `mt4_client.py`):
+Status line format:
 
 ```text
 <State,Angle(ABCDXYZ):a,b,c,d,x,y,z,Cartesian coordinate(XYZ RxRyRz):...,Pump PWM:n,Valve PWM:n,Motion_MODE:n>
@@ -229,13 +264,11 @@ Primary real-time status mechanism. **Marlin commands `M114`/`M115`/`M119` are n
 | Command | Mode |
 |---------|------|
 | `M20` | **Cartesian** — TCP position (XYZ + orientation) |
-| `M21` | **Angle** — joint-space degrees (primary mode used in this repo) |
+| `M21` | **Angle** — joint-space degrees |
 
 Arc commands (`G2`/`G3`) apply **only in Cartesian mode** (`Error,E115`).
 
-### 7.2 Axis mapping (angle mode — verified in project)
-
-Firmware G-code letters map to arm joints as used by `mt4_client.py`:
+### 7.2 Axis mapping (angle mode)
 
 | G-code axis | Arm joint | Status index |
 |-------------|-----------|--------------|
@@ -244,11 +277,11 @@ Firmware G-code letters map to arm joints as used by `mt4_client.py`:
 | `Z` | **J3 elbow** | `angle_z` |
 | `A` | **J4 wrist** | `angle_a` (field `d` in `ABCDXYZ`) |
 
-Fields `a,b,c` in `ABCDXYZ` are additional angle channels (likely auxiliary / internal axes).
+Fields `a,b,c` in `ABCDXYZ` are additional angle channels (auxiliary / internal axes).
 
-### 7.3 Typical move sequence (verified)
+### 7.3 Typical move sequence
 
-Firmware queues G-code; host must **unlock** and **cycle-start** each motion:
+Firmware queues G-code; the host must **unlock** and **cycle-start** each motion:
 
 ```text
 M50                              ; unlock axes
@@ -263,9 +296,9 @@ M21 G91 G01 X5.000 F3000
 ~
 ```
 
-| Parameter | Practical range (project) |
-|-----------|-------------------------|
-| Feed `F` | 100 – 3000 (client clamps to this) |
+| Parameter | Practical range |
+|-----------|-----------------|
+| Feed `F` | 100 – 3000 |
 | Gripper `M3S` | ~40 open, ~60 closed |
 
 ### 7.4 Homing & unlock
@@ -278,14 +311,12 @@ M21 G91 G01 X5.000 F3000
 | `!` | Feed hold |
 | `~` | Cycle start / resume |
 
-After alarm: firmware may report `Error,A106,Locked status of each axis` until unlock/homing.
+After alarm: firmware reports `Error,A106,Locked status of each axis` until unlock/homing.
 
-### 7.5 Kinematics parameters (firmware strings — EEPROM `$` settings)
+### 7.5 Kinematics parameters (EEPROM `$` settings)
 
-Linkage-style robot model exposed in settings help text:
-
-| Setting | Description (from firmware) |
-|---------|----------------------------|
+| Setting | Description |
+|---------|--------------|
 | `$31` | LINKAGE1 link length |
 | `$32` | LINKAGE2 link length |
 | `$33` – `$36` | CENCER/HEAD offset and height lengths |
@@ -299,9 +330,9 @@ Workspace violations: `Error,E118` (Cartesian), `Error,E119` (angle out of range
 
 ---
 
-## 8. Command reference
+## 8. Command reference (stock firmware)
 
-### 8.1 Grbl-standard commands (supported)
+### 8.1 Grbl-standard commands
 
 | Command | Description |
 |---------|-------------|
@@ -318,7 +349,7 @@ Workspace violations: `Error,E118` (Cartesian), `Error,E119` (angle out of range
 | `$x=value` | Save setting |
 | `ctrl-x` | Soft reset |
 
-### 8.2 WLKATA-specific M-codes (from firmware strings + project use)
+### 8.2 WLKATA-specific M-codes
 
 | M-code | Description |
 |--------|-------------|
@@ -331,7 +362,7 @@ Workspace violations: `Error,E118` (Cartesian), `Error,E119` (angle out of range
 | `M43` | Write axis 6 reset parameters to EEPROM |
 | `M50` | Unlock axes |
 | `M60` | Query color sensor RGB (`Data, Color:`) |
-| `G4 P0` | Dwell / planner flush (used in `retarget_test.py`) |
+| `G4 P0` | Dwell / planner flush |
 | `G38.x` | Probe cycle (Grbl heritage) |
 
 ### 8.3 Unsupported / different from Marlin
@@ -346,13 +377,9 @@ Workspace violations: `Error,E118` (Cartesian), `Error,E119` (angle out of range
 
 ## 9. Configuration (`$` settings)
 
-Firmware extends Grbl `$0`–`$30` with robot-specific `$31`–`$54`. View live values:
+Firmware extends Grbl `$0`–`$30` with robot-specific `$31`–`$54`. View live values with `$$`.
 
-```text
-$$
-```
-
-### 9.1 Standard Grbl-like settings (labels from flash)
+### 9.1 Standard Grbl-like settings
 
 | Area | Examples |
 |------|----------|
@@ -427,79 +454,31 @@ EEPROM failure falls back to defaults: `Info,E106,EEPROM read fail. Using defaul
 
 ---
 
-## 12. Motion driver layer (PCB → firmware gap)
+## 12. Motion driver layer — open unknowns
 
-### What we know
-
-- Drivers are **TMC2209-LA** in **STEP/DIR/ENABLE** mode (labels on modules).
-- Firmware contains Grbl **step port invert mask**, **dir port invert mask**, **step pulse** width — classic GPIO bit-bang or timer-driven stepping.
-- Settings use **step/deg** — rotary joint axes, not linear mm-only machine.
-
-### What we do not yet know
-
-| Item | How to determine |
-|------|------------------|
-| PORT/BIT per STEP/DIR/EN | Ghidra disassembly of stepper ISR |
-| Which driver socket = which axis | Cross-reference pin map with PCB photos + continuity |
-| TMC2209 UART config | Check MS1/MS2/PDN pins and driver jumper config |
-| Limit switch pins | Limit ISR + `$` invert settings + meter |
-| 5th–7th axis driver channels | Settings + calibration M-codes + PCB trace |
+- PORT/BIT per STEP/DIR/EN for the stock firmware's own driver assignment (the pin map
+  in §3.4 is empirical, from direct pin manipulation, not from reading stock firmware
+  source).
+- TMC2209 UART configuration (standalone vs UART-configured; MS1/MS2/PDN pin states).
+- Full 5th–7th axis driver channel mapping (not used by this project).
 
 ---
 
-## 13. Repository tooling map
+## 13. Safety notes
 
-| File | Role |
-|------|------|
-| `mt4_probe.py` | Read-only port discovery and firmware query |
-| `mt4_client.py` | Serial client: status parse, move, homing, gripper |
-| `mt4_common.py` | Shared connect / confirm / keyboard helpers |
-| `exercise_arm.py` | Interactive preset pose exerciser |
-| `jog_arm.py` | Keyboard joint jog + gripper |
-| `retarget_test.py` | Mid-motion retarget / hold experiments |
-| `backups/` | Firmware + EEPROM images (do not commit to public repos) |
-| `RESULTS_TEMPLATE.md` | Investigation worksheet |
-
----
-
-## 14. Investigation checklist (completed vs open)
-
-| Item | Status |
-|------|--------|
-| USB serial enumeration | ✅ COM6, CH340 `1A86:7523` |
-| Firmware serial at 115200 | ✅ Banner + `?` status |
-| ATmega2560 signature | ✅ `0x1E9801` |
-| Bootloader over USB | ✅ `avrdude -c wiring` |
-| Flash + EEPROM backup | ✅ `backups/mt4_flash_2026-07-02.*` |
-| Grbl lineage identified | ✅ 0.9j + WLKATA extensions |
-| Motion commands (host) | ✅ M21/G01/M50/~ pattern |
-| MCU pin map (STEP/DIR ports, ISR) | ✅ `MT4_DISASM_STEPPER.md` + empirical **`MT4_PIN_MAP.md`** |
-| J1–J4 drive/DIR/limit pins | ✅ Drive + 2 limits mapped; J2/J3 DIR guesses remain |
-| Full 7-axis driver map | ❌ J3/J4 limits unknown; axes 5–7 not mapped |
-| TMC2209 configuration method | ❌ Unknown (stand-alone vs UART) |
-
----
-
-## 15. Recommended next steps
-
-1. **Confirm J2/J3 DIR** — `pin_sweep.py --dir-for 25` / `27` (see `MT4_PIN_MAP.md`).
-2. **Custom 4-axis firmware** — motion planner using confirmed pin map in `pin_map.py`.
-3. **Live `$` dump** — document factory tuning (steps/deg, homing masks) if not already captured.
-4. **EEPROM decode** — compare EEPROM image before/after `$$` changes.
-
----
-
-## 16. Safety notes
-
-- **Alarm state** does not necessarily mean hardware fault — may indicate power-on lock until `$H` / `M50` / `$X`.
-- Always **backup flash + EEPROM** before experimental firmware writes.
-- Test firmware can energize motors on boot — keep workspace clear and power removable.
+- Clear workspace before jogging or homing; drivers energize while a key/command is active.
+- After a stall/jerk, **power-cycle the motor supply ~10 s** before retrying — TMC2209
+  drivers can latch into a non-responsive state that a USB reflash does not clear.
+- Serial command success ≠ motion — pulse counts are software-only; watch the arm.
+- `Alarm` state does not necessarily mean a hardware fault — it may just be the
+  power-on lock, cleared by `$H` / `M50` / `$X`.
+- Always back up flash + EEPROM before experimental firmware writes.
 - Do not modify **fuse** or **lock** bits without an ISP recovery plan.
 - Only one host may open the COM port at a time (Python or avrdude, not both).
 
 ---
 
-## Appendix A — Verified probe transcript (summary)
+## Appendix A — Probe transcript (stock firmware)
 
 ```
 Port: COM6 @ 115200
@@ -518,7 +497,7 @@ H=Help  L=List I/O Ports  R=Dump RAM  F=Dump FLASH  E=Dump EEPROM
 B=Blink LED  Y=Port blink  V=show interrupt Vectors  Q=Quit
 ```
 
-This is part of the bootloader/monitor image, not the normal WLKATA runtime command set.
+This is part of the bootloader/monitor image, not the WLKATA runtime command set.
 
 ## Appendix C — References
 

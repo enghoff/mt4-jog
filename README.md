@@ -1,8 +1,11 @@
 # MT4 custom jog
 
-Keyboard jog and on-device J1/J2 homing for the WLKATA MT4 arm (ATmega2560 @ COM6, 115200).
+Keyboard jog and on-device homing for the WLKATA MT4 arm (ATmega2560 @ COM6, 115200).
 
-Joint-space jog (`jog_keyboard.py`) and **Cartesian world-frame jog** (`jog_keyboard_cartesian.py`) share the same firmware.
+Custom firmware (`firmware/mt4_jog/`) replaces the stock Grbl-derived firmware with a
+4-axis step/dir jog engine plus an on-device Cartesian (world-frame) resolved-rate
+jog. `jog_keyboard.py` is the only client: Cartesian jog is the sole motion mode
+(direct per-joint jog was dropped), plus J4 wrist roll and the gripper.
 
 ## Requirements
 
@@ -20,44 +23,38 @@ pip install -r requirements.txt
 # Flash custom jog firmware
 python flash_jog.py --port COM6
 
-# Run joint-space keyboard jog (focus terminal, hold one or more keys)
+# Run keyboard jog (focus terminal, hold one or more keys)
 python jog_keyboard.py --port COM6
-
-# Run Cartesian keyboard jog (world X/Y/Z — requires firmware below)
-python jog_keyboard_cartesian.py --port COM6
 ```
 
-### Joint jog keys (`jog_keyboard.py`)
+### Keys (`jog_keyboard.py`)
 
 | Key | Action |
 |-----|--------|
-| Q/A | J1 base |
-| W/S | J2 shoulder |
-| E/D | J3 elbow |
-| R/F | J4 wrist |
-| T/G | Gripper ramp open / closed (hold key) |
-| H | Home J1 + J2 (seek limits, pull off) |
+| I/K | World +Z / -Z |
+| S/W | World +Y / -Y |
+| A/D | World +X / -X |
+| J/L | J4 wrist roll (when no Cartesian key held) |
+| Q/E | Gripper sweep open / close (S120–S285 on MT4; release = stop) |
+| -/= | Jog speed slower / faster (live, repeats while held) |
+| H | Home (on-device) |
 | SPACE | Status |
 | 0 | Stop, drivers off |
 | ESC | Quit |
 
-### Cartesian jog keys (`jog_keyboard_cartesian.py`)
+Use `--no-orient` to disable J4 wrist unwind during Cartesian moves, or
+`--orient-gain <g>` to set an initial gain (default 1.0; also live-tunable via
+serial `orient <gain>`).
 
-| Key | Action |
-|-----|--------|
-| I/K | World +X / -X |
-| J/L | World +Y / -Y |
-| U/O | World +Z / -Z |
-| R/F | J4 wrist (joint jog when no XYZ key held) |
-| T/G | Gripper open / close |
-| H | Home J1 + J2 |
-| SPACE | Status (shows `MODE=cart`, joint step counters) |
-| 0 | Stop, drivers off |
-| ESC | Quit |
+Gripper and J4-roll commands resend on a ~50ms timer while their key is held, so a
+single dropped serial line can't strand them mid-motion — same fix already applied
+to Cartesian jog's `cj` resend.
 
-Use `--no-orient` to disable J4 wrist unwind during Cartesian moves.
-
-Firmware Cartesian commands (serial): `cj +x`, `cj -y`, `cj 1 0 1`, `orient on|off`, `pos`.
+Firmware serial commands: `cj +x|-x|+y|-y|+z|-z|<dx> <dy> <dz>`, `orient on|off|<gain>`,
+`speed <us>` (live jog step period, 700-4000us), `pos`, `setpos <j1> <j2> <j3> <j4>`,
+`m <dj1> <dj2> <dj3> <dj4> [dg]` (bounded relative move, all axes finish together),
+`home [j1 j2]`, `g o|c|stop|<120-285>`, `?`/`s`. Full reference in the header comment
+of `firmware/mt4_jog/src/main.cpp`.
 
 Kinematic model: the MT4 is a parallel-link (palletizing) arm — J2 sets the upper-arm
 absolute angle, J3 sets the forearm absolute angle through the link rods (independent of
@@ -65,7 +62,16 @@ J2), and the head platform stays level. At the homed pose (upper arm vertical, f
 horizontal) the model reproduces the factory-reported TCP **(230.000, 0, 255.570)** exactly
 from the EEPROM geometry (L1 130, L2 150, base 45/140, head 35/14.43).
 
-Homing defaults: J1 center **4580** steps, J2 pull **1000** steps (override with `--j1-center` / `--j2-pull`).
+Per-joint calibration (`MT4_STEPS_PER_DEG` / `J_STEP_SIGN`, duplicated in
+`firmware/mt4_jog/src/kinematics.{h,cpp}`, `mt4_jog/joints.py`, and
+`mt4_jog/kinematics.py` — no shared config file, so edit all three together) is from
+direct measurement (phone clinometer for J2-J4, direct yaw measurement for J1): J1/J2/J3
+= 35 steps/deg, J4 = 45 steps/deg.
+
+Homing seeks J1/J2's limit switches directly; J3 has no limit switch of its own, so it's
+homed indirectly by driving it into mechanical interference with J2 until that
+displaces J2 enough to release J2's own limit switch. J1 center **4580** steps, J2/J3
+pull-off **1000** steps by default (override with `--j1-center` / `--j2-pull`).
 
 ## Restore stock firmware
 
@@ -86,20 +92,22 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 
 | Path | Purpose |
 |------|---------|
-| `jog_keyboard.py` | Joint-space keyboard jog client |
-| `jog_keyboard_cartesian.py` | Cartesian world X/Y/Z keyboard jog |
+| `jog_keyboard.py` | Keyboard jog client (Cartesian + J4 roll + gripper) |
 | `flash_jog.py` | Flash custom firmware |
 | `restore_stock.py` | Flash stock firmware backup |
 | `mt4_jog/` | Python joint map, kinematics, serial helpers |
-| `firmware/mt4_jog/` | Arduino jog + homing + Cartesian firmware |
+| `firmware/mt4_jog/` | Arduino firmware: `config`/`pins`/`gripper`/`dda`/`motion`/`homing`/`commands`/`kinematics` modules |
 | `backups/` | Stock flash/EEPROM images |
+| `docs/` | Hardware, pin map, and stock-firmware protocol reference (`MT4_ARCHITECTURE.md`) |
 
 ## Safety
 
 - Clear workspace before jogging or homing.
 - Drivers energize while a key is held.
 - After a stall/jerk, **power-cycle motor supply ~10 s** before retrying (TMC2209 latch).
-- Only J1 (I21) and J2 (I20) have hardware limit switches; J3/J4 use soft limits in stock firmware.
+- Only J1 (I21) and J2 (I20) have hardware limit switches; J3/J4 have none (J3 is
+  homed indirectly via J2's switch; J4 is unreferenced and relies on power-on step
+  counters staying valid).
 
 ## Pin map (custom firmware)
 
@@ -112,4 +120,4 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 
 Shared enable: **D40** (active low).
 
-Gripper PWM: **D7** (Timer4 OC4B). Limits and sweep run **on the MT4** (S120–S285). Client sends **`g o`** / **`g c`** on key down, **`g stop`** on release. Manual: **`g <120-285>`** or query with **`g`**.
+Gripper PWM: **D7** (Timer4 OC4B). Limits and sweep run **on the MT4** (S120–S285). Client sends **`g o`** / **`g c`** on key down (resent while held), **`g stop`** on release. Manual: **`g <120-285>`** or query with **`g`**.
