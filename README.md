@@ -101,7 +101,7 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 | `mt4_jog/` | Python joint map, kinematics, serial helpers |
 | `firmware/mt4_jog/` | Arduino firmware: `config`/`pins`/`gripper`/`dda`/`motion`/`homing`/`commands`/`kinematics` modules |
 | `backups/` | Stock flash/EEPROM images |
-| `docs/` | Hardware, pin map, and stock-firmware protocol reference (`MT4_ARCHITECTURE.md`) |
+| `docs/` | Hardware and pin map reference (`MT4_ARCHITECTURE.md`) |
 
 ## Safety
 
