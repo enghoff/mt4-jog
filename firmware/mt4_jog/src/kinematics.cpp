@@ -19,8 +19,14 @@ static const float CENCER_HEIGHT = 140.0f; /* shoulder pivot height */
 static const float HEAD_OFFSET = 35.0f;    /* wrist pivot -> TCP, horizontal */
 static const float HEAD_HEIGHT = 14.43f;   /* TCP below wrist pivot */
 
-const float MT4_STEPS_PER_DEG[MT4_NUM_JOINTS] = {44.001f, 35.556f, 35.556f,
-                                                 852.0f};
+/* All four measured 2026-07-06 (J2-J4 with a phone clinometer against the
+ * link; J1 by direct measurement of its yaw rotation), replacing the
+ * factory-EEPROM-derived guesses -- J1/J2/J3 share a physical motor/gearbox
+ * design (~35 steps/deg each). J3's own EEPROM setting was missing from the
+ * dump entirely (the old 35.556 was borrowed from unrelated extra axes),
+ * and J4's old value (852) was a wrong axis-letter assumption ("d" = J4). */
+const float MT4_STEPS_PER_DEG[MT4_NUM_JOINTS] = {35.0f, 35.0f, 35.0f,
+                                                 45.0f};
 static const float J_STEP_SIGN[MT4_NUM_JOINTS] = {
     MT4_J1_STEP_SIGN, MT4_J2_STEP_SIGN, MT4_J3_STEP_SIGN, MT4_J4_STEP_SIGN};
 static const float DLS_LAMBDA = 0.05f;
@@ -163,15 +169,15 @@ bool mt4_cartesian_rates(const JointAnglesDeg *q, const Vec3 *dir_unit,
       J_STEP_SIGN[2] * dq[2] * MT4_STEPS_PER_DEG[2],
       J_STEP_SIGN[3] * dq4 * MT4_STEPS_PER_DEG[3]};
 
-  /* Peak/master-scale is based on the POSITION joints (J1-J3) only. J4's
-   * wrist-unwind is a small angular correction, but its steps/deg (852) is
-   * ~19x J1's (44), so including it in the peak let a modest orientation
-   * hold dominate the DDA timing budget and throttle the primary motion to
-   * a crawl while J4 spun at max rate. J4 is scaled the same as the
-   * position joints and clamped to the achievable +/-1-step-per-tick range
-   * (best effort) rather than dictating everyone else's speed. */
+  /* Peak/master-scale spans all four joints. This used to be a problem when
+   * J4's steps/deg (852, an axis-letter misassignment -- see kinematics.h)
+   * was ~19x J1's, letting a modest orientation-hold correction dominate the
+   * DDA timing budget and throttle the primary motion to a crawl. Now that
+   * J4 is correctly calibrated (~45, close to J1's ~44), including it here
+   * costs at most a few percent of speed and gives exact wrist-unwind
+   * fidelity instead of clamping J4 short of the commanded orient_gain. */
   float peak = 0.0f;
-  for (uint8_t i = 0; i < 3; ++i) {
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
     const float v = fabsf(steps[i]);
     if (v > peak) {
       peak = v;
@@ -185,13 +191,7 @@ bool mt4_cartesian_rates(const JointAnglesDeg *q, const Vec3 *dir_unit,
   out->j1 = (int32_t)lroundf(steps[0] * scale);
   out->j2 = (int32_t)lroundf(steps[1] * scale);
   out->j3 = (int32_t)lroundf(steps[2] * scale);
-  int32_t j4 = (int32_t)lroundf(steps[3] * scale);
-  if (j4 > MT4_CJ_MASTER) {
-    j4 = MT4_CJ_MASTER;
-  } else if (j4 < -MT4_CJ_MASTER) {
-    j4 = -MT4_CJ_MASTER;
-  }
-  out->j4 = j4;
+  out->j4 = (int32_t)lroundf(steps[3] * scale);
   out->master = MT4_CJ_MASTER;
   return true;
 }
