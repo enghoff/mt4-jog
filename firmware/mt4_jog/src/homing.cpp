@@ -55,9 +55,13 @@ static bool serial_abort() {
   return false;
 }
 
-static bool seek_limit(uint8_t drive, uint8_t dir, bool dir_high, uint8_t lim) {
+// Drives `drive`/`dir` until pin `lim` reads `target_triggered`, or returns
+// false on abort/HOME_SEEK_MAX timeout. seek_limit/seek_release below are
+// thin wrappers naming the two directions this is used in.
+static bool seek_until(uint8_t drive, uint8_t dir, bool dir_high, uint8_t lim,
+                        bool target_triggered) {
   prepare_axis(drive, dir, dir_high);
-  if (limit_triggered(lim)) {
+  if (limit_triggered(lim) == target_triggered) {
     return true;
   }
   for (uint32_t i = 0; i < HOME_SEEK_MAX; ++i) {
@@ -66,32 +70,22 @@ static bool seek_limit(uint8_t drive, uint8_t dir, bool dir_high, uint8_t lim) {
     }
     do_one_step(drive);
     poll_limits();
-    if (limit_triggered(lim)) {
+    if (limit_triggered(lim) == target_triggered) {
       return true;
     }
   }
   return false;
 }
 
+static bool seek_limit(uint8_t drive, uint8_t dir, bool dir_high, uint8_t lim) {
+  return seek_until(drive, dir, dir_high, lim, true);
+}
+
 // Like seek_limit, but drives `drive`/`dir` while watching a DIFFERENT limit
 // pin (`watch_lim`) for it to go from triggered to released -- used for J3,
 // which has no limit switch of its own, via its interference with J2.
 static bool seek_release(uint8_t drive, uint8_t dir, bool dir_high, uint8_t watch_lim) {
-  prepare_axis(drive, dir, dir_high);
-  if (!limit_triggered(watch_lim)) {
-    return true;
-  }
-  for (uint32_t i = 0; i < HOME_SEEK_MAX; ++i) {
-    if (serial_abort()) {
-      return false;
-    }
-    do_one_step(drive);
-    poll_limits();
-    if (!limit_triggered(watch_lim)) {
-      return true;
-    }
-  }
-  return false;
+  return seek_until(drive, dir, dir_high, watch_lim, false);
 }
 
 static void move_steps(uint8_t drive, uint8_t dir, bool dir_high, uint32_t n) {
@@ -105,29 +99,27 @@ static void move_steps(uint8_t drive, uint8_t dir, bool dir_high, uint32_t n) {
   }
 }
 
+// Moves a joint away from its home-seek direction (widen off an extreme, or
+// pull off after reaching one) -- i.e. move_steps with the direction
+// flipped from home_dir_high, so call sites read as "back off" rather than
+// having to negate the home direction inline.
+static void back_off(uint8_t drive, uint8_t dir, bool home_dir_high, uint32_t n) {
+  move_steps(drive, dir, !home_dir_high, n);
+}
+
 void do_home(uint16_t j1_center, uint16_t j2_pull) {
   stop_jog();
   homing_active = true;
   Serial.println(F("home start"));
 
-  // 1) Back J2/J3 off their minimum-angle extremes first, so J1 can't lock
-  // up mechanically against either of them while it rotates to find its own
-  // limit and center. J3's interference reference is reached by FOLDING
-  // toward J2 (the narrow side), so J3 widens the opposite direction from
-  // its seek-toward-interference below.
-  move_steps(J3_DRIVE, J3_DIR, !J3_HOME_DIR_HIGH, J23_PREWIDEN_STEPS);
-  move_steps(J2_DRIVE, J2_DIR, !J2_HOME_DIR_HIGH, J23_PREWIDEN_STEPS);
+  // 1) Back J3 off its minimum-angle extreme, so it isn't already sitting
+  // somewhere that interferes with J2's approach to its own limit switch
+  // below. J3's interference reference is reached by FOLDING toward J2
+  // (the narrow side), so this widens the opposite direction from its
+  // seek-toward-interference in step 3.
+  back_off(J3_DRIVE, J3_DIR, J3_HOME_DIR_HIGH, J3_PREWIDEN_STEPS);
 
-  // 2) Home J1: seek its limit switch, then return to center.
-  if (!seek_limit(J1_DRIVE, J1_DIR, J1_HOME_DIR_HIGH, J1_LIMIT)) {
-    Serial.println(F("home fail J1"));
-    homing_active = false;
-    return;
-  }
-  Serial.println(F("home J1 limit"));
-  move_steps(J1_DRIVE, J1_DIR, !J1_HOME_DIR_HIGH, j1_center);
-
-  // 3) Home J2: seek its limit switch and stop right at the raw trigger
+  // 2) Home J2: seek its limit switch and stop right at the raw trigger
   // (no pulloff yet -- J3's seek below needs J2 held there).
   if (!seek_limit(J2_DRIVE, J2_DIR, J2_HOME_DIR_HIGH, J2_LIMIT)) {
     Serial.println(F("home fail J2"));
@@ -136,7 +128,7 @@ void do_home(uint16_t j1_center, uint16_t j2_pull) {
   }
   Serial.println(F("home J2 limit"));
 
-  // 4) Home J3 indirectly: drive it into interference with J2 until that
+  // 3) Home J3 indirectly: drive it into interference with J2 until that
   // displaces J2 enough to release J2's OWN limit switch. J3 has no switch
   // of its own, so this release point is its end-of-travel reference.
   if (!seek_release(J3_DRIVE, J3_DIR, J3_HOME_DIR_HIGH, J2_LIMIT)) {
@@ -146,9 +138,22 @@ void do_home(uint16_t j1_center, uint16_t j2_pull) {
   }
   Serial.println(F("home J3 release"));
 
-  // 5) Pull both J2 and J3 off their limit/interference extremes.
-  move_steps(J2_DRIVE, J2_DIR, !J2_HOME_DIR_HIGH, j2_pull);
-  move_steps(J3_DRIVE, J3_DIR, !J3_HOME_DIR_HIGH, j2_pull);
+  // 4) Pull both J2 and J3 off their limit/interference extremes. J1 homes
+  // after this, by which point J2/J3 are back near their normal home
+  // position and can't lock J1 up.
+  back_off(J2_DRIVE, J2_DIR, J2_HOME_DIR_HIGH, j2_pull);
+  back_off(J3_DRIVE, J3_DIR, J3_HOME_DIR_HIGH, j2_pull);
+
+  // 5) Home J1: seek its limit switch, pause briefly to let it settle at
+  // the switch, then return to center.
+  if (!seek_limit(J1_DRIVE, J1_DIR, J1_HOME_DIR_HIGH, J1_LIMIT)) {
+    Serial.println(F("home fail J1"));
+    homing_active = false;
+    return;
+  }
+  Serial.println(F("home J1 limit"));
+  delay(J1_HOME_LIMIT_PAUSE_MS);
+  back_off(J1_DRIVE, J1_DIR, J1_HOME_DIR_HIGH, j1_center);
 
   stop_jog();
   step_pin = 0;
