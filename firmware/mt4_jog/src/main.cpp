@@ -14,7 +14,10 @@
  *   cj +x|-x|+y|-y|+z|-z   world-frame TCP jog (multi-axis DDA on device)
  *   cj <dx> <dy> <dz>      direction vector (integer components, normalized)
  *   orient on|off          J4 wrist unwind when J1 moves (default on, 1:1)
- *   pos                      print joint step counters (since last home)
+ *   pos                      print joint step counters (since last home),
+ *                              plus a derived "tcp x=.. y=.. z=.. j4=..
+ *                              grip=.." line (mm/deg/S -- same frame and
+ *                              units the `mp` command below accepts)
  *   setpos <j1> <j2> <j3> <j4>
  *       Directly overwrite the joint step counters (no motion) -- for
  *       correcting drift after an external reference (e.g. a soft-contact
@@ -28,6 +31,17 @@
  *       S (clamped to S120-285). Replies "ok m" on accept, then an async
  *       "m done pos ..." line when the joint motion completes. Drivers are
  *       left ENABLED (holding) after the move.
+ *
+ * Absolute move (bounded, coordinated):
+ *   mp <x> <y> <z> <j4> <g>
+ *       Move to an absolute TCP position in mm (origin at the base, under
+ *       J1's pivot) with an absolute J4 orientation in degrees and an
+ *       absolute gripper S (0 = leave the gripper alone). Solved via
+ *       closed-form IK, nearest-branch to the current pose. Rejected with
+ *       "err not homed" unless `home`/`$H` has completed successfully this
+ *       session -- absolute coordinates are meaningless against an
+ *       unreferenced step counter. Same "ok mp" / async "mp done pos ..."
+ *       reply convention as `m`.
  *
  *   home [j1 j2]    widen J2/J3 off their min-angle extremes, home J1 (seek
  *                     I21, return to center), seek J2 to its raw I20

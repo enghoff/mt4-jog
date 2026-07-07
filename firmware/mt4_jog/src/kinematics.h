@@ -62,6 +62,14 @@ void mt4_fk_tcp(const JointAnglesDeg *q, Vec3 *out);
 bool mt4_cartesian_rates(const JointAnglesDeg *q, const Vec3 *dir_unit,
                          bool hold_orient, CartesianRates *out);
 
+/* Closed-form position IK: TCP (x, y, z) mm, origin at the base under J1's
+ * pivot -> joint angles. J4 is taken directly (absolute), not solved. Elbow
+ * branch and J1 wrap are chosen nearest `near`. Returns false if (x, y, z)
+ * is outside the two-link reach. Mirrors mt4_jog/kinematics.py's
+ * ik_position(). */
+bool mt4_ik_position(const JointAnglesDeg *near, float x, float y, float z,
+                     float j4_deg, JointAnglesDeg *out);
+
 #ifdef __cplusplus
 }
 #endif

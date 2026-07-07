@@ -4,8 +4,9 @@ Keyboard jog and on-device homing for the WLKATA MT4 arm (ATmega2560 @ COM6, 115
 
 Custom firmware (`firmware/mt4_jog/`) replaces the stock Grbl-derived firmware with a
 4-axis step/dir jog engine plus an on-device Cartesian (world-frame) resolved-rate
-jog. `jog_keyboard.py` is the only client: Cartesian jog is the sole motion mode
-(direct per-joint jog was dropped), plus J4 wrist roll and the gripper.
+jog. `jog_keyboard.py` is the main client: Cartesian jog is the sole motion mode
+(direct per-joint jog was dropped), plus J4 wrist roll and the gripper. `goto_position.py`
+is a second, prompt-driven client for one-shot absolute moves.
 
 ## Requirements
 
@@ -25,6 +26,10 @@ python flash_jog.py --port COM6
 
 # Run keyboard jog (focus terminal, hold one or more keys)
 python jog_keyboard.py --port COM6
+
+# Or move to an absolute position (prompts for x/y/z/j4/gripper; requires
+# having homed this session)
+python goto_position.py --port COM6
 ```
 
 ### Keys (`jog_keyboard.py`)
@@ -50,10 +55,16 @@ single dropped serial line can't strand them mid-motion — same fix already app
 to Cartesian jog's `cj` resend.
 
 Firmware serial commands: `cj +x|-x|+y|-y|+z|-z|<dx> <dy> <dz>`, `orient on|off`,
-`speed <us>` (live jog step period, 700-4000us), `pos`, `setpos <j1> <j2> <j3> <j4>`,
+`speed <us>` (live jog step period, 700-4000us), `pos` (joint steps + derived TCP
+mm/J4 deg/gripper S), `setpos <j1> <j2> <j3> <j4>`,
 `m <dj1> <dj2> <dj3> <dj4> [dg]` (bounded relative move, all axes finish together),
-`home [j1 j2]`, `g o|c|stop|<120-285>`, `?`/`s`. Full reference in the header comment
-of `firmware/mt4_jog/src/main.cpp`.
+`mp <x> <y> <z> <j4> <g>` (absolute move to a TCP position in mm + absolute J4 deg +
+absolute gripper S, closed-form IK; rejected with `err not homed` unless homed this
+session), `home [j1 j2]`, `g o|c|stop|<120-285>`, `?`/`s`. Full reference in the header
+comment of `firmware/mt4_jog/src/main.cpp`.
+
+`goto_position.py` queries `pos` for the current TCP/J4/gripper state, prompts for
+each (blank = keep current), then sends `mp` and prints the async completion line.
 
 Kinematic model: the MT4 is a parallel-link (palletizing) arm — J2 sets the upper-arm
 absolute angle, J3 sets the forearm absolute angle through the link rods (independent of
@@ -96,6 +107,7 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 | Path | Purpose |
 |------|---------|
 | `jog_keyboard.py` | Keyboard jog client (Cartesian + J4 roll + gripper) |
+| `goto_position.py` | Prompt-driven absolute-position client (firmware `mp`) |
 | `flash_jog.py` | Flash custom firmware |
 | `restore_stock.py` | Flash stock firmware backup |
 | `mt4_jog/` | Python joint map, kinematics, serial helpers |

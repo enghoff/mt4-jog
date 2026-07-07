@@ -11,6 +11,10 @@
 // J4 counters base yaw 1:1 (dq4 = -dq1).
 extern bool cart_orient_hold;
 
+// True once do_home() has completed successfully this session; never reset
+// except by a power cycle/reflash. Gates the `mp` absolute-position command.
+extern bool mt4_homed;
+
 void motion_init();
 void reset_joint_steps();
 /* setpos command: directly overwrite the joint step counters (no motion). */
@@ -41,6 +45,13 @@ void start_relative_move(const long d[MT4_NUM_JOINTS], long dg);
 /* Call every loop() iteration; prints "m done pos ..." and stops the jog
  * exactly once when a relative move completes. */
 void motion_poll_move_done();
+
+/* "mp" command: move to an absolute TCP position (x, y, z mm, origin at the
+ * base under J1's pivot) + absolute J4 orientation (deg) + absolute gripper
+ * S (0 = leave the gripper alone). Rejected with "err not homed" unless
+ * mt4_homed. Same coordinated multi-axis DDA move and async
+ * "mp done pos ..." completion convention as start_relative_move(). */
+bool start_absolute_move(float x, float y, float z, float j4_deg, long g);
 
 /* "speed <us>" command: clamps, applies to the timer live, and prints the
  * accepted value. */

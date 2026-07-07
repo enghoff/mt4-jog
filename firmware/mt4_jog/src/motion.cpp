@@ -7,6 +7,7 @@
 #include "pins.h"
 
 bool cart_orient_hold = true;
+bool mt4_homed = false;
 
 static bool cart_jog_mode = false;
 static Vec3 cart_dir_active = {0.0f, 0.0f, 0.0f};
@@ -64,6 +65,34 @@ void print_joint_pos() {
   Serial.print(joint_steps[2]);
   Serial.print(F(" J4="));
   Serial.println(joint_steps[3]);
+
+  // Derived absolute state for clients (e.g. the `mp` prompt script) to use
+  // as move defaults -- same frame/units `mp` accepts (x/y/z mm, origin at
+  // the base under J1's pivot; j4 deg absolute; grip S).
+  const JointAnglesDeg q = angles_from_steps();
+  Vec3 tcp;
+  mt4_fk_tcp(&q, &tcp);
+  Serial.print(F("tcp x="));
+  Serial.print(tcp.x, 1);
+  Serial.print(F(" y="));
+  Serial.print(tcp.y, 1);
+  Serial.print(F(" z="));
+  Serial.print(tcp.z, 1);
+  Serial.print(F(" j4="));
+  Serial.print(q.j4, 1);
+  Serial.print(F(" grip="));
+  Serial.println(gripper_s);
+}
+
+// F()'s PSTR() expands to a GCC statement-expression, which can't be used
+// as a static initializer at file scope -- so track which command is
+// pending with a plain bool instead of caching the F() string itself.
+static bool move_done_is_mp = false;
+
+static void report_move_done() {
+  Serial.print(move_done_is_mp ? F("mp") : F("m"));
+  Serial.print(F(" done "));
+  print_joint_pos();
 }
 
 void print_status() {
@@ -71,7 +100,9 @@ void print_status() {
   Serial.print(F("MODE="));
   Serial.print(cart_jog_mode ? F("cart") : F("joint"));
   Serial.print(F("  ORIENT="));
-  Serial.println(cart_orient_hold ? F("hold") : F("free"));
+  Serial.print(cart_orient_hold ? F("hold") : F("free"));
+  Serial.print(F("  HOMED="));
+  Serial.println(mt4_homed ? F("yes") : F("no"));
   print_joint_pos();
   Serial.print(F("STEP="));
   if (dda_axis_mask == 0) {
@@ -219,6 +250,7 @@ void refresh_cartesian_jog_if_due() {
  * enabled (holding) afterwards. */
 void start_relative_move(const long d[MT4_NUM_JOINTS], long dg) {
   cart_jog_mode = false;
+  move_done_is_mp = false;
 
   int32_t master = 0;
   for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
@@ -236,8 +268,7 @@ void start_relative_move(const long d[MT4_NUM_JOINTS], long dg) {
   if (master == 0) {
     /* gripper-only (or no-op) request: nothing to step */
     Serial.println(F("ok m"));
-    Serial.print(F("m done "));
-    print_joint_pos();
+    report_move_done();
     return;
   }
 
@@ -254,6 +285,79 @@ void start_relative_move(const long d[MT4_NUM_JOINTS], long dg) {
   Serial.println(F("ok m"));
 }
 
+/* "mp" command: absolute-position move. Uses the same coordinated-DDA
+ * machinery as start_relative_move(), but the joint targets come from
+ * mt4_ik_position() instead of a caller-supplied step delta, and the move
+ * is refused outright unless the arm has homed this session -- absolute
+ * coordinates are meaningless relative to an unreferenced step counter. */
+bool start_absolute_move(float x, float y, float z, float j4_deg, long g) {
+  if (!mt4_homed) {
+    Serial.println(F("err not homed"));
+    return false;
+  }
+  if (g != 0 && !gripperSValid(g)) {
+    Serial.print(F("err mp grip "));
+    Serial.print(GRIPPER_S_OPEN);
+    Serial.print('-');
+    Serial.println(GRIPPER_S_CLOSED);
+    return false;
+  }
+
+  const JointAnglesDeg near = angles_from_steps();
+  JointAnglesDeg target;
+  if (!mt4_ik_position(&near, x, y, z, j4_deg, &target)) {
+    Serial.println(F("err mp unreachable"));
+    return false;
+  }
+
+  const long target_steps[MT4_NUM_JOINTS] = {
+      lroundf((target.j1 - MT4_HOME_J1_DEG) * MT4_STEPS_PER_DEG[0] *
+              MT4_J1_STEP_SIGN),
+      lroundf((target.j2 - MT4_HOME_J2_DEG) * MT4_STEPS_PER_DEG[1] *
+              MT4_J2_STEP_SIGN),
+      lroundf((target.j3 - MT4_HOME_J3_DEG) * MT4_STEPS_PER_DEG[2] *
+              MT4_J3_STEP_SIGN),
+      lroundf((target.j4 - MT4_HOME_J4_DEG) * MT4_STEPS_PER_DEG[3] *
+              MT4_J4_STEP_SIGN),
+  };
+
+  int32_t deltas[MT4_NUM_JOINTS];
+  int32_t master = 0;
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    const long d = target_steps[i] - joint_steps[i];
+    if (d > MOVE_MAX_STEPS || d < -MOVE_MAX_STEPS) {
+      Serial.println(F("err mp step delta too large"));
+      return false;
+    }
+    deltas[i] = static_cast<int32_t>(d);
+    const int32_t mag = deltas[i] < 0 ? -deltas[i] : deltas[i];
+    if (mag > master) {
+      master = mag;
+    }
+  }
+
+  cart_jog_mode = false;
+  move_done_is_mp = true;
+
+  if (g != 0) {
+    gripperSweepToS(g);
+  }
+
+  if (master == 0) {
+    Serial.println(F("ok mp"));
+    report_move_done();
+    return true;
+  }
+
+  apply_all(PIN_FLOAT);
+  set_enable(true);
+  delay(ENABLE_SETTLE_MS);
+  dda_arm(master, deltas, true);
+  dda_engage();
+  Serial.println(F("ok mp"));
+  return true;
+}
+
 void motion_poll_move_done() {
   if (!move_done_pending) {
     return;
@@ -261,6 +365,5 @@ void motion_poll_move_done() {
   move_done_pending = false;
   dda_stop();
   move_mode = false;
-  Serial.print(F("m done "));
-  print_joint_pos();
+  report_move_done();
 }
