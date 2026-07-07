@@ -126,7 +126,6 @@ void do_home(uint16_t j1_center, uint16_t j2_pull) {
     homing_active = false;
     return;
   }
-  Serial.println(F("home J2 limit"));
 
   // 3) Home J3 indirectly: drive it into interference with J2 until that
   // displaces J2 enough to release J2's OWN limit switch. J3 has no switch
@@ -136,24 +135,22 @@ void do_home(uint16_t j1_center, uint16_t j2_pull) {
     homing_active = false;
     return;
   }
-  Serial.println(F("home J3 release"));
 
-  // 4) Pull both J2 and J3 off their limit/interference extremes. J1 homes
-  // after this, by which point J2/J3 are back near their normal home
-  // position and can't lock J1 up.
-  back_off(J2_DRIVE, J2_DIR, J2_HOME_DIR_HIGH, j2_pull);
-  back_off(J3_DRIVE, J3_DIR, J3_HOME_DIR_HIGH, j2_pull);
-
-  // 5) Home J1: seek its limit switch, pause briefly to let it settle at
-  // the switch, then return to center.
+  // 4) Home J1: seek its limit switch, pause briefly to let it settle at
+  // the switch, then return to center. Done while J2/J3 are still held at
+  // their raw limit/interference extremes from steps 2-3.
   if (!seek_limit(J1_DRIVE, J1_DIR, J1_HOME_DIR_HIGH, J1_LIMIT)) {
     Serial.println(F("home fail J1"));
     homing_active = false;
     return;
   }
-  Serial.println(F("home J1 limit"));
   delay(J1_HOME_LIMIT_PAUSE_MS);
   back_off(J1_DRIVE, J1_DIR, J1_HOME_DIR_HIGH, j1_center);
+
+  // 5) Pull both J2 and J3 off their limit/interference extremes now that
+  // J1 is done.
+  back_off(J2_DRIVE, J2_DIR, J2_HOME_DIR_HIGH, j2_pull);
+  back_off(J3_DRIVE, J3_DIR, J3_HOME_DIR_HIGH, j2_pull);
 
   stop_jog();
   step_pin = 0;

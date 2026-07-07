@@ -180,7 +180,6 @@ def j4_key_state() -> bool | None:
 
 def run_home(ser, buf: list[str], j1: int, j2: int, verbose: bool) -> None:
     cmd = f"home {j1} {j2}"
-    print(f"Homing… (J1 center {j1}, J2 pull {j2})")
     if verbose:
         print(f">>> {cmd}", file=sys.stderr)
     ser.write(f"{cmd}\n".encode("ascii"))

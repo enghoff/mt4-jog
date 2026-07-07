@@ -1,5 +1,7 @@
 #include "pins.h"
 
+#include "dda.h"
+
 bool drivers_enabled = false;
 uint8_t step_pin = 0;
 
@@ -88,7 +90,11 @@ void poll_limits() {
     const int raw = digitalRead(pin);
     if (!last_limit_valid || raw != last_limit_raw[i]) {
       last_limit_raw[i] = static_cast<int8_t>(raw);
-      emit_limit(pin, raw);
+      // Homing already reports its own start/complete/fail lines; suppress
+      // the per-transition debug prints so its output stays terse.
+      if (!homing_active) {
+        emit_limit(pin, raw);
+      }
     }
   }
   last_limit_valid = true;
