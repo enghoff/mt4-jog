@@ -44,6 +44,10 @@ void mt4_fk_tcp(const JointAnglesDeg *q, Vec3 *out) {
            HEAD_HEIGHT;
 }
 
+float mt4_ws_j4_deg(const JointAnglesDeg *q) {
+  return q->j4 + q->j1;
+}
+
 static void jacobian_mm_per_deg(const JointAnglesDeg *q, float j[3][MT4_NUM_JOINTS]) {
   Vec3 p0;
   JointAnglesDeg trial = *q;

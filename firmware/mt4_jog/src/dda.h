@@ -27,6 +27,9 @@ void dda_clear_axes();
 bool dda_add_axis_by_pin(uint8_t pin);
 bool dda_remove_axis_by_pin(uint8_t pin);
 void dda_set_speed_us(long us);
+/* Same clamp/apply as dda_set_speed_us() but without the serial ack line. */
+void dda_set_speed_us_quiet(long us);
+uint16_t dda_get_speed_us();
 void dda_stop();
 void dda_engage();
 /* Arms a coordinated move: master ticks + per-joint signed step deltas

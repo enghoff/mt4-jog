@@ -14,6 +14,9 @@ static Vec3 cart_dir_active = {0.0f, 0.0f, 0.0f};
 static bool cart_dir_active_valid = false;
 static unsigned long cart_refresh_ms = 0;
 
+static void mp_path_cancel();
+static void report_move_done();
+
 static JointAnglesDeg angles_from_steps() {
   JointAnglesDeg q;
   q.j1 = MT4_HOME_J1_DEG + MT4_J1_STEP_SIGN *
@@ -54,6 +57,7 @@ void stop_jog() {
 void motion_cancel_move() {
   move_mode = false;
   move_done_pending = false;
+  mp_path_cancel();
 }
 
 void print_joint_pos() {
@@ -68,7 +72,7 @@ void print_joint_pos() {
 
   // Derived absolute state for clients (e.g. the `mp` prompt script) to use
   // as move defaults -- same frame/units `mp` accepts (x/y/z mm, origin at
-  // the base under J1's pivot; j4 deg absolute; grip S).
+  // the base under J1's pivot; j4 deg world-frame yaw; grip S; speed us).
   const JointAnglesDeg q = angles_from_steps();
   Vec3 tcp;
   mt4_fk_tcp(&q, &tcp);
@@ -79,15 +83,130 @@ void print_joint_pos() {
   Serial.print(F(" z="));
   Serial.print(tcp.z, 1);
   Serial.print(F(" j4="));
-  Serial.print(q.j4, 1);
+  Serial.print(mt4_ws_j4_deg(&q), 1);
   Serial.print(F(" grip="));
-  Serial.println(gripper_s);
+  Serial.print(gripper_s);
+  Serial.print(F(" speed="));
+  Serial.println(dda_get_speed_us());
 }
 
 // F()'s PSTR() expands to a GCC statement-expression, which can't be used
 // as a static initializer at file scope -- so track which command is
 // pending with a plain bool instead of caching the F() string itself.
 static bool move_done_is_mp = false;
+
+/* Cartesian linear `mp` path: TCP (x,y,z) is interpolated along straight
+ * world-frame lines; J4 is either held fixed in world space (when the
+ * commanded J4 matches the pose at move start) or interpolated linearly. */
+static struct {
+  bool active;
+  bool hold_ws_orient;
+  uint16_t next_seg;
+  uint16_t num_segments;
+  float sx, sy, sz;
+  float sj4_ws, ej4_ws;
+  float ex, ey, ez;
+} mp_path;
+
+static bool mp_drivers_ready = false;
+
+static void mp_path_cancel() {
+  mp_path.active = false;
+  mp_path.hold_ws_orient = false;
+  mp_path.next_seg = 0;
+  mp_path.num_segments = 0;
+  mp_drivers_ready = false;
+}
+
+static bool joint_angles_to_deltas(const JointAnglesDeg *target,
+                                   int32_t deltas[MT4_NUM_JOINTS],
+                                   int32_t *out_master) {
+  const long target_steps[MT4_NUM_JOINTS] = {
+      lroundf((target->j1 - MT4_HOME_J1_DEG) * MT4_STEPS_PER_DEG[0] *
+              MT4_J1_STEP_SIGN),
+      lroundf((target->j2 - MT4_HOME_J2_DEG) * MT4_STEPS_PER_DEG[1] *
+              MT4_J2_STEP_SIGN),
+      lroundf((target->j3 - MT4_HOME_J3_DEG) * MT4_STEPS_PER_DEG[2] *
+              MT4_J3_STEP_SIGN),
+      lroundf((target->j4 - MT4_HOME_J4_DEG) * MT4_STEPS_PER_DEG[3] *
+              MT4_J4_STEP_SIGN),
+  };
+
+  int32_t master = 0;
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    const long d = target_steps[i] - joint_steps[i];
+    if (d > MOVE_MAX_STEPS || d < -MOVE_MAX_STEPS) {
+      return false;
+    }
+    deltas[i] = static_cast<int32_t>(d);
+    const int32_t mag = deltas[i] < 0 ? -deltas[i] : deltas[i];
+    if (mag > master) {
+      master = mag;
+    }
+  }
+  *out_master = master;
+  return true;
+}
+
+/* Arm one Cartesian-linear `mp` segment (seg is 1..num_segments). Returns
+ * false on IK/delta failure. When the segment needs no joint motion, returns
+ * true with move_mode left false so the caller can chain immediately. */
+static bool mp_execute_segment(uint16_t seg) {
+  const float t =
+      static_cast<float>(seg) / static_cast<float>(mp_path.num_segments);
+  const float wx = mp_path.sx + t * (mp_path.ex - mp_path.sx);
+  const float wy = mp_path.sy + t * (mp_path.ey - mp_path.sy);
+  const float wz = mp_path.sz + t * (mp_path.ez - mp_path.sz);
+  const float wj4_ws = mp_path.hold_ws_orient
+                           ? mp_path.sj4_ws
+                           : mp_path.sj4_ws + t * (mp_path.ej4_ws - mp_path.sj4_ws);
+
+  const JointAnglesDeg near = angles_from_steps();
+  JointAnglesDeg target;
+  if (!mt4_ik_position(&near, wx, wy, wz, 0.0f, &target)) {
+    return false;
+  }
+  target.j4 = wj4_ws - target.j1;
+
+  int32_t deltas[MT4_NUM_JOINTS];
+  int32_t master = 0;
+  if (!joint_angles_to_deltas(&target, deltas, &master)) {
+    return false;
+  }
+  if (master == 0) {
+    return true;
+  }
+
+  if (!mp_drivers_ready) {
+    apply_all(PIN_FLOAT);
+    set_enable(true);
+    delay(ENABLE_SETTLE_MS);
+    mp_drivers_ready = true;
+  }
+  dda_arm(master, deltas, true);
+  dda_engage();
+  return true;
+}
+
+/* Run pending `mp` segments until one needs async stepping or the path ends.
+ * On success with async motion in flight, leaves mp_path.active true. On
+ * completion, clears mp_path and emits "mp done pos ...". */
+static bool mp_continue_path() {
+  while (mp_path.active && mp_path.next_seg <= mp_path.num_segments) {
+    if (!mp_execute_segment(mp_path.next_seg)) {
+      mp_path_cancel();
+      Serial.println(F("err mp segment"));
+      return false;
+    }
+    ++mp_path.next_seg;
+    if (move_mode) {
+      return true;
+    }
+  }
+  mp_path_cancel();
+  report_move_done();
+  return true;
+}
 
 static void report_move_done() {
   Serial.print(move_done_is_mp ? F("mp") : F("m"));
@@ -102,7 +221,9 @@ void print_status() {
   Serial.print(F("  ORIENT="));
   Serial.print(cart_orient_hold ? F("hold") : F("free"));
   Serial.print(F("  HOMED="));
-  Serial.println(mt4_homed ? F("yes") : F("no"));
+  Serial.print(mt4_homed ? F("yes") : F("no"));
+  Serial.print(F("  SPEED="));
+  Serial.println(dda_get_speed_us());
   print_joint_pos();
   Serial.print(F("STEP="));
   if (dda_axis_mask == 0) {
@@ -199,6 +320,7 @@ static bool setup_cartesian_jog(const Vec3 *dir) {
 }
 
 void start_cartesian_jog(Vec3 dir) {
+  mp_path_cancel();
   normalize_vec3(&dir);
   cart_dir_active = dir;
   cart_dir_active_valid = true;
@@ -251,6 +373,7 @@ void refresh_cartesian_jog_if_due() {
 void start_relative_move(const long d[MT4_NUM_JOINTS], long dg) {
   cart_jog_mode = false;
   move_done_is_mp = false;
+  mp_path_cancel();
 
   int32_t master = 0;
   for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
@@ -285,12 +408,14 @@ void start_relative_move(const long d[MT4_NUM_JOINTS], long dg) {
   Serial.println(F("ok m"));
 }
 
-/* "mp" command: absolute-position move. Uses the same coordinated-DDA
- * machinery as start_relative_move(), but the joint targets come from
- * mt4_ik_position() instead of a caller-supplied step delta, and the move
- * is refused outright unless the arm has homed this session -- absolute
- * coordinates are meaningless relative to an unreferenced step counter. */
-bool start_absolute_move(float x, float y, float z, float j4_deg, long g) {
+/* "mp" command: absolute-position move along a straight world-frame
+ * Cartesian line (TCP xyz). J4 is held fixed in world space when the
+ * commanded value matches the pose at move start (J4 counters J1 1:1,
+ * like `orient on`); otherwise J4 is interpolated linearly to the target.
+ * The path is split into short segments; each segment solves IK and runs
+ * a coordinated joint DDA move. Refused unless the arm has homed this session. */
+bool start_absolute_move(float x, float y, float z, float j4_deg, long g,
+                         long speed_us) {
   if (!mt4_homed) {
     Serial.println(F("err not homed"));
     return false;
@@ -302,60 +427,71 @@ bool start_absolute_move(float x, float y, float z, float j4_deg, long g) {
     Serial.println(GRIPPER_S_CLOSED);
     return false;
   }
+  if (speed_us != 0 &&
+      (speed_us < JOG_STEP_PERIOD_MIN_US || speed_us > JOG_STEP_PERIOD_MAX_US)) {
+    Serial.print(F("err mp speed "));
+    Serial.print(JOG_STEP_PERIOD_MIN_US);
+    Serial.print('-');
+    Serial.println(JOG_STEP_PERIOD_MAX_US);
+    return false;
+  }
+
+  motion_cancel_move();
+  dda_stop();
+
+  if (speed_us != 0) {
+    dda_set_speed_us_quiet(speed_us);
+  }
 
   const JointAnglesDeg near = angles_from_steps();
+  const float ws_j4_now = mt4_ws_j4_deg(&near);
+  const bool hold_ws_orient = fabsf(j4_deg - ws_j4_now) < 0.1f;
+
   JointAnglesDeg target;
-  if (!mt4_ik_position(&near, x, y, z, j4_deg, &target)) {
+  if (!mt4_ik_position(&near, x, y, z, 0.0f, &target)) {
     Serial.println(F("err mp unreachable"));
     return false;
   }
 
-  const long target_steps[MT4_NUM_JOINTS] = {
-      lroundf((target.j1 - MT4_HOME_J1_DEG) * MT4_STEPS_PER_DEG[0] *
-              MT4_J1_STEP_SIGN),
-      lroundf((target.j2 - MT4_HOME_J2_DEG) * MT4_STEPS_PER_DEG[1] *
-              MT4_J2_STEP_SIGN),
-      lroundf((target.j3 - MT4_HOME_J3_DEG) * MT4_STEPS_PER_DEG[2] *
-              MT4_J3_STEP_SIGN),
-      lroundf((target.j4 - MT4_HOME_J4_DEG) * MT4_STEPS_PER_DEG[3] *
-              MT4_J4_STEP_SIGN),
-  };
+  Vec3 start_tcp;
+  mt4_fk_tcp(&near, &start_tcp);
 
-  int32_t deltas[MT4_NUM_JOINTS];
-  int32_t master = 0;
-  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
-    const long d = target_steps[i] - joint_steps[i];
-    if (d > MOVE_MAX_STEPS || d < -MOVE_MAX_STEPS) {
-      Serial.println(F("err mp step delta too large"));
-      return false;
-    }
-    deltas[i] = static_cast<int32_t>(d);
-    const int32_t mag = deltas[i] < 0 ? -deltas[i] : deltas[i];
-    if (mag > master) {
-      master = mag;
-    }
+  const float dx = x - start_tcp.x;
+  const float dy = y - start_tcp.y;
+  const float dz = z - start_tcp.z;
+  const float cart_dist = sqrtf(dx * dx + dy * dy + dz * dz);
+
+  uint16_t num_segments =
+      static_cast<uint16_t>(ceilf(cart_dist / MP_CART_SEGMENT_MM));
+  if (num_segments < 1) {
+    num_segments = 1;
+  }
+  if (num_segments > MP_MAX_SEGMENTS) {
+    num_segments = MP_MAX_SEGMENTS;
   }
 
   cart_jog_mode = false;
   move_done_is_mp = true;
 
+  mp_path.sx = start_tcp.x;
+  mp_path.sy = start_tcp.y;
+  mp_path.sz = start_tcp.z;
+  mp_path.sj4_ws = ws_j4_now;
+  mp_path.ex = x;
+  mp_path.ey = y;
+  mp_path.ez = z;
+  mp_path.ej4_ws = j4_deg;
+  mp_path.hold_ws_orient = hold_ws_orient;
+  mp_path.num_segments = num_segments;
+  mp_path.next_seg = 1;
+  mp_path.active = true;
+
   if (g != 0) {
     gripperSweepToS(g);
   }
 
-  if (master == 0) {
-    Serial.println(F("ok mp"));
-    report_move_done();
-    return true;
-  }
-
-  apply_all(PIN_FLOAT);
-  set_enable(true);
-  delay(ENABLE_SETTLE_MS);
-  dda_arm(master, deltas, true);
-  dda_engage();
   Serial.println(F("ok mp"));
-  return true;
+  return mp_continue_path();
 }
 
 void motion_poll_move_done() {
@@ -365,5 +501,10 @@ void motion_poll_move_done() {
   move_done_pending = false;
   dda_stop();
   move_mode = false;
+
+  if (mp_path.active) {
+    mp_continue_path();
+    return;
+  }
   report_move_done();
 }

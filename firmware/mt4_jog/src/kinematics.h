@@ -59,6 +59,11 @@ typedef struct {
 } CartesianRates;
 
 void mt4_fk_tcp(const JointAnglesDeg *q, Vec3 *out);
+
+/* Gripper yaw in world frame (deg). Invariant when J4 counters J1 1:1
+ * (`orient on` / mp world-space hold): ws_j4 = j4_joint + j1. */
+float mt4_ws_j4_deg(const JointAnglesDeg *q);
+
 bool mt4_cartesian_rates(const JointAnglesDeg *q, const Vec3 *dir_unit,
                          bool hold_orient, CartesianRates *out);
 

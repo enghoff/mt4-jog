@@ -94,6 +94,11 @@ def fk_tcp(q: JointAnglesDeg) -> Vec3:
     )
 
 
+def ws_j4_deg(q: JointAnglesDeg) -> float:
+    """Gripper yaw in world frame (deg): j4_joint + j1. Invariant under orient hold."""
+    return q.j4 + q.j1
+
+
 def jacobian_mm_per_deg(q: JointAnglesDeg) -> np.ndarray:
     """3x4 matrix: d(TCP mm)/d(joint deg)."""
     j = np.zeros((3, 4))

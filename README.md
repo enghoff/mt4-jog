@@ -55,11 +55,13 @@ single dropped serial line can't strand them mid-motion — same fix already app
 to Cartesian jog's `cj` resend.
 
 Firmware serial commands: `cj +x|-x|+y|-y|+z|-z|<dx> <dy> <dz>`, `orient on|off`,
-`speed <us>` (live jog step period, 700-4000us), `pos` (joint steps + derived TCP
-mm/J4 deg/gripper S), `setpos <j1> <j2> <j3> <j4>`,
+`speed <us>` (live jog step period, 700-4000us, session state), `pos` (joint steps + derived TCP
+mm/world-frame J4 deg/gripper S/move speed us), `setpos <j1> <j2> <j3> <j4>`,
 `m <dj1> <dj2> <dj3> <dj4> [dg]` (bounded relative move, all axes finish together),
-`mp <x> <y> <z> <j4> <g>` (absolute move to a TCP position in mm + absolute J4 deg +
-absolute gripper S, closed-form IK; rejected with `err not homed` unless homed this
+`mp <x> <y> <z> <j4> <g> [speed_us]` (absolute move to a TCP position in mm + world-frame J4 deg +
+absolute gripper S + optional step period 700-4000us; TCP xyz interpolated along straight world-frame lines in short
+segments with closed-form IK per segment; when the commanded J4 matches the current
+world-frame yaw, gripper orientation is held fixed in world space; rejected with `err not homed` unless homed this
 session), `home [j1 j2]`, `g o|c|stop|<120-285>`, `?`/`s`. Full reference in the header
 comment of `firmware/mt4_jog/src/main.cpp`.
 

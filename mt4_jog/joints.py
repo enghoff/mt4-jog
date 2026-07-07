@@ -22,6 +22,11 @@ STEPS_PER_DEG: tuple[float, float, float, float] = (35.0, 35.0, 35.0, 45.0)
 GRIPPER_S_OPEN = 120
 GRIPPER_S_CLOSED = 285
 
+# Shared jog / `mp` move step period (microseconds between DDA ticks).
+JOG_SPEED_MIN_US = 700
+JOG_SPEED_MAX_US = 4000
+DEFAULT_JOG_SPEED_US = 1524
+
 
 @dataclass(frozen=True)
 class Joint:

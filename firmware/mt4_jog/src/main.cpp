@@ -7,8 +7,9 @@
  *   d<pin> f|l|h    direction / float
  *   x<pin> | x+<pin> | x-<pin> | xc   step pin(s) for jog
  *   j | stop          start/stop Timer1 jog ISR (equal step rate on active axes)
- *   speed <us>        set the shared jog step period (joint jog + cj), live-
- *                        adjustable mid-jog; clamped to [700,4000] us
+ *   speed <us>        set the shared jog step period (joint jog + cj + mp),
+ *                        live-adjustable mid-jog; clamped to [700,4000] us
+ *                        (session state, reset on reboot)
  *
  * Cartesian jog:
  *   cj +x|-x|+y|-y|+z|-z   world-frame TCP jog (multi-axis DDA on device)
@@ -16,8 +17,8 @@
  *   orient on|off          J4 wrist unwind when J1 moves (default on, 1:1)
  *   pos                      print joint step counters (since last home),
  *                              plus a derived "tcp x=.. y=.. z=.. j4=..
- *                              grip=.." line (mm/deg/S -- same frame and
- *                              units the `mp` command below accepts)
+ *                              grip=.. speed=.." line (mm/deg/S/us -- x/y/z,
+ *                              j4, and speed use the same units `mp` accepts)
  *   setpos <j1> <j2> <j3> <j4>
  *       Directly overwrite the joint step counters (no motion) -- for
  *       correcting drift after an external reference (e.g. a soft-contact
@@ -32,12 +33,19 @@
  *       "m done pos ..." line when the joint motion completes. Drivers are
  *       left ENABLED (holding) after the move.
  *
- * Absolute move (bounded, coordinated):
- *   mp <x> <y> <z> <j4> <g>
+ * Absolute move (bounded, coordinated, Cartesian-linear):
+ *   mp <x> <y> <z> <j4> <g> [speed_us]
  *       Move to an absolute TCP position in mm (origin at the base, under
- *       J1's pivot) with an absolute J4 orientation in degrees and an
- *       absolute gripper S (0 = leave the gripper alone). Solved via
- *       closed-form IK, nearest-branch to the current pose. Rejected with
+ *       J1's pivot) with a world-frame J4 gripper yaw in degrees and an
+ *       absolute gripper S (0 = leave the gripper alone). Optional speed_us
+ *       sets the shared step period for the move (700-4000 us, same units as
+ *       `speed`; 0 or omitted = leave the current period unchanged). TCP xyz is
+ *       interpolated along straight world-frame lines in short segments;
+ *       each segment solves closed-form IK (nearest branch to the current
+ *       pose) and runs a coordinated joint DDA move. When the commanded J4
+ *       matches the pose at move start, gripper yaw is held fixed in
+ *       world space (J4 counters J1 1:1, like `orient on`); otherwise J4
+ *       is interpolated linearly to the target. Rejected with
  *       "err not homed" unless `home`/`$H` has completed successfully this
  *       session -- absolute coordinates are meaningless against an
  *       unreferenced step counter. Same "ok mp" / async "mp done pos ..."

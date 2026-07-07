@@ -30,6 +30,10 @@ static const uint16_t STEP_PULSE_US = 10;
 static const uint16_t JOG_STEP_PERIOD_MIN_US = 700;
 static const uint16_t JOG_STEP_PERIOD_MAX_US = 4000;
 static const uint16_t CJ_REFRESH_MS = 40;
+/* `mp` absolute moves: linear TCP interpolation step size (mm) and cap on
+ * the number of segments per move (longer moves use a larger effective step). */
+static const float MP_CART_SEGMENT_MM = 2.0f;
+static const uint16_t MP_MAX_SEGMENTS = 250;
 /* Generous headroom; ~2 full sweeps of any joint at current steps/deg. */
 static const long MOVE_MAX_STEPS = 100000L;
 static const uint16_t HOME_STEP_PERIOD_US = 800;

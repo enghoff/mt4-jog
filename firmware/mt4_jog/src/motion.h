@@ -47,11 +47,16 @@ void start_relative_move(const long d[MT4_NUM_JOINTS], long dg);
 void motion_poll_move_done();
 
 /* "mp" command: move to an absolute TCP position (x, y, z mm, origin at the
- * base under J1's pivot) + absolute J4 orientation (deg) + absolute gripper
- * S (0 = leave the gripper alone). Rejected with "err not homed" unless
- * mt4_homed. Same coordinated multi-axis DDA move and async
- * "mp done pos ..." completion convention as start_relative_move(). */
-bool start_absolute_move(float x, float y, float z, float j4_deg, long g);
+ * base under J1's pivot) + world-frame J4 gripper yaw (deg) + absolute gripper
+ * S (0 = leave the gripper alone) + optional speed_us (700-4000, same units
+ * as `speed`; 0 = leave the current step period unchanged). Rejected with
+ * "err not homed" unless mt4_homed. TCP xyz is interpolated along straight
+ * world-frame lines in short segments. When the commanded J4 matches the
+ * current world-frame yaw, gripper orientation is held fixed in world space
+ * (J4 counters J1 1:1); otherwise world-frame J4 is interpolated linearly.
+ * Async "mp done pos ..." matches `m`. */
+bool start_absolute_move(float x, float y, float z, float j4_deg, long g,
+                         long speed_us);
 
 /* "speed <us>" command: clamps, applies to the timer live, and prints the
  * accepted value. */
