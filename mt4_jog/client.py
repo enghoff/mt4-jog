@@ -101,24 +101,41 @@ class Mt4Client:
             hard_limit=wait + READ_HARD_LIMIT_S,
         )
 
-    def _get_status_unlocked(self) -> Mt4Status:
+    def _drain_serial_unlocked(self) -> list[str]:
+        """Discard any unread firmware lines (stale status, prior home ok, etc.)."""
+        ser = self._require_serial()
+        drained: list[str] = []
+        while True:
+            batch = read_lines(ser, 0.05, hard_limit=0.12)
+            if not batch:
+                break
+            drained.extend(batch)
+        return drained
+
+    def _get_status_unlocked(self, *, retries: int = 1) -> Mt4Status:
         self._ensure_connected_unlocked()
-        lines = self._send_and_collect("?", wait=STATUS_WAIT_S)
+        status = Mt4Status()
+        for attempt in range(retries):
+            if attempt > 0:
+                time.sleep(0.15)
+            lines = self._send_and_collect("?", wait=STATUS_WAIT_S)
 
-        # `?` and `pos` both print the same joint-position + derived
-        # `tcp x=...` line (see firmware print_joint_pos()), so retrying
-        # with the lighter `pos` query is a real fallback if `?`'s fuller
-        # reply got cut off. There's no separate firmware "tcp" command.
-        if not lines:
-            lines = self._send_and_collect("pos", wait=1.5)
+            # `?` and `pos` both print the same joint-position + derived
+            # `tcp x=...` line (see firmware print_joint_pos()), so retrying
+            # with the lighter `pos` query is a real fallback if `?`'s fuller
+            # reply got cut off. There's no separate firmware "tcp" command.
+            if not lines:
+                lines = self._send_and_collect("pos", wait=1.5)
 
-        status = parse_status_lines(lines)
-        status.parse_failed = status.tcp is None and not status.joints
+            status = parse_status_lines(lines)
+            status.parse_failed = status.tcp is None and not status.joints
+            if not status.parse_failed:
+                return status
         return status
 
     def get_status(self) -> Mt4Status:
         with self._lock:
-            return self._get_status_unlocked()
+            return self._get_status_unlocked(retries=3)
 
     def get_tcp(self) -> TcpPose:
         status = self.get_status()
@@ -190,16 +207,28 @@ class Mt4Client:
         with self._lock:
             self._ensure_connected_unlocked()
             ser = self._require_serial()
+            self._drain_serial_unlocked()
             ser.write(f"home {j1_center} {j2_pull}\n".encode("ascii"))
             ser.flush()
             collected: list[str] = []
+            saw_home_start = False
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 lines = read_lines(ser, POLL_WAIT_S, hard_limit=POLL_WAIT_S + READ_HARD_LIMIT_S)
                 collected.extend(lines)
                 for line in lines:
-                    if line == "home ok":
-                        return {"ok": True, "lines": collected}
+                    if line == "home start":
+                        saw_home_start = True
+                    if line == "home ok" and saw_home_start:
+                        self._drain_serial_unlocked()
+                        status = self._get_status_unlocked(retries=3)
+                        return {
+                            "ok": True,
+                            "lines": collected,
+                            "homed": status.homed,
+                            "tcp": status.tcp.as_dict() if status.tcp else None,
+                            "parse_failed": status.parse_failed,
+                        }
                     if line.startswith("home fail") or line.startswith("err"):
                         return {"ok": False, "error": line, "lines": collected}
             return {"ok": False, "error": "Homing timed out", "lines": collected}
@@ -231,7 +260,7 @@ class Mt4Client:
             )
 
         with self._lock:
-            status = self._get_status_unlocked()
+            status = self._get_status_unlocked(retries=3)
             if not status.homed:
                 raise Mt4ClientError(
                     "Arm has not homed this session -- call home() first"

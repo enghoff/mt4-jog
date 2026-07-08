@@ -57,14 +57,12 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             "Control and read status from a WLKATA MT4 arm over serial. "
             "TCP x/y/z are in mm with origin at the base under J1's pivot. "
             "j4 is world-frame gripper yaw in degrees. "
-            "mt4_move_to and mt4_move_relative require confirm=True and "
-            "physically move the arm -- always check mt4_status first and "
-            "confirm the workspace is clear with the user before setting "
-            "confirm=True. mt4_home runs immediately with no confirmation "
-            "required and needs no workspace check -- call it directly "
-            "whenever homing is needed. mt4_move_to requires homing this "
-            "session (mt4_home) first; check the `homed` field in "
-            "mt4_status."
+            "Execute motion commands directly when asked -- never ask the "
+            "user to confirm before calling a tool. mt4_move_to and "
+            "mt4_move_relative move the arm immediately. Check mt4_status "
+            "first when you need the current pose or homed flag. "
+            "mt4_move_to requires homing this session (mt4_home) first; "
+            "mt4_home returns homed and tcp on success."
         ),
         auth=auth,
         lifespan=lifespan,
@@ -107,7 +105,8 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         call directly. The arm moves on its own, and both J1 and J2 travel
         to their hard limit switches during the seek. Takes up to ~30s;
         can take longer (up to 180s) if a limit switch isn't found on the
-        first pass.
+        first pass. On success, returns `homed` and `tcp` from a fresh
+        status query so callers don't need a separate mt4_status round-trip.
         """
         try:
             return get_client().home()
@@ -119,7 +118,6 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         x: float,
         y: float,
         z: float,
-        confirm: bool = False,
         j4: float | None = None,
         grip: int = 0,
         speed_us: int = 0,
@@ -134,10 +132,6 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             x: Target TCP X in mm, origin at the base under J1's pivot.
             y: Target TCP Y in mm.
             z: Target TCP Z in mm.
-            confirm: Must be explicitly set to True to actually move the
-                arm. Defaults to False and is rejected without moving
-                anything. Only set True after confirming the workspace is
-                clear and the target position is intended.
             j4: Target gripper yaw in world-frame degrees. If omitted, the
                 current yaw is reused, which makes the firmware hold gripper
                 orientation fixed in world space during the move (like
@@ -147,15 +141,6 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             speed_us: Step period in microseconds, 700 (fast) to 4000
                 (slow). 0 (default) leaves the current speed unchanged.
         """
-        if not confirm:
-            return {
-                "ok": False,
-                "error": (
-                    "Move not sent: call again with confirm=True after "
-                    "verifying the workspace is clear and this is the "
-                    "intended target."
-                ),
-            }
         try:
             return get_client().move_to(
                 x, y, z, j4=j4, grip=grip, speed_us=speed_us
@@ -169,7 +154,6 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         dj2: int,
         dj3: int,
         dj4: int,
-        confirm: bool = False,
         dgrip: int = 0,
     ) -> dict[str, Any]:
         """Nudge each joint by a relative step count, all axes finishing
@@ -184,21 +168,9 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             dj2: J2 (shoulder) step delta, signed.
             dj3: J3 (elbow) step delta, signed.
             dj4: J4 (wrist) step delta, signed.
-            confirm: Must be explicitly set to True to actually move the
-                arm. Defaults to False and is rejected without moving
-                anything.
             dgrip: Gripper S-value delta, signed (gripper spans 120-285).
                 0 (default) leaves the gripper unchanged.
         """
-        if not confirm:
-            return {
-                "ok": False,
-                "error": (
-                    "Move not sent: call again with confirm=True after "
-                    "verifying the workspace is clear and these deltas are "
-                    "intended."
-                ),
-            }
         try:
             return get_client().move_relative(dj1, dj2, dj3, dj4, dgrip=dgrip)
         except Mt4ClientError as exc:
@@ -206,12 +178,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
 
     @server.tool
     def mt4_gripper(action: str | int) -> dict[str, Any]:
-        """Open, close, stop, or set the gripper (firmware `g`). Lower risk
-        than the arm-body motion tools (no collision risk with the
-        workspace), so this does not require a confirm flag -- but it is
-        still physical motion capable of pinching, so use with the same
-        care.
-
+        """Open, close, stop, or set the gripper (firmware `g`).
         Args:
             action: One of the strings "open", "close", "stop" (start/stop
                 a sweep between the gripper's travel limits), or an absolute

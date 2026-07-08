@@ -61,7 +61,7 @@ class Mt4Status:
         }
 
 
-_POS_RE = re.compile(r"^pos J1=(\d+) J2=(\d+) J3=(\d+) J4=(\d+)$")
+_POS_RE = re.compile(r"^pos J1=(-?\d+) J2=(-?\d+) J3=(-?\d+) J4=(-?\d+)$")
 _MODE_RE = re.compile(
     r"MODE=(\w+)\s+ORIENT=(\w+)\s+HOMED=(\w+)\s+SPEED=(\d+)"
 )
