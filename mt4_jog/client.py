@@ -1,0 +1,297 @@
+"""Long-lived serial client for MT4 jog firmware."""
+
+from __future__ import annotations
+
+import threading
+import time
+from typing import TYPE_CHECKING
+
+from mt4_jog.joints import (
+    DEFAULT_BAUD,
+    DEFAULT_PORT,
+    GRIPPER_S_CLOSED,
+    GRIPPER_S_OPEN,
+    J1_HOME_CENTER_STEPS,
+    J2_HOME_PULLOFF_STEPS,
+    JOG_SPEED_MAX_US,
+    JOG_SPEED_MIN_US,
+)
+from mt4_jog.serial import open_serial, read_lines, send
+from mt4_jog.status import Mt4Status, TcpPose, parse_status_lines, parse_tcp_line
+
+if TYPE_CHECKING:
+    import serial as serial_module
+
+BOOT_WAIT_S = 1.0
+STATUS_WAIT_S = 2.0
+COMMAND_WAIT_S = 0.5
+GRIP_WAIT_S = 1.0
+# Homing seeks limit switches with no position feedback beforehand, so it
+# needs the same generous ceiling as jog_keyboard.py's HOME_WAIT_S.
+HOME_TIMEOUT_S = 180.0
+# Matches goto_position.py's MOVE_TIMEOUT_S for coordinated m/mp moves.
+MOVE_TIMEOUT_S = 30.0
+# Cap line collection so a chatty firmware stream cannot block forever.
+READ_HARD_LIMIT_S = 1.0
+# Ceiling on how long a single read_lines() poll waits while draining an
+# async move/home completion line, so the overall timeout loop stays responsive.
+POLL_WAIT_S = 0.3
+
+
+class Mt4ClientError(Exception):
+    """Raised when the arm is unreachable or returns an unexpected response."""
+
+
+class Mt4Client:
+    """Thread-safe owner of the MT4 serial connection."""
+
+    def __init__(
+        self,
+        port: str = DEFAULT_PORT,
+        baud: int = DEFAULT_BAUD,
+    ) -> None:
+        self.port = port
+        self.baud = baud
+        self._ser: serial_module.Serial | None = None
+        # Reentrant so methods like move_to() can call _get_status_unlocked()
+        # (to default J4 / check homed) while already holding the lock.
+        self._lock = threading.RLock()
+
+    @property
+    def connected(self) -> bool:
+        return self._ser is not None and self._ser.is_open
+
+    def ensure_connected(self) -> None:
+        with self._lock:
+            self._ensure_connected_unlocked()
+
+    def connect(self) -> None:
+        self.ensure_connected()
+
+    def _ensure_connected_unlocked(self) -> None:
+        if self.connected:
+            return
+        try:
+            self._ser = open_serial(self.port, self.baud)
+        except Exception as exc:
+            raise Mt4ClientError(
+                f"Could not open {self.port} @ {self.baud} baud: {exc}"
+            ) from exc
+        time.sleep(BOOT_WAIT_S)
+        read_lines(self._ser, 0.5, hard_limit=0.6)  # discard boot banner
+
+    def close(self) -> None:
+        with self._lock:
+            if self._ser is not None:
+                self._ser.close()
+                self._ser = None
+
+    def _require_serial(self) -> serial_module.Serial:
+        if not self.connected:
+            raise Mt4ClientError("Not connected to the arm")
+        assert self._ser is not None
+        return self._ser
+
+    def _send_and_collect(self, cmd: str, wait: float) -> list[str]:
+        ser = self._require_serial()
+        return send(
+            ser,
+            cmd,
+            wait=wait,
+            hard_limit=wait + READ_HARD_LIMIT_S,
+        )
+
+    def _get_status_unlocked(self) -> Mt4Status:
+        self._ensure_connected_unlocked()
+        lines = self._send_and_collect("?", wait=STATUS_WAIT_S)
+
+        # `?` and `pos` both print the same joint-position + derived
+        # `tcp x=...` line (see firmware print_joint_pos()), so retrying
+        # with the lighter `pos` query is a real fallback if `?`'s fuller
+        # reply got cut off. There's no separate firmware "tcp" command.
+        if not lines:
+            lines = self._send_and_collect("pos", wait=1.5)
+
+        status = parse_status_lines(lines)
+        status.parse_failed = status.tcp is None and not status.joints
+        return status
+
+    def get_status(self) -> Mt4Status:
+        with self._lock:
+            return self._get_status_unlocked()
+
+    def get_tcp(self) -> TcpPose:
+        status = self.get_status()
+        if status.tcp is None:
+            raise Mt4ClientError("Could not read TCP pose")
+        return status.tcp
+
+    def stop(self) -> list[str]:
+        with self._lock:
+            self._ensure_connected_unlocked()
+            return self._send_and_collect("stop", wait=COMMAND_WAIT_S)
+
+    def _await_completion(
+        self,
+        *,
+        done_prefix: str,
+        timeout: float,
+        collected: list[str],
+    ) -> dict[str, object]:
+        """Poll for an async `<cmd> done ...` / `err ...` line after an `ok`
+        ack, matching the pattern goto_position.py's send_move() already uses
+        for `m`/`mp`. Returns a dict with "ok", "lines", and (on success) the
+        parsed final "tcp" pose if one was printed.
+
+        `collected` may already contain the terminal line -- a no-op move
+        (e.g. all-zero relative deltas) gets "ok m" + "m done ..." back
+        synchronously in the same initial read, with nothing further to
+        poll for -- so every batch (including the one passed in) is scanned
+        before waiting for more.
+        """
+
+        def scan(batch: list[str]) -> dict[str, object] | None:
+            for line in batch:
+                if line.startswith("err"):
+                    return {"ok": False, "error": line, "lines": collected}
+                if line.startswith(done_prefix):
+                    tcp = next(
+                        (parse_tcp_line(candidate) for candidate in batch),
+                        None,
+                    )
+                    return {
+                        "ok": True,
+                        "lines": collected,
+                        "tcp": tcp.as_dict() if tcp else None,
+                    }
+            return None
+
+        result = scan(collected)
+        if result is not None:
+            return result
+
+        ser = self._require_serial()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            lines = read_lines(ser, POLL_WAIT_S, hard_limit=POLL_WAIT_S + READ_HARD_LIMIT_S)
+            collected.extend(lines)
+            result = scan(lines)
+            if result is not None:
+                return result
+        return {"ok": False, "error": f"Timed out waiting for {done_prefix!r}", "lines": collected}
+
+    def home(
+        self,
+        j1_center: int = J1_HOME_CENTER_STEPS,
+        j2_pull: int = J2_HOME_PULLOFF_STEPS,
+        timeout: float = HOME_TIMEOUT_S,
+    ) -> dict[str, object]:
+        """Run on-device homing (`home <j1> <j2>`) and wait for completion."""
+        with self._lock:
+            self._ensure_connected_unlocked()
+            ser = self._require_serial()
+            ser.write(f"home {j1_center} {j2_pull}\n".encode("ascii"))
+            ser.flush()
+            collected: list[str] = []
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                lines = read_lines(ser, POLL_WAIT_S, hard_limit=POLL_WAIT_S + READ_HARD_LIMIT_S)
+                collected.extend(lines)
+                for line in lines:
+                    if line == "home ok":
+                        return {"ok": True, "lines": collected}
+                    if line.startswith("home fail") or line.startswith("err"):
+                        return {"ok": False, "error": line, "lines": collected}
+            return {"ok": False, "error": "Homing timed out", "lines": collected}
+
+    def move_to(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        j4: float | None = None,
+        grip: int = 0,
+        speed_us: int = 0,
+        timeout: float = MOVE_TIMEOUT_S,
+    ) -> dict[str, object]:
+        """Absolute Cartesian move (`mp`). Requires homing this session.
+
+        `grip=0` leaves the gripper unchanged (firmware convention). When
+        `j4` is left as None, it defaults to the arm's *current* world-frame
+        yaw, which makes the firmware hold gripper orientation fixed during
+        the move (same as `orient on`).
+        """
+        if speed_us and not JOG_SPEED_MIN_US <= speed_us <= JOG_SPEED_MAX_US:
+            raise Mt4ClientError(
+                f"speed_us must be 0 or {JOG_SPEED_MIN_US}-{JOG_SPEED_MAX_US}"
+            )
+        if grip and not GRIPPER_S_OPEN <= grip <= GRIPPER_S_CLOSED:
+            raise Mt4ClientError(
+                f"grip must be 0 (unchanged) or {GRIPPER_S_OPEN}-{GRIPPER_S_CLOSED}"
+            )
+
+        with self._lock:
+            status = self._get_status_unlocked()
+            if not status.homed:
+                raise Mt4ClientError(
+                    "Arm has not homed this session -- call home() first"
+                )
+            if j4 is None:
+                if status.tcp is None:
+                    raise Mt4ClientError(
+                        "Could not read current TCP pose to default j4"
+                    )
+                j4 = status.tcp.j4
+
+            cmd = f"mp {x} {y} {z} {j4} {grip}"
+            if speed_us:
+                cmd += f" {speed_us}"
+            collected = self._send_and_collect(cmd, wait=1.0)
+            return self._await_completion(
+                done_prefix="mp done", timeout=timeout, collected=collected
+            )
+
+    def move_relative(
+        self,
+        dj1: int,
+        dj2: int,
+        dj3: int,
+        dj4: int,
+        dgrip: int = 0,
+        timeout: float = MOVE_TIMEOUT_S,
+    ) -> dict[str, object]:
+        """Bounded relative joint-step move (`m`). Does not require homing --
+        deltas are relative to the current step counters, whatever they are.
+        """
+        with self._lock:
+            self._ensure_connected_unlocked()
+            cmd = f"m {dj1} {dj2} {dj3} {dj4} {dgrip}"
+            collected = self._send_and_collect(cmd, wait=1.0)
+            return self._await_completion(
+                done_prefix="m done", timeout=timeout, collected=collected
+            )
+
+    def gripper(self, action: str | int) -> dict[str, object]:
+        """Gripper sweep/set (`g o|c|stop|<120-285>`)."""
+        if isinstance(action, str):
+            normalized = action.strip().lower()
+            arg = {"open": "o", "close": "c", "stop": "stop"}.get(normalized)
+            if arg is None:
+                raise Mt4ClientError(
+                    "action must be 'open', 'close', 'stop', or an int "
+                    f"{GRIPPER_S_OPEN}-{GRIPPER_S_CLOSED}"
+                )
+        else:
+            if not GRIPPER_S_OPEN <= action <= GRIPPER_S_CLOSED:
+                raise Mt4ClientError(
+                    f"action must be {GRIPPER_S_OPEN}-{GRIPPER_S_CLOSED}"
+                )
+            arg = str(int(action))
+
+        with self._lock:
+            self._ensure_connected_unlocked()
+            lines = self._send_and_collect(f"g {arg}", wait=GRIP_WAIT_S)
+        for line in lines:
+            if line.startswith("err"):
+                return {"ok": False, "error": line, "lines": lines}
+        return {"ok": True, "lines": lines}

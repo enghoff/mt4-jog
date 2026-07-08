@@ -30,7 +30,49 @@ python jog_keyboard.py --port COM6
 # Or move to an absolute position (prompts for x/y/z/j4/gripper; requires
 # having homed this session)
 python goto_position.py --port COM6
+
+# Local HTTP MCP server (Phase 1: status + stop only)
+python -m mt4_mcp
+# Then open MCP Inspector at http://127.0.0.1:8787/mcp
 ```
+
+### MCP server (`mt4_mcp`)
+
+Phase 1 exposes read-only status tools plus emergency stop over local HTTP
+(Streamable HTTP at `/mcp`). Motion tools (`mt4_home`, `mt4_move`) come in a
+later phase.
+
+```powershell
+# Default: serial COM6, MCP on http://127.0.0.1:8787/mcp
+python -m mt4_mcp
+
+# Override ports
+$env:MT4_SERIAL_PORT = "COM6"
+$env:MT4_MCP_PORT = "8787"
+python -m mt4_mcp
+```
+
+| Tool | Purpose |
+|------|---------|
+| `mt4_status` | Full `?` status as JSON |
+| `mt4_tcp` | Current TCP pose only |
+| `mt4_stop` | Stop jog / cancel move |
+
+Test with [MCP Inspector](https://github.com/modelcontextprotocol/inspector):
+connect to `http://127.0.0.1:8787/mcp`, transport **Streamable HTTP**.
+
+### Cursor
+
+This repo includes `.cursor/mcp.json`, which registers the MT4 server for this
+workspace. Cursor launches it over stdio (`python -m mt4_mcp --stdio`) when you
+enable the **MT4** MCP server in settings.
+
+1. Open **Cursor Settings → MCP** (or reload the window after pulling).
+2. Enable the **MT4** server.
+3. Stop `jog_keyboard.py` first — only one process can use COM6.
+
+For HTTP mode instead (e.g. MCP Inspector), run `python -m mt4_mcp` without
+`--stdio`.
 
 ### Keys (`jog_keyboard.py`)
 
@@ -110,6 +152,7 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 |------|---------|
 | `jog_keyboard.py` | Keyboard jog client (Cartesian + J4 roll + gripper) |
 | `goto_position.py` | Prompt-driven absolute-position client (firmware `mp`) |
+| `mt4_mcp/` | Local HTTP MCP server for arm status and control |
 | `flash_jog.py` | Flash custom firmware |
 | `restore_stock.py` | Flash stock firmware backup |
 | `mt4_jog/` | Python joint map, kinematics, serial helpers |

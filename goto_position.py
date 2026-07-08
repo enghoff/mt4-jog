@@ -29,28 +29,12 @@ from mt4_jog.joints import (
     JOG_SPEED_MIN_US,
 )
 from mt4_jog.serial import open_serial, read_lines, send
-
-FIELDS = ("x", "y", "z", "j4", "grip", "speed")
+from mt4_jog.status import parse_tcp_line
 MOVE_TIMEOUT_S = 30.0
 # Matches jog_keyboard.py's HOME_WAIT_S -- the limit-switch seeks inside
 # do_home() can each run up to HOME_SEEK_MAX steps (~20s) if a limit isn't
 # found quickly, on top of the widen/backoff steps.
 HOME_TIMEOUT_S = 180.0
-
-
-def parse_tcp_line(line: str) -> dict[str, float] | None:
-    if not line.startswith("tcp "):
-        return None
-    out: dict[str, float] = {}
-    for tok in line[4:].split():
-        key, _, val = tok.partition("=")
-        if key not in FIELDS:
-            continue
-        try:
-            out[key] = float(val)
-        except ValueError:
-            return None
-    return out if len(out) == len(FIELDS) else None
 
 
 def query_status(ser) -> tuple[bool, dict[str, float] | None]:
@@ -61,9 +45,9 @@ def query_status(ser) -> tuple[bool, dict[str, float] | None]:
         # at the start -- check by substring, not startswith.
         if "HOMED=yes" in line:
             homed = True
-        parsed = parse_tcp_line(line)
-        if parsed is not None:
-            tcp = parsed
+        pose = parse_tcp_line(line)
+        if pose is not None:
+            tcp = pose.as_dict()
     return homed, tcp
 
 
