@@ -119,6 +119,18 @@ void do_home(uint16_t j1_center, uint16_t j2_pull) {
   // seek-toward-interference in step 3.
   back_off(J3_DRIVE, J3_DIR, J3_HOME_DIR_HIGH, J3_PREWIDEN_STEPS);
 
+  // 1b) If J3 pre-widen left J2 sitting on its limit switch, widen J2
+  // until the switch releases, then widen a little more before seeking.
+  poll_limits();
+  if (limit_triggered(J2_LIMIT)) {
+    if (!seek_until(J2_DRIVE, J2_DIR, !J2_HOME_DIR_HIGH, J2_LIMIT, false)) {
+      Serial.println(F("home fail J2 prewiden"));
+      homing_active = false;
+      return;
+    }
+    back_off(J2_DRIVE, J2_DIR, J2_HOME_DIR_HIGH, J2_PREWIDEN_STEPS);
+  }
+
   // 2) Home J2: seek its limit switch and stop right at the raw trigger
   // (no pulloff yet -- J3's seek below needs J2 held there).
   if (!seek_limit(J2_DRIVE, J2_DIR, J2_HOME_DIR_HIGH, J2_LIMIT)) {

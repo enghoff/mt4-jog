@@ -63,10 +63,11 @@ static const bool J3_HOME_DIR_HIGH = true;
 static const uint16_t J1_HOME_CENTER_DEFAULT = 4580;
 static const uint16_t J2_HOME_PULL_DEFAULT = 1000;
 // Pre-home backoff for J3 so it isn't already sitting in a position that
-// interferes with J2's approach to its own limit switch. J2 needs no
-// pre-widen of its own: homing is assumed to start near home, so J2 won't
-// already be sitting at its limit switch when it starts seeking.
-static const uint16_t J3_PREWIDEN_STEPS = 500;
+// interferes with J2's approach to its own limit switch.
+static const uint16_t J3_PREWIDEN_STEPS = 1200;
+// J2 widen steps after releasing its limit switch (if already
+// triggered after J3 pre-widen) before seeking back toward the switch.
+static const uint16_t J2_PREWIDEN_STEPS = 500;
 static const uint32_t HOME_SEEK_MAX = 25000;
 // Dwell after J1 hits its limit switch, before reversing back toward
 // center. Lets J1 fully settle at the switch (no ramp/creep on approach)
