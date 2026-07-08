@@ -62,9 +62,10 @@ static const bool J2_HOME_DIR_HIGH = true;
 static const bool J3_HOME_DIR_HIGH = true;
 static const uint16_t J1_HOME_CENTER_DEFAULT = 4580;
 static const uint16_t J2_HOME_PULL_DEFAULT = 1000;
+static const uint16_t J3_HOME_PULL_DEFAULT = 500;
 // Pre-home backoff for J3 so it isn't already sitting in a position that
 // interferes with J2's approach to its own limit switch.
-static const uint16_t J3_PREWIDEN_STEPS = 1200;
+static const uint16_t J3_PREWIDEN_STEPS = 1000;
 // J2 widen steps after releasing its limit switch (if already
 // triggered after J3 pre-widen) before seeking back toward the switch.
 static const uint16_t J2_PREWIDEN_STEPS = 500;

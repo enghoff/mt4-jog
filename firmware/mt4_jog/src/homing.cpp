@@ -159,10 +159,10 @@ void do_home(uint16_t j1_center, uint16_t j2_pull) {
   delay(J1_HOME_LIMIT_PAUSE_MS);
   back_off(J1_DRIVE, J1_DIR, J1_HOME_DIR_HIGH, j1_center);
 
-  // 5) Pull both J2 and J3 off their limit/interference extremes now that
-  // J1 is done.
+  // 5) Pull J2 and J3 off their limit/interference extremes now that J1
+  // is done (J3 uses a shorter pull-off than J2).
   back_off(J2_DRIVE, J2_DIR, J2_HOME_DIR_HIGH, j2_pull);
-  back_off(J3_DRIVE, J3_DIR, J3_HOME_DIR_HIGH, j2_pull);
+  back_off(J3_DRIVE, J3_DIR, J3_HOME_DIR_HIGH, J3_HOME_PULL_DEFAULT);
 
   stop_jog();
   step_pin = 0;
