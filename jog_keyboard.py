@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keyboard jog for MT4 custom jog firmware — hold key(s) to move, H to home.
+"""Keyboard / Xbox gamepad jog for MT4 custom jog firmware — hold to move, H to home.
 
 Cartesian-only jog (world-frame TCP motion via firmware `cj`, on-device
 Jacobian/DLS resolved-rate) plus J4 wrist roll and the gripper. Direct
@@ -13,6 +13,7 @@ import argparse
 import sys
 import time
 
+from mt4_jog.gamepad import A, B, BACK, X, XboxGamepad
 from mt4_jog.joints import (
     DEFAULT_BAUD,
     DEFAULT_PORT,
@@ -73,15 +74,15 @@ VK = {
 }
 
 
-def print_help() -> None:
-    print("MT4 keyboard jog — hold one or more keys to move, release to stop")
+def print_help(*, gamepad: bool) -> None:
+    print("MT4 jog — hold keys or sticks to move, release to stop")
     print()
+    print("Keyboard:")
     print("  I / K     world +Z / -Z")
     print("  S / W     world +Y / -Y")
     print("  A / D     world +X / -X")
     print("  J / L     J4 wrist roll (when no Cartesian key held)")
     print("  -  / =    nudge jog speed slower / faster (live)")
-    print()
     print("  H       home J1 + J2 (on-device)")
     print(
         f"  Q / E   gripper sweep open / close "
@@ -90,6 +91,18 @@ def print_help() -> None:
     print("  SPACE   status")
     print("  0       stop, drivers off")
     print("  ESC     quit")
+    if gamepad:
+        print()
+        print("Xbox controller (player 1):")
+        print("  Left stick        world X / Y")
+        print("  Right stick Y     world Z")
+        print("  Right stick X     J4 wrist roll (when not moving XYZ)")
+        print("  LT / RT           gripper open / close")
+        print("  LB / RB or D-pad  jog speed slower / faster")
+        print("  A                 home")
+        print("  B                 stop, drivers off")
+        print("  X                 status")
+        print("  Back              quit")
     print()
     limits = ", ".join(f"{io}={label}" for io, label in sorted(LIMIT_JOINTS.items()))
     print(f"Limits: {limits}")
@@ -134,12 +147,16 @@ def stop_jog(ser) -> None:
     time.sleep(0.02)
 
 
-def pressed_cart_vector() -> tuple[int, int, int] | None:
+def pressed_cart_vector(gamepad_cart: tuple[int, int, int] | None = None) -> tuple[int, int, int] | None:
     vec = [0, 0, 0]
     for key, delta in CART_BINDINGS.items():
         if key_down(key):
             for i in range(3):
                 vec[i] += delta[i]
+    if gamepad_cart is not None:
+        for i in range(3):
+            vec[i] += gamepad_cart[i]
+    vec = [max(-1, min(1, v)) for v in vec]
     if vec == [0, 0, 0]:
         return None
     return vec[0], vec[1], vec[2]
@@ -167,7 +184,7 @@ def resend_j4_jog(ser) -> None:
     send_quick(ser, "j")
 
 
-def j4_key_state() -> bool | None:
+def j4_key_state(gamepad_j4: bool | None = None) -> bool | None:
     """Return dir_high for J4 roll, or None when J/L not held (or both held)."""
     j = key_down("j")
     l = key_down("l")
@@ -175,7 +192,7 @@ def j4_key_state() -> bool | None:
         return False
     if l and not j:
         return True
-    return None
+    return gamepad_j4
 
 
 def run_home(ser, buf: list[str], j1: int, j2: int, verbose: bool) -> None:
@@ -210,7 +227,7 @@ def gripper_sweep_stop(ser) -> None:
     send_quick(ser, "g stop")
 
 
-def gripper_key_state() -> str | None:
+def gripper_key_state(gamepad_grip: str | None = None) -> str | None:
     """Return 'open', 'close', or None when Q/E not held (or both held)."""
     q = key_down("q")
     e = key_down("e")
@@ -218,7 +235,7 @@ def gripper_key_state() -> str | None:
         return "open"
     if e and not q:
         return "close"
-    return None
+    return gamepad_grip
 
 
 def main() -> int:
@@ -233,15 +250,35 @@ def main() -> int:
         action="store_true",
         help="disable J4 wrist unwind during Cartesian jog",
     )
+    parser.add_argument(
+        "--no-gamepad",
+        action="store_true",
+        help="disable Xbox controller input (keyboard only)",
+    )
+    parser.add_argument(
+        "--gamepad-deadzone",
+        type=int,
+        default=9000,
+        help="stick deadzone for Xbox controller (default: 9000)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
     if sys.platform != "win32":
-        print("Requires Windows (GetAsyncKeyState).", file=sys.stderr)
+        print("Requires Windows (GetAsyncKeyState / XInput).", file=sys.stderr)
         return 1
 
-    print_help()
-    print(f"Port {args.port} @ {args.baud} — focus this window.")
+    gamepad = None
+    if not args.no_gamepad:
+        gamepad = XboxGamepad(deadzone=args.gamepad_deadzone)
+        if not gamepad.available:
+            print("XInput not available — keyboard only.", file=sys.stderr)
+            gamepad = None
+
+    print_help(gamepad=gamepad is not None)
+    print(f"Port {args.port} @ {args.baud} — focus this window for keyboard.")
+    if gamepad is not None:
+        print("Xbox controller: plug in before start; sticks work without focus.")
     print("WARNING: drivers energize while any jog key is held.")
 
     poll_s = args.poll_ms / 1000.0
@@ -269,10 +306,15 @@ def main() -> int:
             while True:
                 drain_async(ser, buf, args.verbose)
 
-                if key_down("esc"):
+                pad = gamepad.poll() if gamepad is not None else None
+                pad_cart = pad.cart if pad and pad.connected else None
+                pad_j4 = pad.j4 if pad and pad.connected else None
+                pad_grip = pad.grip if pad and pad.connected else None
+
+                if key_down("esc") or (pad is not None and pad.quit):
                     break
 
-                if key_down("space"):
+                if key_down("space") or (pad is not None and pad.status):
                     stop_jog(ser)
                     active_j4 = None
                     active_cart = None
@@ -280,11 +322,11 @@ def main() -> int:
                     grip_state = None
                     for line in send(ser, "?", wait=1.0):
                         print(line)
-                    while key_down("space"):
+                    while key_down("space") or (gamepad is not None and gamepad.is_pressed(X)):
                         time.sleep(poll_s)
                     continue
 
-                if key_down("0"):
+                if key_down("0") or (pad is not None and pad.stop_all):
                     stop_jog(ser)
                     active_j4 = None
                     active_cart = None
@@ -292,23 +334,26 @@ def main() -> int:
                     grip_state = None
                     send(ser, "e0", wait=0.2)
                     send(ser, "all f", wait=0.3)
-                    while key_down("0"):
+                    while key_down("0") or (gamepad is not None and gamepad.is_pressed(B)):
                         time.sleep(poll_s)
                     continue
 
-                if key_down("h"):
+                if key_down("h") or (pad is not None and pad.home):
                     stop_jog(ser)
                     active_j4 = None
                     active_cart = None
                     gripper_sweep_stop(ser)
                     grip_state = None
                     run_home(ser, buf, args.j1_center, args.j2_pull, args.verbose)
-                    while key_down("h"):
+                    while key_down("h") or (gamepad is not None and gamepad.is_pressed(A)):
                         time.sleep(poll_s)
                     continue
 
                 minus = key_down("minus")
                 plus = key_down("plus")
+                if pad is not None:
+                    minus = minus or pad.speed_down
+                    plus = plus or pad.speed_up
                 now_t = time.monotonic()
                 if (minus or plus) and now_t - last_speed_adjust >= SPEED_REPEAT_S:
                     # Lower period = faster; "=" (plus) speeds up. Keeps
@@ -319,7 +364,7 @@ def main() -> int:
                     last_speed_adjust = now_t
 
                 # Cartesian keys take priority over J4 roll when held.
-                desired_cart = pressed_cart_vector()
+                desired_cart = pressed_cart_vector(pad_cart)
                 now = time.monotonic()
                 if desired_cart is not None:
                     if active_j4 is not None:
@@ -333,7 +378,7 @@ def main() -> int:
                     if active_cart is not None:
                         stop_jog(ser)
                         active_cart = None
-                    j4 = j4_key_state()
+                    j4 = j4_key_state(pad_j4)
                     if j4 is None:
                         if active_j4 is not None:
                             stop_jog(ser)
@@ -346,7 +391,7 @@ def main() -> int:
                         resend_j4_jog(ser)
                         last_j4_send = now
 
-                desired_grip = gripper_key_state()
+                desired_grip = gripper_key_state(pad_grip)
                 if desired_grip is None:
                     if grip_state is not None:
                         gripper_sweep_stop(ser)
