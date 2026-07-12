@@ -42,6 +42,22 @@ python jog_keyboard.py --port COM6
 | 0 | Stop, drivers off |
 | ESC | Quit |
 
+**Xbox controller** (player 1, via Windows XInput; works without terminal focus):
+
+| Control | Action |
+|---------|--------|
+| Left stick | World X / Y |
+| Right stick Y | World Z |
+| Right stick X | J4 wrist roll (when not moving XYZ) |
+| LT / RT | Gripper open / close |
+| LB / RB or D-pad up/down | Jog speed faster / slower |
+| A | Home |
+| B | Stop, drivers off |
+| X | Status |
+| Back | Quit |
+
+Use `--no-gamepad` for keyboard only. `--gamepad-deadzone` adjusts stick deadzone (default 9000).
+
 Use `--no-orient` to disable J4 wrist unwind during Cartesian moves (also
 live-toggleable via serial `orient on|off`). When on, J4 counters J1's yaw 1:1.
 
@@ -95,7 +111,7 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 
 | Path | Purpose |
 |------|---------|
-| `jog_keyboard.py` | Keyboard jog client (Cartesian + J4 roll + gripper) |
+| `jog_keyboard.py` | Keyboard + Xbox gamepad jog client (Cartesian + J4 roll + gripper) |
 | `flash_jog.py` | Flash custom firmware |
 | `restore_stock.py` | Flash stock firmware backup |
 | `mt4_jog/` | Python joint map, kinematics, serial helpers |
