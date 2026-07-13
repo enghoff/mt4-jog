@@ -111,6 +111,21 @@ def cmd_place(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_place_here(args: argparse.Namespace) -> int:
+    from mt4_vision.pickplace import place_here
+
+    calib = load_calibration(Path(args.calib))
+    client = _pick_place_client(args)
+    try:
+        tcp = client.get_tcp()
+        print(f"placing at current position ({tcp.x:.1f}, {tcp.y:.1f})")
+        place_here(client, calib)
+    finally:
+        client.close()
+    print("done")
+    return 0
+
+
 def cmd_goto_marker(args: argparse.Namespace) -> int:
     from mt4_vision.pickplace import goto_marker
 
@@ -157,6 +172,13 @@ def main() -> None:
     p.add_argument("y", type=float)
     p.add_argument("--port", default="")
     p.set_defaults(func=cmd_place)
+
+    p = sub.add_parser(
+        "place-here",
+        help="place held cube at the current TCP xy (moves the arm)",
+    )
+    p.add_argument("--port", default="")
+    p.set_defaults(func=cmd_place_here)
 
     p = sub.add_parser(
         "goto-marker",

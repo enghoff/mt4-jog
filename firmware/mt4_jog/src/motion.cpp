@@ -18,21 +18,29 @@ static unsigned long cart_refresh_ms = 0;
 static void mp_path_cancel();
 static void report_move_done();
 
-static JointAnglesDeg angles_from_steps() {
+static JointAnglesDeg angles_from_joint_steps(const long steps[MT4_NUM_JOINTS]) {
   JointAnglesDeg q;
   q.j1 = MT4_HOME_J1_DEG + MT4_J1_STEP_SIGN *
-                               static_cast<float>(joint_steps[0]) /
+                               static_cast<float>(steps[0]) /
                                MT4_STEPS_PER_DEG[0];
   q.j2 = MT4_HOME_J2_DEG + MT4_J2_STEP_SIGN *
-                               static_cast<float>(joint_steps[1]) /
+                               static_cast<float>(steps[1]) /
                                MT4_STEPS_PER_DEG[1];
   q.j3 = MT4_HOME_J3_DEG + MT4_J3_STEP_SIGN *
-                               static_cast<float>(joint_steps[2]) /
+                               static_cast<float>(steps[2]) /
                                MT4_STEPS_PER_DEG[2];
   q.j4 = MT4_HOME_J4_DEG + MT4_J4_STEP_SIGN *
-                               static_cast<float>(joint_steps[3]) /
+                               static_cast<float>(steps[3]) /
                                MT4_STEPS_PER_DEG[3];
   return q;
+}
+
+static JointAnglesDeg angles_from_steps() {
+  long steps[MT4_NUM_JOINTS];
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    steps[i] = joint_steps[i];
+  }
+  return angles_from_joint_steps(steps);
 }
 
 void motion_init() {
@@ -269,23 +277,28 @@ static void mp_path_xy_at(float s, float *wx, float *wy) {
   }
 }
 
-static bool joint_angles_to_deltas(const JointAnglesDeg *target,
-                                   int32_t deltas[MT4_NUM_JOINTS],
-                                   int32_t *out_master) {
-  const long target_steps[MT4_NUM_JOINTS] = {
-      lroundf((target->j1 - MT4_HOME_J1_DEG) * MT4_STEPS_PER_DEG[0] *
-              MT4_J1_STEP_SIGN),
-      lroundf((target->j2 - MT4_HOME_J2_DEG) * MT4_STEPS_PER_DEG[1] *
-              MT4_J2_STEP_SIGN),
-      lroundf((target->j3 - MT4_HOME_J3_DEG) * MT4_STEPS_PER_DEG[2] *
-              MT4_J3_STEP_SIGN),
-      lroundf((target->j4 - MT4_HOME_J4_DEG) * MT4_STEPS_PER_DEG[3] *
-              MT4_J4_STEP_SIGN),
-  };
+static void angles_to_joint_steps(const JointAnglesDeg *q,
+                                  long out[MT4_NUM_JOINTS]) {
+  out[0] = lroundf((q->j1 - MT4_HOME_J1_DEG) * MT4_STEPS_PER_DEG[0] *
+                   MT4_J1_STEP_SIGN);
+  out[1] = lroundf((q->j2 - MT4_HOME_J2_DEG) * MT4_STEPS_PER_DEG[1] *
+                   MT4_J2_STEP_SIGN);
+  out[2] = lroundf((q->j3 - MT4_HOME_J3_DEG) * MT4_STEPS_PER_DEG[2] *
+                   MT4_J3_STEP_SIGN);
+  out[3] = lroundf((q->j4 - MT4_HOME_J4_DEG) * MT4_STEPS_PER_DEG[3] *
+                   MT4_J4_STEP_SIGN);
+}
+
+static bool joint_steps_to_deltas(const long current[MT4_NUM_JOINTS],
+                                  const JointAnglesDeg *target,
+                                  int32_t deltas[MT4_NUM_JOINTS],
+                                  int32_t *out_master) {
+  long target_steps[MT4_NUM_JOINTS];
+  angles_to_joint_steps(target, target_steps);
 
   int32_t master = 0;
   for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
-    const long d = target_steps[i] - joint_steps[i];
+    const long d = target_steps[i] - current[i];
     if (d > MOVE_MAX_STEPS || d < -MOVE_MAX_STEPS) {
       return false;
     }
@@ -299,10 +312,19 @@ static bool joint_angles_to_deltas(const JointAnglesDeg *target,
   return true;
 }
 
-/* Arm one Cartesian-linear `mp` segment (seg is 1..num_segments). Returns
- * false on IK/delta failure. When the segment needs no joint motion, returns
- * true with move_mode left false so the caller can chain immediately. */
-static bool mp_execute_segment(uint16_t seg) {
+static bool joint_angles_to_deltas(const JointAnglesDeg *target,
+                                   int32_t deltas[MT4_NUM_JOINTS],
+                                   int32_t *out_master) {
+  long current[MT4_NUM_JOINTS];
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    current[i] = joint_steps[i];
+  }
+  return joint_steps_to_deltas(current, target, deltas, out_master);
+}
+
+/* Joint target at the end of Cartesian `mp` segment seg (1..num_segments). */
+static bool mp_segment_target(uint16_t seg, const JointAnglesDeg *near,
+                              JointAnglesDeg *out) {
   const float t =
       static_cast<float>(seg) / static_cast<float>(mp_path.num_segments);
   float wx;
@@ -313,12 +335,50 @@ static bool mp_execute_segment(uint16_t seg) {
                            ? mp_path.sj4_ws
                            : mp_path.sj4_ws + t * (mp_path.ej4_ws - mp_path.sj4_ws);
 
-  const JointAnglesDeg near = angles_from_steps();
-  JointAnglesDeg target;
-  if (!mt4_ik_position(&near, wx, wy, wz, 0.0f, &target)) {
+  if (!mt4_ik_position(near, wx, wy, wz, 0.0f, out)) {
     return false;
   }
-  target.j4 = wj4_ws - target.j1;
+  out->j4 = wj4_ws - out->j1;
+  return true;
+}
+
+/* Sum per-segment master ticks along the planned Cartesian path so the
+ * accel/decel ramp tracks detours and segmentation, not a straight
+ * joint-space chord to the final pose. */
+static int32_t mp_estimate_path_ticks(void) {
+  long sim[MT4_NUM_JOINTS];
+  const JointAnglesDeg q0 = angles_from_steps();
+  angles_to_joint_steps(&q0, sim);
+
+  int32_t total = 0;
+  for (uint16_t seg = 1; seg <= mp_path.num_segments; ++seg) {
+    const JointAnglesDeg near = angles_from_joint_steps(sim);
+    JointAnglesDeg target;
+    if (!mp_segment_target(seg, &near, &target)) {
+      return 0;
+    }
+    int32_t deltas[MT4_NUM_JOINTS];
+    int32_t master = 0;
+    if (!joint_steps_to_deltas(sim, &target, deltas, &master)) {
+      return 0;
+    }
+    total += master;
+    for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+      sim[i] += deltas[i];
+    }
+  }
+  return total;
+}
+
+/* Arm one Cartesian-linear `mp` segment (seg is 1..num_segments). Returns
+ * false on IK/delta failure. When the segment needs no joint motion, returns
+ * true with move_mode left false so the caller can chain immediately. */
+static bool mp_execute_segment(uint16_t seg) {
+  const JointAnglesDeg near = angles_from_steps();
+  JointAnglesDeg target;
+  if (!mp_segment_target(seg, &near, &target)) {
+    return false;
+  }
 
   int32_t deltas[MT4_NUM_JOINTS];
   int32_t master = 0;
@@ -683,23 +743,6 @@ bool start_absolute_move(float x, float y, float z, float j4_deg, long g,
     num_segments = MP_MAX_SEGMENTS;
   }
 
-  // Estimate the whole move's master-tick count (start -> final target,
-  // straight joint-space line) purely to time the accel/decel ramp -- the
-  // actual path/positioning is unaffected, still solved per-segment below.
-  // A close-but-imperfect estimate (IK is mildly nonlinear across segments)
-  // only means the ramp starts decelerating a little early/late, not that
-  // the arm ends up anywhere different.
-  int32_t ramp_deltas[MT4_NUM_JOINTS];
-  int32_t master_total = 0;
-  if (!joint_angles_to_deltas(&target, ramp_deltas, &master_total)) {
-    master_total = 0;  // ramp estimate unavailable -- dda_set_ramp() no-ops
-  }
-  dda_set_ramp(MP_ACCEL_START_US, dda_get_speed_us(), master_total,
-               MP_ACCEL_RAMP_TICKS);
-
-  cart_jog_mode = false;
-  move_done_is_mp = true;
-
   mp_path.sz = start_tcp.z;
   mp_path.sj4_ws = ws_j4_now;
   mp_path.ez = z;
@@ -708,6 +751,14 @@ bool start_absolute_move(float x, float y, float z, float j4_deg, long g,
   mp_path.num_pieces = num_pieces;
   mp_path.total_xy_len = xy_len;
   mp_path.num_segments = num_segments;
+
+  const int32_t master_total = mp_estimate_path_ticks();
+  dda_set_ramp(MP_ACCEL_START_US, dda_get_speed_us(), master_total,
+               MP_ACCEL_RAMP_TICKS);
+
+  cart_jog_mode = false;
+  move_done_is_mp = true;
+
   mp_path.next_seg = 1;
   mp_path.active = true;
 

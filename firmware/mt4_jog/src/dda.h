@@ -33,8 +33,8 @@ uint16_t dda_get_speed_us();
 /* Configure an acceleration ramp for an upcoming multi-segment coordinated
  * move (the `mp` command): starts at start_us, ramps toward cruise_us over
  * up to ramp_ticks master ticks, holds cruise, then ramps symmetrically back
- * toward start_us over the last ramp_ticks of total_ticks (the estimated
- * total master ticks for the *whole* move, not just one segment).
+ * toward start_us over the last ramp_ticks of total_ticks (the summed
+ * per-segment master ticks along the planned `mp` path).
  *
  * Persists across dda_arm()/dda_engage() calls (segment boundaries) --
  * `mp` calls dda_stop() between every segment, but neither dda_stop() nor

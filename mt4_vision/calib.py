@@ -47,6 +47,12 @@ class Calibration:
     # Travel height between moves (mm). Keep modest -- the arm should stay
     # low over the desk, well inside its envelope.
     safe_z: float
+    # Step period (us) for safe_z transits. Must be below the firmware ramp's
+    # MP_ACCEL_START_US (1800) to engage accel/decel; 700 is fastest.
+    travel_speed_us: int = 700
+    # Step period (us) for pick/place descent and table touch -- deliberately
+    # slow (>= 1800) so the firmware ramp stays off near the work surface.
+    approach_speed_us: int = 2400
     # Gripper S values for this cube size (firmware absolute, 120-285).
     grip_open_s: int = 140
     grip_close_s: int = 240
