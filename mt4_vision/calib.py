@@ -6,9 +6,15 @@ gathered by jogging the arm's TCP to touch each marker center -- this absorbs
 the entire camera pose, so no camera intrinsics are needed.
 
 Cubes are detected by their top face, which sits cube_height_mm above the
-table plane, so the raw homography output is displaced radially away from the
-camera's nadir. When cam_xy_robot/cam_height_mm are set, detections are
-corrected by shrinking toward the nadir point by (h_cam - h_cube) / h_cam.
+table plane, so the raw table-plane homography output is off for them by a
+camera-parallax amount -- confirmed empirically (see calibrate_height.py) to
+be roughly constant across the desk for this camera's mounting, not clearly
+radial from a nadir point, so the primary correction is cube_top_homography:
+a second homography/affine fit the same way as the table-plane one, but from
+correspondences at cube-top height (an object of known height placed exactly
+at already-calibrated robot XYs, photographed, its pixel position paired with
+that XY). cam_xy_robot/cam_height_mm remain as a fallback radial-scaling
+correction for setups without a cube_top_homography.
 """
 
 from __future__ import annotations
@@ -46,8 +52,26 @@ class Calibration:
     grip_close_s: int = 240
     # Cube edge length (mm), used for the parallax correction and place height.
     cube_height_mm: float = 30.0
-    # Optional parallax correction: robot XY directly under the camera and the
-    # camera lens height above the table (mm). None disables the correction.
+    # Preferred cube-top correction: a second pixel -> robot-XY homography
+    # fit directly at cube-top height (see calibrate_height.py) from
+    # arm-placed probe cubes -- the arm's commanded place position is the
+    # ground truth. None if not yet calibrated.
+    cube_top_homography: list[list[float]] | None = None
+    # Pixel -> metric-table-frame homography from the marker-corner bundle
+    # (table_fit.py). Perspective comes from 20 subpixel corners, so this is
+    # the trustworthy projective part; the maps above are (similarity .
+    # bundle) compositions of it. Stored so cheap low-DOF refits (e.g. the
+    # cube-top similarity from probes) can reuse the perspective without
+    # re-solving it.
+    bundle_homography: list[list[float]] | None = None
+    # Raw calibration observations (marker id -> {pixel, corners, robot}),
+    # kept so the map can be refit offline without redoing the physical
+    # session -- the fitted matrix alone is not invertible back to its data,
+    # which cost us dearly once.
+    raw_marker_observations: dict | None = None
+    # Fallback parallax correction, used only when cube_top_homography is
+    # unset: robot XY directly under the camera and the camera lens height
+    # above the table (mm). None disables the correction entirely.
     cam_xy_robot: list[float] | None = None
     cam_height_mm: float | None = None
     # Per-color HSV overrides merged over detect.COLOR_RANGES defaults.
@@ -57,6 +81,11 @@ class Calibration:
     workspace_hull_px: list[list[float]] | None = None
 
     def pixel_to_robot(self, px: float, py: float, *, on_cube_top: bool = False) -> tuple[float, float]:
+        if on_cube_top and self.cube_top_homography:
+            h = np.array(self.cube_top_homography, dtype=np.float64)
+            v = h @ np.array([px, py, 1.0])
+            return float(v[0] / v[2]), float(v[1] / v[2])
+
         h = np.array(self.homography, dtype=np.float64)
         v = h @ np.array([px, py, 1.0])
         x, y = float(v[0] / v[2]), float(v[1] / v[2])

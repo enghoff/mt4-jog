@@ -194,9 +194,7 @@ def main() -> int:
     from mt4_vision.calib import (
         DEFAULT_CALIB_PATH,
         Calibration,
-        fit_transform,
         load_calibration,
-        reprojection_errors,
     )
     from mt4_vision.camera import DEFAULT_CAMERA_INDEX, CameraError, grab_frame, open_camera
     from mt4_vision.detect import detect_markers
@@ -434,18 +432,32 @@ def main() -> int:
 
     if finish and len(recorded) >= 3:
         flush_console_input()
-        pixel_pts = [ref_px[mid] for mid in sorted(recorded)]
-        robot_pts = [recorded[mid][:2] for mid in sorted(recorded)]
-        matrix, kind = fit_transform(pixel_pts, robot_pts)
-        errors = reprojection_errors(matrix, pixel_pts, robot_pts)
-        print(f"\n{kind} fit from markers {sorted(recorded)}")
-        print(f"reprojection error per marker (mm): {[round(e, 2) for e in errors]}")
-        if kind == "affine":
-            print("NOTE: 3-point affine fit -- no perspective correction; accuracy "
-                  "is best inside the marker triangle. Record a 4th marker if one "
-                  "ever becomes reachable.")
-        if max(errors) > 5.0:
-            print("WARNING: worst marker is >5mm off; consider re-recording it")
+        from mt4_vision.table_fit import fit_table_map
+
+        marker_corners = {
+            m.marker_id: m.corners for m in ref_markers if m.corners is not None
+        }
+        touch_px = {mid: ref_px[mid] for mid in sorted(recorded)}
+        touch_robot = {mid: recorded[mid][:2] for mid in sorted(recorded)}
+        matrix, report = fit_table_map(marker_corners, touch_px, touch_robot)
+        print(f"\n{report.kind} fit from markers {sorted(recorded)}")
+        if report.corner_rms_px is not None:
+            print(f"corner-bundle RMS: {report.corner_rms_px}px "
+                  f"(~{report.corner_rms_mm}mm; >1px suggests lens distortion)")
+        print(f"per-marker touch residual (mm): {report.touch_residuals_mm}")
+        if report.touch_loo_mm:
+            print(f"per-marker leave-one-out error (mm): {report.touch_loo_mm}")
+        for note in report.notes:
+            print(f"NOTE: {note}")
+        # A touch that disagrees with the camera's own geometry by this much
+        # is almost never a sloppy touch -- it's the wrong digit pressed at
+        # that marker (marker ids aren't human-readable; this exact mistake,
+        # ids 2 and 3 swapped, once cost a full recalibration).
+        suspects = [m for m, e in report.touch_residuals_mm.items() if e > 25.0]
+        if suspects:
+            print(f"WARNING: markers {suspects} disagree with the camera geometry by >25mm.")
+            print("  Most likely the wrong digit was pressed at those markers --")
+            print("  re-jog to each and re-record before trusting this calibration.")
 
         # TCP Z while touching a marker IS the table height at that spot.
         table_z_default = round(statistics.median(z for _x, _y, z in recorded.values()), 1)
@@ -474,10 +486,19 @@ def main() -> int:
             grip_open_s=grip_open,
             grip_close_s=grip_close,
             cube_height_mm=cube,
+            bundle_homography=report.bundle_h,
             cam_xy_robot=prev.cam_xy_robot if prev else None,
             cam_height_mm=prev.cam_height_mm if prev else None,
             color_ranges=prev.color_ranges if prev else {},
             workspace_hull_px=hull.tolist(),
+            raw_marker_observations={
+                str(mid): {
+                    "pixel": list(touch_px[mid]),
+                    "corners": marker_corners.get(mid),
+                    "robot": list(touch_robot[mid]),
+                }
+                for mid in sorted(recorded)
+            },
         )
         calib.save(output)
         saved = True

@@ -27,6 +27,12 @@ COLOR_RANGES: dict[str, list[tuple[tuple[int, int, int], tuple[int, int, int]]]]
 # Reject blobs smaller than this (px^2) -- noise, shadows, cable ties.
 # Cube top faces are only ~150-600px^2 at this camera distance.
 MIN_BLOB_AREA = 120.0
+# Reject blobs larger than this -- the arm's own orange/red forearm reads as
+# "red" and its blob (~1600px^2+) is much bigger than any real cube (topped
+# out ~650px^2 across testing). Confirmed picking the wrong "cube" this way:
+# detect_cubes sorts largest-first, so an uncapped arm-body blob outranks the
+# real cube and gets treated as it by any caller taking the first result.
+MAX_BLOB_AREA = 900.0
 # Reject blobs whose bounding-box aspect is far from square (cubes are square
 # from above; this drops elongated glare streaks and desk-edge artifacts).
 MAX_ASPECT = 2.0
@@ -47,6 +53,13 @@ class MarkerDetection:
     marker_id: int
     px: float  # center, pixels
     py: float
+    # The 4 outline corners (pixels, detector order: TL, TR, BR, BL relative
+    # to the marker's own printed orientation). Subpixel-refined. These carry
+    # far more geometric information than the center alone -- 20 corners
+    # across 5 identical printed squares are what make the table-plane
+    # perspective actually observable (5 centers alone are not enough; see
+    # table_fit.py).
+    corners: list[list[float]] | None = None
 
 
 @dataclass
@@ -73,17 +86,28 @@ def detect_markers(
 ) -> list[MarkerDetection]:
     if dict_name not in ARUCO_DICTS:
         raise ValueError(f"unknown ArUco dict {dict_name!r}, one of {sorted(ARUCO_DICTS)}")
+    params = cv2.aruco.DetectorParameters()
+    # Subpixel corner refinement: the corners feed the table-plane fit, where
+    # a half-pixel error is ~1mm on the table.
+    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
     detector = cv2.aruco.ArucoDetector(
-        cv2.aruco.getPredefinedDictionary(ARUCO_DICTS[dict_name]),
-        cv2.aruco.DetectorParameters(),
+        cv2.aruco.getPredefinedDictionary(ARUCO_DICTS[dict_name]), params
     )
     corners, ids, _rejected = detector.detectMarkers(frame)
     if ids is None:
         return []
     out = []
     for marker_corners, marker_id in zip(corners, ids.flatten()):
-        center = marker_corners[0].mean(axis=0)
-        out.append(MarkerDetection(int(marker_id), float(center[0]), float(center[1])))
+        quad = marker_corners[0]
+        center = quad.mean(axis=0)
+        out.append(
+            MarkerDetection(
+                int(marker_id),
+                float(center[0]),
+                float(center[1]),
+                corners=[[float(cx), float(cy)] for cx, cy in quad],
+            )
+        )
     return sorted(out, key=lambda m: m.marker_id)
 
 
@@ -127,7 +151,7 @@ def detect_cubes(
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area < MIN_BLOB_AREA:
+            if area < MIN_BLOB_AREA or area > MAX_BLOB_AREA:
                 continue
             _x, _y, w, h = cv2.boundingRect(contour)
             if max(w, h) / max(min(w, h), 1) > MAX_ASPECT:
@@ -136,10 +160,13 @@ def detect_cubes(
             if m["m00"] == 0:
                 continue
             px, py = m["m10"] / m["m00"], m["m01"] / m["m00"]
-            # Workspace filter: the arm's orange body reads as red, and the
-            # room beyond the desk contributes stray blobs -- both live
-            # outside the marker quadrilateral.
-            if hull is not None and cv2.pointPolygonTest(hull, (px, py), True) < 5:
+            # Workspace filter: off-desk clutter contributes stray blobs.
+            # The margin is negative (allowing detections a bit OUTSIDE the
+            # marker polygon) because the markers now sit inside the arm's
+            # reach, not at the desk edges -- cubes can legitimately sit
+            # outside the polygon. The arm's own red-reading body is handled
+            # by MAX_BLOB_AREA, not this filter.
+            if hull is not None and cv2.pointPolygonTest(hull, (px, py), True) < -80:
                 continue
             det = CubeDetection(color, px, py, area)
             if calibration is not None:
