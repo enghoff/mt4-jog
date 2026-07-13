@@ -13,7 +13,7 @@ import argparse
 import sys
 import time
 
-from mt4_jog.gamepad import A, B, BACK, X, XboxGamepad
+from mt4_jog.gamepad import A, B, START, X, XboxGamepad
 from mt4_jog.joints import (
     DEFAULT_BAUD,
     GRIPPER_S_CLOSED,
@@ -69,6 +69,7 @@ VK = {
     "space": 0x20,
     "0": 0x30,
     "h": 0x48,
+    "grave": 0xC0,
     "minus": 0xBD,
     "plus": 0xBB,
 }
@@ -89,6 +90,7 @@ def print_help(*, gamepad: bool) -> None:
         f"(S{GRIPPER_S_OPEN}–S{GRIPPER_S_CLOSED} on MT4; release = stop)"
     )
     print("  SPACE   status")
+    print("  `       toggle invert world X + Y")
     print("  0       stop, drivers off")
     print("  ESC     quit")
     if gamepad:
@@ -102,6 +104,7 @@ def print_help(*, gamepad: bool) -> None:
         print("  A                 home")
         print("  B                 stop, drivers off")
         print("  X                 status")
+        print("  Start             toggle invert world X + Y")
         print("  Back              quit")
     print()
     limits = ", ".join(f"{io}={label}" for io, label in sorted(LIMIT_JOINTS.items()))
@@ -142,12 +145,59 @@ def key_down(key: str) -> bool:
     return vk is not None and bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
 
 
+def gamepad_button_held(gamepad: XboxGamepad | None, mask: int) -> bool:
+    """Poll fresh controller state before testing a held button."""
+    if gamepad is None or not mask:
+        return False
+    gamepad.poll()
+    return gamepad.is_pressed(mask)
+
+
+def wait_until_released(
+    ser,
+    buf: list[str],
+    verbose: bool,
+    poll_s: float,
+    *,
+    gamepad: XboxGamepad | None,
+    keyboard_keys: tuple[str, ...] = (),
+    gamepad_mask: int = 0,
+) -> None:
+    """Block until keyboard keys and/or a gamepad button are released."""
+    while any(key_down(key) for key in keyboard_keys) or gamepad_button_held(
+        gamepad, gamepad_mask
+    ):
+        drain_async(ser, buf, verbose)
+        time.sleep(poll_s)
+
+
 def stop_jog(ser) -> None:
     send_quick(ser, "stop")
     time.sleep(0.02)
 
 
-def pressed_cart_vector(gamepad_cart: tuple[int, int, int] | None = None) -> tuple[int, int, int] | None:
+def clear_active_motion(ser) -> tuple[None, None, None]:
+    """Stop jog/gripper and return cleared motion state."""
+    stop_jog(ser)
+    gripper_sweep_stop(ser)
+    return None, None, None
+
+
+def apply_xy_invert(
+    vector: tuple[int, int, int] | None,
+    invert_xy: bool,
+) -> tuple[int, int, int] | None:
+    if vector is None or not invert_xy:
+        return vector
+    x, y, z = vector
+    return -x, -y, z
+
+
+def pressed_cart_vector(
+    gamepad_cart: tuple[int, int, int] | None = None,
+    *,
+    invert_xy: bool = False,
+) -> tuple[int, int, int] | None:
     vec = [0, 0, 0]
     for key, delta in CART_BINDINGS.items():
         if key_down(key):
@@ -159,7 +209,7 @@ def pressed_cart_vector(gamepad_cart: tuple[int, int, int] | None = None) -> tup
     vec = [max(-1, min(1, v)) for v in vec]
     if vec == [0, 0, 0]:
         return None
-    return vec[0], vec[1], vec[2]
+    return apply_xy_invert((vec[0], vec[1], vec[2]), invert_xy)
 
 
 def sync_cart_jog(ser, vector: tuple[int, int, int] | None) -> None:
@@ -301,6 +351,8 @@ def main() -> int:
     last_grip_send = 0.0
     speed_us = DEFAULT_SPEED_US
     last_speed_adjust = 0.0
+    invert_xy = False
+    grave_was_down = False
 
     with open_serial(port, args.baud) as ser:
         time.sleep(1.0)
@@ -311,6 +363,16 @@ def main() -> int:
             drain_async(ser, buf, False)
         send(ser, "all f", wait=0.5)
         send(ser, "orient off" if args.no_orient else "orient on", wait=0.3)
+        status_lines = send(ser, "?", wait=1.5)
+        for line in status_lines:
+            if line.startswith("MODE=") or line.startswith("pos ") or line.startswith("EN="):
+                print(line)
+        if not any(line.startswith("MODE=") for line in status_lines):
+            print(
+                "WARNING: no firmware status reply — check USB cable/hub and "
+                "that custom jog firmware is flashed.",
+                file=sys.stderr,
+            )
 
         try:
             while True:
@@ -320,43 +382,61 @@ def main() -> int:
                 pad_cart = pad.cart if pad and pad.connected else None
                 pad_j4 = pad.j4 if pad and pad.connected else None
                 pad_grip = pad.grip if pad and pad.connected else None
+                now = time.monotonic()
 
                 if key_down("esc") or (pad is not None and pad.quit):
                     break
 
+                grave_down = key_down("grave")
+                toggle_invert = (grave_down and not grave_was_down) or (
+                    pad is not None and pad.toggle_invert_xy
+                )
+                grave_was_down = grave_down
+                if toggle_invert:
+                    invert_xy = not invert_xy
+                    print(f"XY invert: {'on' if invert_xy else 'off'}")
+                    if active_cart is not None:
+                        stop_jog(ser)
+                        active_cart = None
+                    wait_until_released(
+                        ser,
+                        buf,
+                        args.verbose,
+                        poll_s,
+                        gamepad=gamepad,
+                        keyboard_keys=("grave",),
+                        gamepad_mask=START,
+                    )
+                    grave_was_down = key_down("grave")
+                    continue
+
                 if key_down("space") or (pad is not None and pad.status):
-                    stop_jog(ser)
-                    active_j4 = None
-                    active_cart = None
-                    gripper_sweep_stop(ser)
-                    grip_state = None
+                    active_j4, active_cart, grip_state = clear_active_motion(ser)
                     for line in send(ser, "?", wait=1.0):
                         print(line)
-                    while key_down("space") or (gamepad is not None and gamepad.is_pressed(X)):
-                        time.sleep(poll_s)
+                    wait_until_released(
+                        ser, buf, args.verbose, poll_s, gamepad=gamepad,
+                        keyboard_keys=("space",), gamepad_mask=X,
+                    )
                     continue
 
                 if key_down("0") or (pad is not None and pad.stop_all):
-                    stop_jog(ser)
-                    active_j4 = None
-                    active_cart = None
-                    gripper_sweep_stop(ser)
-                    grip_state = None
+                    active_j4, active_cart, grip_state = clear_active_motion(ser)
                     send(ser, "e0", wait=0.2)
                     send(ser, "all f", wait=0.3)
-                    while key_down("0") or (gamepad is not None and gamepad.is_pressed(B)):
-                        time.sleep(poll_s)
+                    wait_until_released(
+                        ser, buf, args.verbose, poll_s, gamepad=gamepad,
+                        keyboard_keys=("0",), gamepad_mask=B,
+                    )
                     continue
 
                 if key_down("h") or (pad is not None and pad.home):
-                    stop_jog(ser)
-                    active_j4 = None
-                    active_cart = None
-                    gripper_sweep_stop(ser)
-                    grip_state = None
+                    active_j4, active_cart, grip_state = clear_active_motion(ser)
                     run_home(ser, buf, args.j1_center, args.j2_pull, args.verbose)
-                    while key_down("h") or (gamepad is not None and gamepad.is_pressed(A)):
-                        time.sleep(poll_s)
+                    wait_until_released(
+                        ser, buf, args.verbose, poll_s, gamepad=gamepad,
+                        keyboard_keys=("h",), gamepad_mask=A,
+                    )
                     continue
 
                 minus = key_down("minus")
@@ -364,18 +444,16 @@ def main() -> int:
                 if pad is not None:
                     minus = minus or pad.speed_down
                     plus = plus or pad.speed_up
-                now_t = time.monotonic()
-                if (minus or plus) and now_t - last_speed_adjust >= SPEED_REPEAT_S:
+                if (minus or plus) and now - last_speed_adjust >= SPEED_REPEAT_S:
                     # Lower period = faster; "=" (plus) speeds up. Keeps
                     # repeating for as long as the key is held.
                     speed_us += -SPEED_STEP_US if plus else SPEED_STEP_US
                     speed_us = max(SPEED_MIN_US, min(SPEED_MAX_US, speed_us))
                     send_quick(ser, f"speed {speed_us}")
-                    last_speed_adjust = now_t
+                    last_speed_adjust = now
 
                 # Cartesian keys take priority over J4 roll when held.
-                desired_cart = pressed_cart_vector(pad_cart)
-                now = time.monotonic()
+                desired_cart = pressed_cart_vector(pad_cart, invert_xy=invert_xy)
                 if desired_cart is not None:
                     if active_j4 is not None:
                         stop_jog(ser)

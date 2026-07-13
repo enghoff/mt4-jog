@@ -37,6 +37,7 @@ class GamepadSnapshot:
     quit: bool = False
     speed_up: bool = False
     speed_down: bool = False
+    toggle_invert_xy: bool = False
     connected: bool = False
 
 
@@ -157,6 +158,7 @@ class XboxGamepad:
             or self._button_edge(buttons, DPAD_DOWN),
             speed_up=self._button_edge(buttons, RIGHT_SHOULDER)
             or self._button_edge(buttons, DPAD_UP),
+            toggle_invert_xy=self._button_edge(buttons, START),
             connected=True,
         )
         self._prev_buttons = buttons
