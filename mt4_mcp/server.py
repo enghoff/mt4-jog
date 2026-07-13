@@ -62,7 +62,10 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             "mt4_move_relative move the arm immediately. Check mt4_status "
             "first when you need the current pose or homed flag. "
             "mt4_move_to requires homing this session (mt4_home) first; "
-            "mt4_home returns homed and tcp on success."
+            "mt4_home returns homed and tcp on success. "
+            "For pick-and-place of colored cubes on the work surface, use "
+            "mt4_scene to see cube positions, mt4_pick_cube to grab one by "
+            "color, and mt4_place_at to set it down at robot-frame x/y."
         ),
         auth=auth,
         lifespan=lifespan,
@@ -187,6 +190,77 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         try:
             return get_client().gripper(action)
         except Mt4ClientError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # Vision tools import cv2 lazily so the motion tools keep working on
+    # hosts without the camera stack installed.
+    @server.tool
+    def mt4_scene() -> dict[str, Any]:
+        """Detect colored cubes on the work surface via the overhead camera.
+        Returns each cube's color and robot-frame x/y (mm) -- pass those
+        straight to mt4_pick_cube/mt4_place_at/mt4_move_to. Detections are
+        from a fresh frame, so re-call this after anything moves. Requires
+        the camera calibration produced by `python -m mt4_vision calibrate`.
+        """
+        try:
+            from mt4_vision.calib import load_calibration
+            from mt4_vision.camera import capture_frame
+            from mt4_vision.detect import detect_cubes
+
+            calib = load_calibration()
+            cubes = detect_cubes(capture_frame(), calib)
+            return {"ok": True, "cubes": [c.as_dict() for c in cubes]}
+        except Exception as exc:  # noqa: BLE001 -- surface camera/calib errors to the model
+            return {"ok": False, "error": str(exc)}
+
+    @server.tool
+    def mt4_pick_cube(color: str) -> dict[str, Any]:
+        """Pick up a cube by color: re-detects it on a fresh camera frame,
+        then opens the gripper, descends over the cube, grips, and lifts to
+        the calibrated safe height. Homes first if needed. If several cubes
+        of the color are in view, picks the largest detection; use mt4_scene
+        + mt4_move_to for finer control.
+
+        Args:
+            color: Cube color name, e.g. "red", "green", "blue", "yellow".
+        """
+        try:
+            from mt4_vision.calib import load_calibration
+            from mt4_vision.camera import capture_frame
+            from mt4_vision.detect import detect_cubes
+            from mt4_vision.pickplace import pick
+
+            calib = load_calibration()
+            matches = [
+                c for c in detect_cubes(capture_frame(), calib) if c.color == color
+            ]
+            if not matches:
+                return {"ok": False, "error": f"no {color} cube in view"}
+            target = matches[0]
+            result = pick(get_client(), calib, target.x, target.y)
+            result["color"] = color
+            return result
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
+    @server.tool
+    def mt4_place_at(x: float, y: float) -> dict[str, Any]:
+        """Place the currently-held cube at robot-frame (x, y): moves there
+        at the calibrated safe height, descends, releases, and lifts clear.
+        Get target coordinates from mt4_scene (e.g. next to another cube --
+        offset by at least one cube width, ~35mm, to avoid collision).
+
+        Args:
+            x: Target X in mm (robot frame).
+            y: Target Y in mm (robot frame).
+        """
+        try:
+            from mt4_vision.calib import load_calibration
+            from mt4_vision.pickplace import place
+
+            calib = load_calibration()
+            return place(get_client(), calib, x, y)
+        except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)}
 
     return server

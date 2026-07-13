@@ -168,13 +168,42 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 |------|---------|
 | `jog_keyboard.py` | Keyboard + Xbox gamepad jog client (Cartesian + J4 roll + gripper) |
 | `goto_position.py` | Prompt-driven absolute-position client (firmware `mp`) |
-| `mt4_mcp/` | Local HTTP MCP server for arm status and control |
+| `mt4_mcp/` | Local HTTP MCP server for arm status, control, and vision pick/place |
+| `mt4_vision/` | Overhead-camera vision: ArUco calibration, cube detection, pick/place |
 | `flash_jog.py` | Flash custom firmware |
 | `restore_stock.py` | Flash stock firmware backup |
 | `mt4_jog/` | Python joint map, kinematics, serial helpers |
 | `firmware/mt4_jog/` | Arduino firmware: `config`/`pins`/`gripper`/`dda`/`motion`/`homing`/`commands`/`kinematics` modules |
 | `backups/` | Stock flash/EEPROM images |
 | `docs/` | Hardware and pin map reference (`MT4_ARCHITECTURE.md`) |
+
+## Vision pick-and-place
+
+An overhead USB camera watches the work surface, which carries four ArUco
+markers (DICT_4X4_50, ids 0-3). The camera is auto-detected by scanning for
+the one that sees the markers (override with `MT4_CAMERA_INDEX` or
+`--camera`).
+
+One-time calibration maps camera pixels to robot-frame XY on the table plane
+-- no camera intrinsics needed. For each marker, jog the TCP to touch the
+marker center (`jog_keyboard.py`, read X/Y off the status line), then:
+
+```powershell
+python -m mt4_vision markers    # verify all 4 markers are seen
+python -m mt4_vision calibrate  # enter each marker's robot X/Y + pick heights
+python -m mt4_vision scene      # sanity-check cube detections in robot coords
+python -m mt4_vision pick red   # hardware test: pick a cube by color
+```
+
+Calibration lands in `vision_calibration.json` (homography, pick/safe
+heights, gripper S values, HSV overrides). Colored cubes are detected by HSV
+threshold inside the marker quadrilateral; detections outside it (the arm's
+orange body, off-desk clutter) are rejected.
+
+Natural-language control comes via the MCP server: `mt4_scene` reports cube
+colors and robot-frame positions from a fresh frame, `mt4_pick_cube` grabs a
+cube by color, `mt4_place_at` sets it down at x/y. Connect Claude (or any MCP
+client) to the server and say "put the red cube next to the blue one".
 
 ## Safety
 
