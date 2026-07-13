@@ -1,8 +1,8 @@
-"""CLI for camera calibration and vision-driven pick/place.
+"""CLI for vision diagnostics and vision-driven pick/place.
 
 Workflow:
   1. python -m mt4_vision markers      -- verify the ArUco markers are seen
-  2. python -m mt4_vision calibrate    -- fit pixel->robot homography + heights
+  2. python calibrate_vision.py        -- jog-to-marker interactive calibration
   3. python -m mt4_vision scene        -- sanity-check cube detections
   4. python -m mt4_vision pick red     -- hardware test of one pick
 """
@@ -14,15 +14,8 @@ import sys
 from pathlib import Path
 
 import cv2
-import numpy as np
 
-from mt4_vision.calib import (
-    DEFAULT_CALIB_PATH,
-    Calibration,
-    fit_homography,
-    load_calibration,
-    reprojection_errors,
-)
+from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
 from mt4_vision.camera import DEFAULT_CAMERA_INDEX, capture_frame
 from mt4_vision.detect import detect_cubes, detect_markers, scan_marker_dicts
 
@@ -55,72 +48,6 @@ def cmd_markers(args: argparse.Namespace) -> int:
         )
     _save_annotated(frame, "markers_frame.jpg")
     return 0 if markers else 1
-
-
-def _prompt_float(label: str, default: float | None = None) -> float:
-    suffix = f" [{default}]" if default is not None else ""
-    while True:
-        raw = input(f"{label}{suffix}: ").strip()
-        if not raw and default is not None:
-            return default
-        try:
-            return float(raw)
-        except ValueError:
-            print("  enter a number")
-
-
-def cmd_calibrate(args: argparse.Namespace) -> int:
-    frame = capture_frame(args.camera)
-    markers = detect_markers(frame, args.dict)
-    if len(markers) < 4:
-        print(f"only {len(markers)} markers found; need >=4 (try --dict scan via `markers`)")
-        return 1
-    print(f"found {len(markers)} markers: {[m.marker_id for m in markers]}")
-    print(
-        "\nFor each marker, jog the arm's TCP to touch the marker center\n"
-        "(jog_keyboard.py, read X/Y from the status line), then enter the\n"
-        "robot-frame coordinates here. Blank X skips a marker.\n"
-    )
-    pixel_pts, robot_pts = [], []
-    for m in markers:
-        raw = input(f"marker {m.marker_id} robot X (blank=skip): ").strip()
-        if not raw:
-            continue
-        x = float(raw)
-        y = _prompt_float(f"marker {m.marker_id} robot Y")
-        pixel_pts.append((m.px, m.py))
-        robot_pts.append((x, y))
-    homography = fit_homography(pixel_pts, robot_pts)
-    errors = reprojection_errors(homography, pixel_pts, robot_pts)
-    print(f"\nfit ok -- reprojection error per point (mm): {[round(e, 2) for e in errors]}")
-    if max(errors) > 5.0:
-        print("WARNING: worst point is >5mm off; re-measure that marker")
-
-    print("\nHeights (robot-frame Z, mm). Touch a marker/table with the TCP to read table Z.")
-    table_z = _prompt_float("table_z (TCP touching table)")
-    cube = _prompt_float("cube edge length (mm)", 30.0)
-    pick_z = _prompt_float("pick_z (TCP gripping a cube on the table)", table_z + cube / 2)
-    safe_z = _prompt_float("safe_z (travel height; keep low over the desk)", table_z + cube + 40.0)
-    grip_open = int(_prompt_float("grip_open_s (gripper S, clears cube)", 140))
-    grip_close = int(_prompt_float("grip_close_s (gripper S, firm on cube)", 240))
-
-    hull = cv2.convexHull(
-        np.array([[m.px, m.py] for m in markers], dtype=np.float32)
-    ).reshape(-1, 2)
-    calib = Calibration(
-        homography=homography,
-        table_z=table_z,
-        pick_z=pick_z,
-        safe_z=safe_z,
-        grip_open_s=grip_open,
-        grip_close_s=grip_close,
-        cube_height_mm=cube,
-        workspace_hull_px=hull.tolist(),
-    )
-    calib.save(Path(args.output))
-    print(f"\nsaved to {args.output}")
-    print("optional: set cam_xy_robot/cam_height_mm in the JSON for cube-top parallax correction")
-    return 0
 
 
 def cmd_scene(args: argparse.Namespace) -> int:
@@ -193,11 +120,6 @@ def main() -> None:
     p = sub.add_parser("markers", help="detect ArUco markers, save annotated frame")
     p.add_argument("--dict", default="scan", help="ArUco dict name, or 'scan' to try all")
     p.set_defaults(func=cmd_markers)
-
-    p = sub.add_parser("calibrate", help="fit pixel->robot homography interactively")
-    p.add_argument("--dict", default="4x4_50")
-    p.add_argument("--output", default=str(DEFAULT_CALIB_PATH))
-    p.set_defaults(func=cmd_calibrate)
 
     p = sub.add_parser("scene", help="detect cubes, print robot coords")
     p.set_defaults(func=cmd_scene)

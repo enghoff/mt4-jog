@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""Interactive camera->robot calibration: jog the TCP onto each reachable
+ArUco marker and record it. Writes vision_calibration.json for mt4_vision.
+
+Flow: home the arm, capture a reference frame of the markers, then jog with
+the same controls as jog_keyboard.py. Touch the TCP to a marker center and
+record it -- markers can be visited in any order, and unreachable ones are
+simply skipped. 3 recorded markers give an affine fit (accurate inside the
+marker triangle, no perspective correction); 4+ give a full homography.
+
+Remaps vs jog_keyboard.py: digit keys record markers (so drivers-off moves
+0 -> X key), gamepad A records a marker (home moves A -> Y), and Start
+finishes the session (XY invert stays on the ` key only).
+"""
+
+from __future__ import annotations
+
+import argparse
+import statistics
+import sys
+import time
+from pathlib import Path
+
+from jog_keyboard import (
+    DEFAULT_SPEED_US,
+    POLL_MS,
+    SPEED_MAX_US,
+    SPEED_MIN_US,
+    SPEED_REPEAT_S,
+    SPEED_STEP_US,
+    VK,
+    clear_active_motion,
+    drain_async,
+    gripper_sweep_close,
+    gripper_sweep_open,
+    gripper_sweep_stop,
+    gripper_key_state,
+    j4_key_state,
+    key_down,
+    pressed_cart_vector,
+    resend_j4_jog,
+    run_home,
+    stop_jog,
+    sync_cart_jog,
+    sync_j4_jog,
+    wait_until_released,
+    CJ_RESEND_S,
+    GRIP_RESEND_S,
+    J4_RESEND_S,
+)
+from mt4_jog.gamepad import A, B, BACK, START, X, Y, XboxGamepad
+from mt4_jog.joints import DEFAULT_BAUD, J1_HOME_CENTER_STEPS, J2_HOME_PULLOFF_STEPS
+from mt4_jog.ports import Mt4PortError, port_display, resolve_port
+from mt4_jog.serial import open_serial, send, send_quick
+from mt4_jog.status import Mt4Status, parse_status_lines
+
+# Calibration-only keys, merged into jog_keyboard's VK table.
+VK.update(
+    {
+        "1": 0x31, "2": 0x32, "3": 0x33, "4": 0x34, "5": 0x35,
+        "6": 0x36, "7": 0x37, "8": 0x38, "9": 0x39,
+        "enter": 0x0D,
+        "g": 0x47,
+        "x": 0x58,
+    }
+)
+DIGIT_KEYS = tuple(str(d) for d in range(10))
+
+STATUS_WAIT_S = 1.5
+
+
+def print_help(*, gamepad: bool) -> None:
+    print("MT4 vision calibration — jog the TCP onto each reachable marker")
+    print()
+    print("Jog (as jog_keyboard.py):")
+    print("  I/K  A/D  S/W   world Z / X / Y      J / L   J4 roll")
+    print("  Q / E           gripper open / close  - / =  speed")
+    print("  `               toggle invert world X + Y")
+    print()
+    print("Calibration:")
+    print("  0-9     record current TCP as marker <digit>")
+    print("  G       record grip pose (pick Z + gripper S, while gripping a cube)")
+    print("  H       re-home")
+    print("  SPACE   status")
+    print("  X       stop, drivers off")
+    print("  ENTER   finish: fit calibration and save")
+    print("  ESC     quit without saving")
+    if gamepad:
+        print()
+        print("Xbox controller:")
+        print("  Sticks / triggers / LB RB   jog, gripper, speed (as jog_keyboard.py)")
+        print("  A       record marker (auto-identified: the one the arm hides)")
+        print("  Y       home")
+        print("  B       stop, drivers off")
+        print("  X       status")
+        print("  Start   finish: fit calibration and save")
+        print("  Back    quit without saving")
+    print()
+
+
+def flush_console_input() -> None:
+    """Drop keystrokes typed during the jog session so they don't leak into
+    the input() prompts afterwards."""
+    if sys.platform != "win32":
+        return
+    import msvcrt
+
+    while msvcrt.kbhit():
+        msvcrt.getwch()
+
+
+def prompt_float(label: str, default: float) -> float:
+    while True:
+        raw = input(f"{label} [{default:g}]: ").strip()
+        if not raw:
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            print("  enter a number")
+
+
+def query_status(ser, buf: list[str], verbose: bool) -> Mt4Status:
+    lines = send(ser, "?", wait=STATUS_WAIT_S)
+    drain_async(ser, buf, verbose)
+    return parse_status_lines(lines)
+
+
+def record_marker(
+    ser,
+    buf: list[str],
+    verbose: bool,
+    marker_id: int,
+    recorded: dict[int, tuple[float, float, float]],
+) -> None:
+    status = query_status(ser, buf, verbose)
+    if status.tcp is None:
+        print("record failed: no TCP pose in status reply, try again")
+        return
+    if not status.homed:
+        print("record failed: arm reports not homed -- press H to home first")
+        return
+    tcp = status.tcp
+    verb = "updated" if marker_id in recorded else "recorded"
+    recorded[marker_id] = (tcp.x, tcp.y, tcp.z)
+    print(
+        f"marker {marker_id} {verb}: robot ({tcp.x:.1f}, {tcp.y:.1f}, z {tcp.z:.1f})"
+        f" -- {len(recorded)} marker(s) so far"
+    )
+
+
+def autodetect_touched_marker(cap, dict_name: str, ref_ids: set[int]) -> int | None:
+    """The marker the TCP is touching is the one the arm now hides: diff the
+    currently visible ids against the reference frame's."""
+    from mt4_vision.camera import grab_frame
+    from mt4_vision.detect import detect_markers
+
+    frame = grab_frame(cap)
+    seen = {m.marker_id for m in detect_markers(frame, dict_name)}
+    missing = sorted(ref_ids - seen)
+    if len(missing) == 1:
+        return missing[0]
+    if not missing:
+        print("record failed: all markers still visible -- is the TCP on one? "
+              "Use a digit key to record explicitly.")
+    else:
+        print(f"record ambiguous: markers {missing} all hidden -- "
+              "use a digit key to record explicitly.")
+    return None
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="MT4 camera->robot calibration")
+    parser.add_argument("--port", default=None, help="serial port (auto-detect if omitted)")
+    parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
+    parser.add_argument("--camera", type=int, default=None,
+                        help="camera index (auto-detect via markers if omitted)")
+    parser.add_argument("--dict", default="4x4_50", help="ArUco dictionary name")
+    parser.add_argument("--output", default=None, help="calibration JSON path")
+    parser.add_argument("--poll-ms", type=int, default=POLL_MS)
+    parser.add_argument("--j1-center", type=int, default=J1_HOME_CENTER_STEPS)
+    parser.add_argument("--j2-pull", type=int, default=J2_HOME_PULLOFF_STEPS)
+    parser.add_argument("--no-gamepad", action="store_true")
+    parser.add_argument("--gamepad-deadzone", type=int, default=9000)
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args()
+
+    if sys.platform != "win32":
+        print("Requires Windows (GetAsyncKeyState / XInput).", file=sys.stderr)
+        return 1
+
+    # Import late so a missing cv2 fails with a clear message, not at startup
+    # of unrelated arg errors.
+    from mt4_vision.calib import (
+        DEFAULT_CALIB_PATH,
+        Calibration,
+        fit_transform,
+        load_calibration,
+        reprojection_errors,
+    )
+    from mt4_vision.camera import DEFAULT_CAMERA_INDEX, CameraError, grab_frame, open_camera
+    from mt4_vision.detect import detect_markers
+
+    output = Path(args.output) if args.output else DEFAULT_CALIB_PATH
+    camera_index = DEFAULT_CAMERA_INDEX if args.camera is None else args.camera
+
+    # Carry setup-specific tuning across re-calibrations.
+    prev = None
+    try:
+        prev = load_calibration(output)
+        print(f"existing calibration at {output} -- grip/color settings carried over")
+    except Exception:  # noqa: BLE001 -- absent or unreadable both mean "fresh"
+        pass
+
+    gamepad = None
+    if not args.no_gamepad:
+        gamepad = XboxGamepad(deadzone=args.gamepad_deadzone)
+        if not gamepad.available:
+            print("XInput not available — keyboard only.", file=sys.stderr)
+            gamepad = None
+
+    try:
+        port = resolve_port(args.port, baud=args.baud)
+    except Mt4PortError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    try:
+        cap = open_camera(camera_index)
+    except CameraError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    print_help(gamepad=gamepad is not None)
+    print(f"{port_display(port, baud=args.baud, explicit=args.port is not None)} — focus this window for keyboard.")
+    print("WARNING: drivers energize while any jog key is held.")
+    print()
+
+    poll_s = args.poll_ms / 1000.0
+    buf: list[str] = [""]
+    recorded: dict[int, tuple[float, float, float]] = {}
+    grip_pose: tuple[float, float] | None = None  # (pick_z, grip_close_s)
+    saved = False
+
+    with open_serial(port, args.baud) as ser:
+        time.sleep(1.0)
+        drain_async(ser, buf, args.verbose)
+        send(ser, "all f", wait=0.5)
+        send(ser, "orient on", wait=0.3)
+
+        print("Homing first (clear the workspace)...")
+        run_home(ser, buf, args.j1_center, args.j2_pull, args.verbose)
+
+        # Reference frame after homing: the arm sits clear of the table, so
+        # every physically present marker should be visible here.
+        frame = grab_frame(cap)
+        ref_markers = detect_markers(frame, args.dict)
+        if len(ref_markers) < 3:
+            print(
+                f"only {len(ref_markers)} markers visible with dict {args.dict}; "
+                "need >=3 (check camera view / --dict)",
+                file=sys.stderr,
+            )
+            return 1
+        ref_ids = {m.marker_id for m in ref_markers}
+        ref_px = {m.marker_id: (m.px, m.py) for m in ref_markers}
+        print(f"markers in view: {sorted(ref_ids)} -- record at least 3 reachable ones")
+        print()
+
+        active_j4: bool | None = None
+        active_cart: tuple[int, int, int] | None = None
+        grip_state: str | None = None
+        last_cj_send = last_j4_send = last_grip_send = 0.0
+        speed_us = DEFAULT_SPEED_US
+        last_speed_adjust = 0.0
+        invert_xy = False
+        grave_was_down = False
+        digit_was_down: dict[str, bool] = {d: False for d in DIGIT_KEYS}
+        g_was_down = False
+        finish = False
+
+        try:
+            while True:
+                drain_async(ser, buf, args.verbose)
+
+                pad = gamepad.poll() if gamepad is not None else None
+                pad_cart = pad.cart if pad and pad.connected else None
+                pad_j4 = pad.j4 if pad and pad.connected else None
+                pad_grip = pad.grip if pad and pad.connected else None
+                pad_edges = pad.edges if pad and pad.connected else 0
+                now = time.monotonic()
+
+                if key_down("esc") or pad_edges & BACK:
+                    break
+
+                if key_down("enter") or pad_edges & START:
+                    active_j4, active_cart, grip_state = clear_active_motion(ser)
+                    wait_until_released(
+                        ser, buf, args.verbose, poll_s, gamepad=gamepad,
+                        keyboard_keys=("enter",), gamepad_mask=START,
+                    )
+                    finish = True
+                    break
+
+                # Record marker: explicit id via digit key ...
+                for digit in DIGIT_KEYS:
+                    down = key_down(digit)
+                    if down and not digit_was_down[digit]:
+                        marker_id = int(digit)
+                        active_j4, active_cart, grip_state = clear_active_motion(ser)
+                        if marker_id not in ref_ids:
+                            print(f"marker {marker_id} is not in the camera's view "
+                                  f"(visible: {sorted(ref_ids)})")
+                        else:
+                            record_marker(ser, buf, args.verbose, marker_id, recorded)
+                    digit_was_down[digit] = down
+
+                # ... or auto-identified via occlusion on gamepad A.
+                if pad_edges & A:
+                    active_j4, active_cart, grip_state = clear_active_motion(ser)
+                    marker_id = autodetect_touched_marker(cap, args.dict, ref_ids)
+                    if marker_id is not None:
+                        record_marker(ser, buf, args.verbose, marker_id, recorded)
+
+                g_down = key_down("g")
+                if g_down and not g_was_down:
+                    active_j4, active_cart, grip_state = clear_active_motion(ser)
+                    status = query_status(ser, buf, args.verbose)
+                    if status.tcp is None:
+                        print("grip record failed: no TCP pose in status reply")
+                    else:
+                        grip_pose = (status.tcp.z, status.tcp.grip)
+                        print(f"grip pose recorded: pick_z {grip_pose[0]:.1f}, "
+                              f"gripper S {grip_pose[1]:.0f}")
+                g_was_down = g_down
+
+                grave_down = key_down("grave")
+                if grave_down and not grave_was_down:
+                    invert_xy = not invert_xy
+                    print(f"XY invert: {'on' if invert_xy else 'off'}")
+                    if active_cart is not None:
+                        stop_jog(ser)
+                        active_cart = None
+                grave_was_down = grave_down
+
+                if key_down("space") or pad_edges & X:
+                    active_j4, active_cart, grip_state = clear_active_motion(ser)
+                    for line in send(ser, "?", wait=1.0):
+                        print(line)
+                    wait_until_released(
+                        ser, buf, args.verbose, poll_s, gamepad=gamepad,
+                        keyboard_keys=("space",), gamepad_mask=X,
+                    )
+                    continue
+
+                if key_down("x") or pad_edges & B:
+                    active_j4, active_cart, grip_state = clear_active_motion(ser)
+                    send(ser, "e0", wait=0.2)
+                    send(ser, "all f", wait=0.3)
+                    wait_until_released(
+                        ser, buf, args.verbose, poll_s, gamepad=gamepad,
+                        keyboard_keys=("x",), gamepad_mask=B,
+                    )
+                    continue
+
+                if key_down("h") or pad_edges & Y:
+                    active_j4, active_cart, grip_state = clear_active_motion(ser)
+                    run_home(ser, buf, args.j1_center, args.j2_pull, args.verbose)
+                    wait_until_released(
+                        ser, buf, args.verbose, poll_s, gamepad=gamepad,
+                        keyboard_keys=("h",), gamepad_mask=Y,
+                    )
+                    continue
+
+                minus = key_down("minus")
+                plus = key_down("plus")
+                if pad is not None:
+                    minus = minus or pad.speed_down
+                    plus = plus or pad.speed_up
+                if (minus or plus) and now - last_speed_adjust >= SPEED_REPEAT_S:
+                    speed_us += -SPEED_STEP_US if plus else SPEED_STEP_US
+                    speed_us = max(SPEED_MIN_US, min(SPEED_MAX_US, speed_us))
+                    send_quick(ser, f"speed {speed_us}")
+                    last_speed_adjust = now
+
+                desired_cart = pressed_cart_vector(pad_cart, invert_xy=invert_xy)
+                if desired_cart is not None:
+                    if active_j4 is not None:
+                        stop_jog(ser)
+                        active_j4 = None
+                    if desired_cart != active_cart or now - last_cj_send >= CJ_RESEND_S:
+                        sync_cart_jog(ser, desired_cart)
+                        active_cart = desired_cart
+                        last_cj_send = now
+                else:
+                    if active_cart is not None:
+                        stop_jog(ser)
+                        active_cart = None
+                    j4 = j4_key_state(pad_j4)
+                    if j4 is None:
+                        if active_j4 is not None:
+                            stop_jog(ser)
+                            active_j4 = None
+                    elif j4 != active_j4:
+                        sync_j4_jog(ser, j4)
+                        active_j4 = j4
+                        last_j4_send = now
+                    elif now - last_j4_send >= J4_RESEND_S:
+                        resend_j4_jog(ser)
+                        last_j4_send = now
+
+                desired_grip = gripper_key_state(pad_grip)
+                if desired_grip is None:
+                    if grip_state is not None:
+                        gripper_sweep_stop(ser)
+                        grip_state = None
+                elif desired_grip != grip_state or now - last_grip_send >= GRIP_RESEND_S:
+                    if desired_grip == "open":
+                        gripper_sweep_open(ser)
+                    else:
+                        gripper_sweep_close(ser)
+                    grip_state = desired_grip
+                    last_grip_send = now
+
+                time.sleep(poll_s)
+        except KeyboardInterrupt:
+            print()
+        finally:
+            stop_jog(ser)
+            gripper_sweep_stop(ser)
+            send(ser, "e0", wait=0.2)
+            send(ser, "all f", wait=0.3)
+            cap.release()
+
+    if finish and len(recorded) >= 3:
+        flush_console_input()
+        pixel_pts = [ref_px[mid] for mid in sorted(recorded)]
+        robot_pts = [recorded[mid][:2] for mid in sorted(recorded)]
+        matrix, kind = fit_transform(pixel_pts, robot_pts)
+        errors = reprojection_errors(matrix, pixel_pts, robot_pts)
+        print(f"\n{kind} fit from markers {sorted(recorded)}")
+        print(f"reprojection error per marker (mm): {[round(e, 2) for e in errors]}")
+        if kind == "affine":
+            print("NOTE: 3-point affine fit -- no perspective correction; accuracy "
+                  "is best inside the marker triangle. Record a 4th marker if one "
+                  "ever becomes reachable.")
+        if max(errors) > 5.0:
+            print("WARNING: worst marker is >5mm off; consider re-recording it")
+
+        # TCP Z while touching a marker IS the table height at that spot.
+        table_z_default = round(statistics.median(z for _x, _y, z in recorded.values()), 1)
+        cube_default = prev.cube_height_mm if prev else 30.0
+        print("\nHeights (robot-frame Z, mm) and gripper -- Enter accepts defaults.")
+        table_z = prompt_float("table_z", table_z_default)
+        cube = prompt_float("cube edge length", cube_default)
+        pick_z_default = round(grip_pose[0], 1) if grip_pose else round(table_z + cube / 2, 1)
+        pick_z = prompt_float("pick_z", pick_z_default)
+        safe_z = prompt_float("safe_z", prev.safe_z if prev else round(table_z + cube + 40.0, 1))
+        grip_close_default = int(grip_pose[1]) if grip_pose else (prev.grip_close_s if prev else 240)
+        grip_close = int(prompt_float("grip_close_s", grip_close_default))
+        grip_open = int(prompt_float("grip_open_s", prev.grip_open_s if prev else 140))
+
+        import cv2
+        import numpy as np
+
+        hull = cv2.convexHull(
+            np.array([[m.px, m.py] for m in ref_markers], dtype=np.float32)
+        ).reshape(-1, 2)
+        calib = Calibration(
+            homography=matrix,
+            table_z=table_z,
+            pick_z=pick_z,
+            safe_z=safe_z,
+            grip_open_s=grip_open,
+            grip_close_s=grip_close,
+            cube_height_mm=cube,
+            cam_xy_robot=prev.cam_xy_robot if prev else None,
+            cam_height_mm=prev.cam_height_mm if prev else None,
+            color_ranges=prev.color_ranges if prev else {},
+            workspace_hull_px=hull.tolist(),
+        )
+        calib.save(output)
+        saved = True
+        print(f"\nsaved to {output}")
+    elif finish:
+        print(f"\nonly {len(recorded)} marker(s) recorded; need >=3 -- nothing saved")
+    elif recorded:
+        print(f"\nquit without saving ({len(recorded)} marker(s) had been recorded)")
+
+    print("Bye.")
+    return 0 if saved or not finish else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

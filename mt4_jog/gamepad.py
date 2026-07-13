@@ -39,6 +39,10 @@ class GamepadSnapshot:
     speed_down: bool = False
     toggle_invert_xy: bool = False
     connected: bool = False
+    # Raw button state for callers that remap buttons (e.g. calibration):
+    # currently-held mask and newly-pressed-this-poll mask.
+    buttons: int = 0
+    edges: int = 0
 
 
 def _axis_sign(value: int, deadzone: int) -> int:
@@ -150,6 +154,8 @@ class XboxGamepad:
             cart=cart,
             j4=j4,
             grip=grip,
+            buttons=buttons,
+            edges=buttons & ~self._prev_buttons,
             home=self._button_edge(buttons, A),
             stop_all=self._button_edge(buttons, B),
             status=self._button_edge(buttons, X),

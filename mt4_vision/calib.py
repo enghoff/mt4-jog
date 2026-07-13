@@ -74,7 +74,7 @@ class Calibration:
 def load_calibration(path: Path = DEFAULT_CALIB_PATH) -> Calibration:
     if not Path(path).exists():
         raise CalibrationError(
-            f"no calibration at {path} -- run: python -m mt4_vision calibrate"
+            f"no calibration at {path} -- run: python calibrate_vision.py"
         )
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     return Calibration(**data)
@@ -94,6 +94,43 @@ def fit_homography(
     if h is None:
         raise CalibrationError("homography fit failed (degenerate point set?)")
     return h.tolist()
+
+
+def fit_affine(
+    pixel_pts: list[tuple[float, float]], robot_pts: list[tuple[float, float]]
+) -> list[list[float]]:
+    """Affine pixel->robot fit from >=3 correspondences, embedded as a 3x3
+    homography (bottom row [0, 0, 1]) so downstream code is unchanged.
+
+    Only reach for this when just 3 markers are physically reachable: an
+    affine map cannot model perspective foreshortening, so accuracy degrades
+    away from the calibration triangle.
+    """
+    if len(pixel_pts) < 3 or len(pixel_pts) != len(robot_pts):
+        raise CalibrationError(
+            f"need >=3 matched points, got {len(pixel_pts)} pixel / {len(robot_pts)} robot"
+        )
+    src = np.hstack(
+        [np.array(pixel_pts, dtype=np.float64), np.ones((len(pixel_pts), 1))]
+    )
+    dst = np.array(robot_pts, dtype=np.float64)
+    coef, _res, rank, _sv = np.linalg.lstsq(src, dst, rcond=None)
+    if rank < 3:
+        raise CalibrationError("affine fit failed (collinear points?)")
+    h = np.eye(3)
+    h[0, :] = coef[:, 0]
+    h[1, :] = coef[:, 1]
+    return h.tolist()
+
+
+def fit_transform(
+    pixel_pts: list[tuple[float, float]], robot_pts: list[tuple[float, float]]
+) -> tuple[list[list[float]], str]:
+    """Fit the best available pixel->robot map: full homography with >=4
+    points, affine with exactly 3. Returns (matrix, kind)."""
+    if len(pixel_pts) >= 4:
+        return fit_homography(pixel_pts, robot_pts), "homography"
+    return fit_affine(pixel_pts, robot_pts), "affine"
 
 
 def reprojection_errors(

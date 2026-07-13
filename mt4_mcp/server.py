@@ -200,7 +200,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         Returns each cube's color and robot-frame x/y (mm) -- pass those
         straight to mt4_pick_cube/mt4_place_at/mt4_move_to. Detections are
         from a fresh frame, so re-call this after anything moves. Requires
-        the camera calibration produced by `python -m mt4_vision calibrate`.
+        the camera calibration produced by `python calibrate_vision.py`.
         """
         try:
             from mt4_vision.calib import load_calibration

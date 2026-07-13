@@ -168,6 +168,7 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 |------|---------|
 | `jog_keyboard.py` | Keyboard + Xbox gamepad jog client (Cartesian + J4 roll + gripper) |
 | `goto_position.py` | Prompt-driven absolute-position client (firmware `mp`) |
+| `calibrate_vision.py` | Interactive jog-to-marker camera calibration |
 | `mt4_mcp/` | Local HTTP MCP server for arm status, control, and vision pick/place |
 | `mt4_vision/` | Overhead-camera vision: ArUco calibration, cube detection, pick/place |
 | `flash_jog.py` | Flash custom firmware |
@@ -185,18 +186,28 @@ the one that sees the markers (override with `MT4_CAMERA_INDEX` or
 `--camera`).
 
 One-time calibration maps camera pixels to robot-frame XY on the table plane
--- no camera intrinsics needed. For each marker, jog the TCP to touch the
-marker center (`jog_keyboard.py`, read X/Y off the status line), then:
+-- no camera intrinsics needed:
 
 ```powershell
-python -m mt4_vision markers    # verify all 4 markers are seen
-python -m mt4_vision calibrate  # enter each marker's robot X/Y + pick heights
+python -m mt4_vision markers    # verify the markers are seen
+python calibrate_vision.py      # jog-to-marker interactive calibration
 python -m mt4_vision scene      # sanity-check cube detections in robot coords
 python -m mt4_vision pick red   # hardware test: pick a cube by color
 ```
 
-Calibration lands in `vision_calibration.json` (homography, pick/safe
-heights, gripper S values, HSV overrides). Colored cubes are detected by HSV
+`calibrate_vision.py` homes the arm, then drops into the jog controls from
+`jog_keyboard.py`. Jog the TCP onto any reachable marker (any order; markers
+the arm can't reach are simply skipped) and record it with its digit key, or
+with gamepad **A** -- which identifies the marker automatically as the one
+the arm is hiding from the camera. **G** records the pick height and gripper
+S while physically gripping a cube; **Enter**/**Start** fits and saves.
+Because digits and A are taken, drivers-off moves to **X** and home to
+gamepad **Y**. Three recorded markers give an affine fit (accurate within
+the marker triangle); four or more give a full perspective homography.
+
+Calibration lands in `vision_calibration.json` (transform, pick/safe
+heights, gripper S values, HSV overrides -- tuning fields carry over when
+re-calibrating). Colored cubes are detected by HSV
 threshold inside the marker quadrilateral; detections outside it (the arm's
 orange body, off-desk clutter) are rejected.
 
