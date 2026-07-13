@@ -26,6 +26,13 @@ BOOT_WAIT_S = 1.0
 STATUS_WAIT_S = 2.0
 COMMAND_WAIT_S = 0.5
 GRIP_WAIT_S = 1.0
+# Firmware acks an absolute `g <value>` as soon as it parses the command, not
+# once the servo physically arrives -- and read_lines() (see serial.py) exits
+# on serial silence, which follows that immediate ack by ~100ms, long before
+# the ~700ms the gripper actually takes to reach its target. Without this,
+# gripper() returns while the servo is still mid-travel, so pick()/place()'s
+# next move_to() starts while the grip hasn't closed (or opened) yet.
+GRIPPER_SETTLE_S = 0.8
 # Homing seeks limit switches with no position feedback beforehand, so it
 # needs the same generous ceiling as jog_keyboard.py's HOME_WAIT_S.
 HOME_TIMEOUT_S = 180.0
@@ -301,7 +308,16 @@ class Mt4Client:
             )
 
     def gripper(self, action: str | int) -> dict[str, object]:
-        """Gripper sweep/set (`g o|c|stop|<120-285>`)."""
+        """Gripper sweep/set (`g o|c|stop|<120-285>`).
+
+        An absolute target (int) blocks until the servo has had time to
+        physically arrive (see GRIPPER_SETTLE_S) -- the firmware only acks
+        that it parsed the command, not that motion finished, so callers
+        that move the arm right after (pick()/place()) would otherwise race
+        a gripper that's still mid-travel. Sweep actions ('open'/'close'/
+        'stop') are open-ended/continuous, so they return as soon as sent.
+        """
+        settle = False
         if isinstance(action, str):
             normalized = action.strip().lower()
             arg = {"open": "o", "close": "c", "stop": "stop"}.get(normalized)
@@ -316,6 +332,7 @@ class Mt4Client:
                     f"action must be {GRIPPER_S_OPEN}-{GRIPPER_S_CLOSED}"
                 )
             arg = str(int(action))
+            settle = True
 
         with self._lock:
             self._ensure_connected_unlocked()
@@ -323,4 +340,6 @@ class Mt4Client:
         for line in lines:
             if line.startswith("err"):
                 return {"ok": False, "error": line, "lines": lines}
+        if settle:
+            time.sleep(GRIPPER_SETTLE_S)
         return {"ok": True, "lines": lines}
