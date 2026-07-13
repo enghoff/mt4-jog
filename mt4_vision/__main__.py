@@ -18,6 +18,12 @@ import cv2
 from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
 from mt4_vision.camera import DEFAULT_CAMERA_INDEX, capture_frame
 from mt4_vision.detect import detect_cubes, detect_markers, scan_marker_dicts
+from mt4_vision.workspace import (
+    analyze_workspace,
+    cubes_of_color,
+    cubes_with_robot_coords,
+    pick_largest_cube,
+)
 
 
 def _save_annotated(frame, path: str) -> None:
@@ -57,7 +63,23 @@ def cmd_scene(args: argparse.Namespace) -> int:
         print(f"(no calibration: {exc})")
         calib = None
     frame = capture_frame(args.camera)
-    cubes = detect_cubes(frame, calib)
+    if calib is not None:
+        state = analyze_workspace(calib, frame)
+        cubes = state.cubes
+        print(
+            f"markers: {len(state.free_markers)} free, "
+            f"{len(state.occupied)} occupied, "
+            f"{len(state.free_slots)} open slots"
+        )
+        for marker, cube in state.occupied:
+            print(
+                f"  marker {marker.marker_id} ({marker.x:.1f}, {marker.y:.1f}): "
+                f"{cube.color}"
+            )
+        for marker in state.free_markers:
+            print(f"  marker {marker.marker_id} ({marker.x:.1f}, {marker.y:.1f}): empty")
+    else:
+        cubes = detect_cubes(frame, calib)
     if not cubes:
         print("no cubes detected")
     for c in cubes:
@@ -83,11 +105,12 @@ def cmd_pick(args: argparse.Namespace) -> int:
 
     calib = load_calibration(Path(args.calib))
     frame = capture_frame(args.camera)
-    matches = [c for c in detect_cubes(frame, calib) if c.color == args.color]
-    if not matches:
+    target = pick_largest_cube(
+        cubes_of_color(cubes_with_robot_coords(detect_cubes(frame, calib)), args.color)
+    )
+    if target is None:
         print(f"no {args.color} cube in view")
         return 1
-    target = matches[0]
     print(f"picking {args.color} at robot ({target.x:.1f}, {target.y:.1f})")
     client = _pick_place_client(args)
     try:
@@ -123,6 +146,30 @@ def cmd_place_here(args: argparse.Namespace) -> int:
     finally:
         client.close()
     print("done")
+    return 0
+
+
+def cmd_shuffle(args: argparse.Namespace) -> int:
+    import time
+
+    from mt4_vision.shuffle import run_shuffle_loop
+
+    calib = load_calibration(Path(args.calib))
+    client = _pick_place_client(args)
+    try:
+        time.sleep(1.0)
+        print("shuffle loop started (Ctrl+C to stop)")
+        run_shuffle_loop(
+            client,
+            calib,
+            camera=args.camera,
+            pause_s=args.pause,
+            retry_s=args.retry,
+        )
+    except KeyboardInterrupt:
+        print("\nstopped")
+    finally:
+        client.close()
     return 0
 
 
@@ -192,6 +239,15 @@ def main() -> None:
     )
     p.add_argument("--port", default="")
     p.set_defaults(func=cmd_goto_marker)
+
+    p = sub.add_parser(
+        "shuffle",
+        help="home then shuffle cubes between markers and open table (Ctrl+C to stop)",
+    )
+    p.add_argument("--port", default="")
+    p.add_argument("--pause", type=float, default=2.0)
+    p.add_argument("--retry", type=float, default=5.0)
+    p.set_defaults(func=cmd_shuffle)
 
     args = parser.parse_args()
     sys.exit(args.func(args))

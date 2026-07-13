@@ -205,11 +205,30 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         try:
             from mt4_vision.calib import load_calibration
             from mt4_vision.camera import capture_frame
-            from mt4_vision.detect import detect_cubes
+            from mt4_vision.workspace import analyze_workspace
 
             calib = load_calibration()
-            cubes = detect_cubes(capture_frame(), calib)
-            return {"ok": True, "cubes": [c.as_dict() for c in cubes]}
+            state = analyze_workspace(calib, capture_frame())
+            return {
+                "ok": True,
+                "cubes": [c.as_dict() for c in state.cubes],
+                "markers": {
+                    "free": [
+                        {"id": m.marker_id, "x": m.x, "y": m.y}
+                        for m in state.free_markers
+                    ],
+                    "occupied": [
+                        {
+                            "id": m.marker_id,
+                            "x": m.x,
+                            "y": m.y,
+                            "color": c.color,
+                        }
+                        for m, c in state.occupied
+                    ],
+                },
+                "free_slots": [{"x": x, "y": y} for x, y in state.free_slots],
+            }
         except Exception as exc:  # noqa: BLE001 -- surface camera/calib errors to the model
             return {"ok": False, "error": str(exc)}
 
@@ -229,14 +248,21 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             from mt4_vision.camera import capture_frame
             from mt4_vision.detect import detect_cubes
             from mt4_vision.pickplace import pick
+            from mt4_vision.workspace import (
+                cubes_of_color,
+                cubes_with_robot_coords,
+                pick_largest_cube,
+            )
 
             calib = load_calibration()
-            matches = [
-                c for c in detect_cubes(capture_frame(), calib) if c.color == color
-            ]
-            if not matches:
+            target = pick_largest_cube(
+                cubes_of_color(
+                    cubes_with_robot_coords(detect_cubes(capture_frame(), calib)),
+                    color,
+                )
+            )
+            if target is None:
                 return {"ok": False, "error": f"no {color} cube in view"}
-            target = matches[0]
             result = pick(get_client(), calib, target.x, target.y)
             result["color"] = color
             return result

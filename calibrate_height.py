@@ -45,10 +45,8 @@ from mt4_vision.calib import (
 from mt4_vision.camera import capture_frame
 from mt4_vision.detect import CubeDetection, detect_cubes
 from mt4_vision.pickplace import pick, place
+from mt4_vision.workspace import MAX_REACH_MM, PLACEMENT_SLOTS
 
-# Conservative margin under the ~358mm measured max horizontal reach at table
-# height -- leaves room for the gripper's own approach geometry.
-MAX_REACH_MM = 320.0
 # Grid of robot-frame (x, y) targets spread across the reachable workspace,
 # one quadrant/radius at a time -- ground truth is the arm's own positioning,
 # not vision, so these don't need to be markers or anywhere special. Radii
@@ -58,16 +56,7 @@ MAX_REACH_MM = 320.0
 # end of the chain rather than resetting it at the start).
 # Note no point near (100, 0): the homed arm's gripper hangs over that
 # region in the camera view, so a cube placed there can't be re-detected.
-GRID_POINTS: list[tuple[float, float]] = [
-    (200.0, -60.0),
-    (200.0, 60.0),
-    (150.0, 100.0),
-    (240.0, -150.0),
-    (240.0, 150.0),
-    (150.0, -250.0),
-    (150.0, 250.0),
-    (280.0, 0.0),
-]
+GRID_POINTS = PLACEMENT_SLOTS
 # How far (px) the placed cube's centroid may land from where it's expected
 # and still count as "the probe" -- generous given measured parallax shifts
 # were under 15px, but tight enough to reject the arm's own body (which
