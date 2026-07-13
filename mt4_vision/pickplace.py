@@ -66,3 +66,21 @@ def place(client: Mt4Client, calib: Calibration, x: float, y: float) -> dict[str
         "lift after release",
     )
     return {"ok": True, "placed_at": [x, y]}
+
+
+def goto_marker(
+    client: Mt4Client, calib: Calibration, x: float, y: float, *, touch: bool = False
+) -> dict[str, object]:
+    """Move the TCP over robot-frame (x, y) -- a calibration accuracy check:
+    hover at the safe travel height by default (won't crash into the table
+    even if the calibration is off), or descend to the measured table
+    surface with `touch=True` for a physical go/no-go check.
+    """
+    ensure_homed(client)
+    _check(client.move_to(x, y, calib.safe_z), "move to safe height")
+    if touch:
+        _check(
+            client.move_to(x, y, calib.table_z, speed_us=APPROACH_SPEED_US),
+            "descend to table",
+        )
+    return {"ok": True, "moved_to": [x, y], "touched": touch}

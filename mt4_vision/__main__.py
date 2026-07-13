@@ -111,6 +111,29 @@ def cmd_place(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_goto_marker(args: argparse.Namespace) -> int:
+    from mt4_vision.pickplace import goto_marker
+
+    calib = load_calibration(Path(args.calib))
+    frame = capture_frame(args.camera)
+    markers = detect_markers(frame, args.dict)
+    match = next((m for m in markers if m.marker_id == args.marker_id), None)
+    if match is None:
+        print(f"marker {args.marker_id} not in view (visible: "
+              f"{sorted(m.marker_id for m in markers)})")
+        return 1
+    x, y = calib.pixel_to_robot(match.px, match.py)
+    print(f"marker {args.marker_id} at pixel ({match.px:.0f}, {match.py:.0f}) "
+          f"-> robot ({x:.1f}, {y:.1f}){' -- touching table' if args.touch else ' -- hovering at safe_z'}")
+    client = _pick_place_client(args)
+    try:
+        goto_marker(client, calib, x, y, touch=args.touch)
+    finally:
+        client.close()
+    print("done")
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="mt4_vision")
     parser.add_argument("--camera", type=int, default=DEFAULT_CAMERA_INDEX)
@@ -134,6 +157,19 @@ def main() -> None:
     p.add_argument("y", type=float)
     p.add_argument("--port", default="")
     p.set_defaults(func=cmd_place)
+
+    p = sub.add_parser(
+        "goto-marker",
+        help="move the arm to a detected marker -- calibration accuracy check",
+    )
+    p.add_argument("marker_id", type=int)
+    p.add_argument("--dict", default="4x4_50")
+    p.add_argument(
+        "--touch", action="store_true",
+        help="descend to table_z instead of hovering at safe_z",
+    )
+    p.add_argument("--port", default="")
+    p.set_defaults(func=cmd_goto_marker)
 
     args = parser.parse_args()
     sys.exit(args.func(args))

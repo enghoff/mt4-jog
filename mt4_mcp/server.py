@@ -263,6 +263,42 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)}
 
+    @server.tool
+    def mt4_goto_marker(marker_id: int, touch: bool = False) -> dict[str, Any]:
+        """Move the TCP to a calibration ArUco marker's position -- a
+        calibration accuracy check, not a normal operation. Re-detects the
+        marker on a fresh frame and converts its pixel position through the
+        calibration. Hovers at the calibrated safe height by default (won't
+        crash into the table even if the calibration is off); pass
+        touch=true to descend and physically touch the table at that spot.
+
+        Args:
+            marker_id: ArUco marker id to move to (see mt4_scene's calibration
+                or the physical markers on the work surface).
+            touch: If true, descend to table height instead of hovering.
+        """
+        try:
+            from mt4_vision.calib import load_calibration
+            from mt4_vision.camera import capture_frame
+            from mt4_vision.detect import detect_markers
+            from mt4_vision.pickplace import goto_marker
+
+            calib = load_calibration()
+            markers = detect_markers(capture_frame())
+            match = next((m for m in markers if m.marker_id == marker_id), None)
+            if match is None:
+                return {
+                    "ok": False,
+                    "error": f"marker {marker_id} not in view "
+                    f"(visible: {sorted(m.marker_id for m in markers)})",
+                }
+            x, y = calib.pixel_to_robot(match.px, match.py)
+            result = goto_marker(get_client(), calib, x, y, touch=touch)
+            result["marker_id"] = marker_id
+            return result
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
     return server
 
 
