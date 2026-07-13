@@ -44,7 +44,7 @@ from mt4_vision.calib import (
 )
 from mt4_vision.camera import capture_frame
 from mt4_vision.detect import CubeDetection, detect_cubes
-from mt4_vision.pickplace import _check, pick, place
+from mt4_vision.pickplace import pick, place
 
 # Conservative margin under the ~358mm measured max horizontal reach at table
 # height -- leaves room for the gripper's own approach geometry.
@@ -100,22 +100,6 @@ PLACEMENT_SANITY_MM = 100.0
 # leftover 2400us during manual testing.
 RESET_SPEED_US = 1524
 HOME_SETTLE_S = 0.5
-# A direct Cartesian line between two points both close to the base (small
-# X), on opposite sides of it (e.g. X~50,Y~-260 and X~40,Y~320), sweeps Y
-# through ~0 while X stays near the base the whole way -- straight through
-# the MT4's own base column. Detour through this X (comfortably clear of the
-# base at any Y) whenever both ends are closer to the base than this.
-SAFE_TRANSIT_X = 200.0
-
-
-def safe_transit(client: Mt4Client, calib, from_xy: tuple[float, float], to_xy: tuple[float, float]) -> None:
-    """Move at safe_z from from_xy to to_xy, detouring via SAFE_TRANSIT_X if
-    a direct line between them would stay close to the base the whole way."""
-    fx, fy = from_xy
-    tx, ty = to_xy
-    if fx < SAFE_TRANSIT_X and tx < SAFE_TRANSIT_X:
-        _check(client.move_to(SAFE_TRANSIT_X, fy, calib.safe_z), "detour out")
-        _check(client.move_to(SAFE_TRANSIT_X, ty, calib.safe_z), "detour across")
 
 
 def find_probe(frame, color: str, near_px: tuple[float, float]) -> CubeDetection | None:
@@ -291,7 +275,8 @@ def main() -> int:
             grasp_fails = 0
 
             try:
-                safe_transit(client, calib, probe_xy, (gx, gy))
+                # base avoidance is the firmware's job now: mp routes around
+                # the keep-out cylinder on its own
                 place(client, calib, gx, gy)
                 client.home()
             except Mt4ClientError as exc:

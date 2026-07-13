@@ -17,7 +17,17 @@
  *                            + optional J4 roll -1|0|1 layered on top of the
  *                            solved rates (incl. orient hold), so the wrist
  *                            rotates while the TCP moves; all-zero dir with
- *                            nonzero j4 = pure wrist roll
+ *                            nonzero j4 = pure wrist roll. At the keep-out
+ *                            cylinder (see below) the inward velocity
+ *                            component is clamped so the jog slides along
+ *                            the boundary instead of hitting the base.
+ *
+ * Keep-out: the TCP cannot physically approach the base column closer than
+ * ~MT4_KEEPOUT_RADIUS_MM (170mm) from the J1 axis at any Z. `mp` rejects
+ * targets inside the cylinder ("err mp keepout") and automatically routes
+ * paths that would cross it around the boundary (entry tangent, shortest
+ * arc, exit tangent); a start inside the cylinder first escapes radially.
+ * Joint-space moves (`m`, homing) are NOT covered -- they command raw steps.
  *   orient on|off          J4 wrist unwind when J1 moves (default on, 1:1)
  *   pos                      print joint step counters (since last home),
  *                              plus a derived "tcp x=.. y=.. z=.. j4=..

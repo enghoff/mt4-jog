@@ -96,17 +96,30 @@ void print_joint_pos() {
 // pending with a plain bool instead of caching the F() string itself.
 static bool move_done_is_mp = false;
 
-/* Cartesian linear `mp` path: TCP (x,y,z) is interpolated along straight
- * world-frame lines; J4 is either held fixed in world space (when the
- * commanded J4 matches the pose at move start) or interpolated linearly. */
+/* One piece of an `mp` path's XY track: a straight line or an arc along the
+ * keep-out cylinder (radius MT4_KEEPOUT_RADIUS_MM, centered on the J1
+ * axis). Lines: (a,b) -> (c,d). Arcs: start angle a, signed sweep b. */
+typedef struct {
+  uint8_t kind;  // 0 = line, 1 = arc
+  float a, b, c, d;
+  float len;
+} MpPiece;
+
+/* `mp` path: the XY track is a piecewise line/arc route around the keep-out
+ * cylinder (a single straight line when the direct path clears it); Z and
+ * J4 interpolate linearly over total path length. J4 is either held fixed
+ * in world space (when the commanded J4 matches the pose at move start) or
+ * interpolated linearly. */
 static struct {
   bool active;
   bool hold_ws_orient;
   uint16_t next_seg;
   uint16_t num_segments;
-  float sx, sy, sz;
+  uint8_t num_pieces;
+  float total_xy_len;
+  float sz, ez;
   float sj4_ws, ej4_ws;
-  float ex, ey, ez;
+  MpPiece pieces[MP_MAX_PIECES];
 } mp_path;
 
 static bool mp_drivers_ready = false;
@@ -116,7 +129,144 @@ static void mp_path_cancel() {
   mp_path.hold_ws_orient = false;
   mp_path.next_seg = 0;
   mp_path.num_segments = 0;
+  mp_path.num_pieces = 0;
   mp_drivers_ready = false;
+}
+
+static float wrap_2pi_f(float a) {
+  a = fmodf(a, 2.0f * (float)M_PI);
+  return (a < 0.0f) ? a + 2.0f * (float)M_PI : a;
+}
+
+/* Closest approach of the XY segment (sx,sy)->(ex,ey) to the J1 axis. */
+static float seg_dist_origin(float sx, float sy, float ex, float ey) {
+  const float dx = ex - sx;
+  const float dy = ey - sy;
+  const float l2 = dx * dx + dy * dy;
+  if (l2 < 1e-9f) {
+    return sqrtf(sx * sx + sy * sy);
+  }
+  float t = -(sx * dx + sy * dy) / l2;
+  if (t < 0.0f) {
+    t = 0.0f;
+  } else if (t > 1.0f) {
+    t = 1.0f;
+  }
+  const float px = sx + t * dx;
+  const float py = sy + t * dy;
+  return sqrtf(px * px + py * py);
+}
+
+static float mp_piece_line(MpPiece *p, float ax, float ay, float bx, float by) {
+  p->kind = 0;
+  p->a = ax;
+  p->b = ay;
+  p->c = bx;
+  p->d = by;
+  p->len = sqrtf((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
+  return p->len;
+}
+
+/* Route the XY track from S to E around the keep-out cylinder: straight
+ * when the direct segment clears it; otherwise entry tangent -> shortest
+ * arc along the cylinder -> exit tangent. A start inside the cylinder
+ * (reachable via joint-space moves / homing) gets a radial escape piece
+ * first. The 0.25mm tolerance stops borderline float noise from forcing
+ * detours, so the effective guarantee is R - 0.25mm. */
+static uint8_t plan_keepout_path(float sx, float sy, float ex, float ey,
+                                 MpPiece *out, float *total_len) {
+  const float R = MT4_KEEPOUT_RADIUS_MM;
+  uint8_t n = 0;
+  float len = 0.0f;
+  float cx = sx;
+  float cy = sy;
+
+  const float r_s = sqrtf(sx * sx + sy * sy);
+  if (r_s < R - 0.25f) {
+    float ux;
+    float uy;
+    if (r_s < 1e-6f) {
+      const float r_e = sqrtf(ex * ex + ey * ey);
+      ux = (r_e > 1e-6f) ? ex / r_e : 1.0f;
+      uy = (r_e > 1e-6f) ? ey / r_e : 0.0f;
+    } else {
+      ux = sx / r_s;
+      uy = sy / r_s;
+    }
+    len += mp_piece_line(&out[n++], cx, cy, ux * R, uy * R);
+    cx = ux * R;
+    cy = uy * R;
+  }
+
+  if (seg_dist_origin(cx, cy, ex, ey) >= R - 0.25f) {
+    len += mp_piece_line(&out[n++], cx, cy, ex, ey);
+    *total_len = len;
+    return n;
+  }
+
+  const float d_s = sqrtf(cx * cx + cy * cy);
+  const float d_e = sqrtf(ex * ex + ey * ey);
+  const float th_s = atan2f(cy, cx);
+  const float th_e = atan2f(ey, ex);
+  float cs = R / d_s;
+  float ce = R / d_e;
+  if (cs > 1.0f) cs = 1.0f;
+  if (ce > 1.0f) ce = 1.0f;
+  const float ph_s = acosf(cs);
+  const float ph_e = acosf(ce);
+
+  /* Wrap counterclockwise: leave S touching at th_s+ph_s, rejoin toward E
+   * at th_e-ph_e; clockwise mirrors. Tangent lengths are equal either way,
+   * so the shorter arc decides the side. */
+  const float a1 = th_s + ph_s;
+  const float a2 = th_e - ph_e;
+  const float d_ccw = wrap_2pi_f(a2 - a1);
+  const float b1 = th_s - ph_s;
+  const float b2 = th_e + ph_e;
+  const float d_cw = wrap_2pi_f(b1 - b2);
+
+  const float t1a = (d_ccw <= d_cw) ? a1 : b1;
+  const float t2a = (d_ccw <= d_cw) ? a2 : b2;
+  const float sweep = (d_ccw <= d_cw) ? d_ccw : -d_cw;
+
+  len += mp_piece_line(&out[n++], cx, cy, R * cosf(t1a), R * sinf(t1a));
+  out[n].kind = 1;
+  out[n].a = t1a;
+  out[n].b = sweep;
+  out[n].c = 0.0f;
+  out[n].d = 0.0f;
+  out[n].len = R * fabsf(sweep);
+  len += out[n].len;
+  ++n;
+  len += mp_piece_line(&out[n++], R * cosf(t2a), R * sinf(t2a), ex, ey);
+  *total_len = len;
+  return n;
+}
+
+/* XY position at arc length s along the planned pieces. */
+static void mp_path_xy_at(float s, float *wx, float *wy) {
+  for (uint8_t i = 0; i < mp_path.num_pieces; ++i) {
+    const MpPiece *p = &mp_path.pieces[i];
+    const bool last = (i == mp_path.num_pieces - 1);
+    if (s <= p->len || last) {
+      float u = (p->len < 1e-6f) ? 0.0f : s / p->len;
+      if (u > 1.0f) {
+        u = 1.0f;
+      } else if (u < 0.0f) {
+        u = 0.0f;
+      }
+      if (p->kind == 0) {
+        *wx = p->a + u * (p->c - p->a);
+        *wy = p->b + u * (p->d - p->b);
+      } else {
+        const float ang = p->a + u * p->b;
+        *wx = MT4_KEEPOUT_RADIUS_MM * cosf(ang);
+        *wy = MT4_KEEPOUT_RADIUS_MM * sinf(ang);
+      }
+      return;
+    }
+    s -= p->len;
+  }
 }
 
 static bool joint_angles_to_deltas(const JointAnglesDeg *target,
@@ -155,8 +305,9 @@ static bool joint_angles_to_deltas(const JointAnglesDeg *target,
 static bool mp_execute_segment(uint16_t seg) {
   const float t =
       static_cast<float>(seg) / static_cast<float>(mp_path.num_segments);
-  const float wx = mp_path.sx + t * (mp_path.ex - mp_path.sx);
-  const float wy = mp_path.sy + t * (mp_path.ey - mp_path.sy);
+  float wx;
+  float wy;
+  mp_path_xy_at(t * mp_path.total_xy_len, &wx, &wy);
   const float wz = mp_path.sz + t * (mp_path.ez - mp_path.sz);
   const float wj4_ws = mp_path.hold_ws_orient
                            ? mp_path.sj4_ws
@@ -311,11 +462,33 @@ static void normalize_vec3(Vec3 *v) {
 
 static bool setup_cartesian_jog(const Vec3 *dir) {
   CartesianRates rates;
-  const bool has_dir =
-      fabsf(dir->x) + fabsf(dir->y) + fabsf(dir->z) > 1e-6f;
+  const JointAnglesDeg q = angles_from_steps();
+
+  /* Keep-out clamp: at the cylinder boundary, project away the inward
+   * radial component so the jog slides along the cylinder (and up/down)
+   * instead of driving the TCP into the base. Re-evaluated from the
+   * CURRENT pose on every 40ms refresh, so the clamp engages and releases
+   * automatically as the arm moves. Outward motion is always allowed
+   * (that's the escape direction). */
+  Vec3 d = *dir;
+  {
+    Vec3 tcp;
+    mt4_fk_tcp(&q, &tcp);
+    const float r = sqrtf(tcp.x * tcp.x + tcp.y * tcp.y);
+    if (r > 1e-3f && r <= MT4_KEEPOUT_RADIUS_MM + 1.0f) {
+      const float ux = tcp.x / r;
+      const float uy = tcp.y / r;
+      const float inward = d.x * ux + d.y * uy;
+      if (inward < 0.0f) {
+        d.x -= inward * ux;
+        d.y -= inward * uy;
+      }
+    }
+  }
+
+  const bool has_dir = fabsf(d.x) + fabsf(d.y) + fabsf(d.z) > 1e-6f;
   if (has_dir) {
-    const JointAnglesDeg q = angles_from_steps();
-    if (!mt4_cartesian_rates(&q, dir, cart_orient_hold, &rates)) {
+    if (!mt4_cartesian_rates(&q, &d, cart_orient_hold, &rates)) {
       return false;
     }
   } else {
@@ -476,6 +649,11 @@ bool start_absolute_move(float x, float y, float z, float j4_deg, long g,
     dda_set_speed_us_quiet(speed_us);
   }
 
+  if (sqrtf(x * x + y * y) < MT4_KEEPOUT_RADIUS_MM - 0.5f) {
+    Serial.println(F("err mp keepout"));
+    return false;
+  }
+
   const JointAnglesDeg near = angles_from_steps();
   const float ws_j4_now = mt4_ws_j4_deg(&near);
   const bool hold_ws_orient = fabsf(j4_deg - ws_j4_now) < 0.1f;
@@ -489,10 +667,12 @@ bool start_absolute_move(float x, float y, float z, float j4_deg, long g,
   Vec3 start_tcp;
   mt4_fk_tcp(&near, &start_tcp);
 
-  const float dx = x - start_tcp.x;
-  const float dy = y - start_tcp.y;
+  float xy_len = 0.0f;
+  const uint8_t num_pieces =
+      plan_keepout_path(start_tcp.x, start_tcp.y, x, y, mp_path.pieces, &xy_len);
+
   const float dz = z - start_tcp.z;
-  const float cart_dist = sqrtf(dx * dx + dy * dy + dz * dz);
+  const float cart_dist = sqrtf(xy_len * xy_len + dz * dz);
 
   uint16_t num_segments =
       static_cast<uint16_t>(ceilf(cart_dist / MP_CART_SEGMENT_MM));
@@ -520,15 +700,13 @@ bool start_absolute_move(float x, float y, float z, float j4_deg, long g,
   cart_jog_mode = false;
   move_done_is_mp = true;
 
-  mp_path.sx = start_tcp.x;
-  mp_path.sy = start_tcp.y;
   mp_path.sz = start_tcp.z;
   mp_path.sj4_ws = ws_j4_now;
-  mp_path.ex = x;
-  mp_path.ey = y;
   mp_path.ez = z;
   mp_path.ej4_ws = j4_deg;
   mp_path.hold_ws_orient = hold_ws_orient;
+  mp_path.num_pieces = num_pieces;
+  mp_path.total_xy_len = xy_len;
   mp_path.num_segments = num_segments;
   mp_path.next_seg = 1;
   mp_path.active = true;
