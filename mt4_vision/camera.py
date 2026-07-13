@@ -12,11 +12,26 @@ import numpy as np
 # (distinguishes the overhead work camera from e.g. a laptop's built-in one).
 DEFAULT_CAMERA_INDEX = int(os.environ.get("MT4_CAMERA_INDEX", "-1"))
 AUTO_SCAN_MAX_INDEX = 5
+# The driver's default UVC mode is 640x480, where each ArUco marker (already
+# viewed at a steep angle from this overhead mount, and small relative to a
+# frame that has to cover the whole desk) is only ~20-35px per side -- a few
+# pixels per code cell, right at the edge of reliable decoding. Requesting
+# 720p roughly doubles that and made all 5 markers decode reliably in
+# testing; the driver clamps to its nearest supported mode if unsupported.
+CAPTURE_WIDTH = int(os.environ.get("MT4_CAMERA_WIDTH", "1280"))
+CAPTURE_HEIGHT = int(os.environ.get("MT4_CAMERA_HEIGHT", "720"))
 # The camera driver buffers several frames, so the first read() after a period
 # of inactivity returns a stale image of the scene as it was seconds ago --
 # fatal for pick-and-place, where we detect right before moving. Discard this
 # many frames before keeping one.
 FLUSH_FRAMES = 5
+# Right after opening (and especially after the resolution switch above),
+# auto-exposure hasn't converged yet -- frames come back badly overexposed,
+# which washes out cube color saturation enough to break HSV detection.
+# cap.grab() alone doesn't drive convergence (only decoded reads do), so this
+# warm-up does full read()s, not grab()s. ~20 reads (~2-3s) was enough for
+# brightness to stabilize in testing; cheap relative to a whole session.
+WARMUP_READS = 20
 
 
 class CameraError(Exception):
@@ -32,7 +47,13 @@ def _open_raw(index: int) -> cv2.VideoCapture:
     # CAP_DSHOW: the default MSMF backend on Windows takes several seconds to
     # open and sometimes refuses resolution changes on this Lenovo camera.
     backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
-    return cv2.VideoCapture(index, backend)
+    cap = cv2.VideoCapture(index, backend)
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
+        for _ in range(WARMUP_READS):
+            cap.read()
+    return cap
 
 
 def _autodetect_index() -> int:
