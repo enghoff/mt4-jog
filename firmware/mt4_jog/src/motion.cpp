@@ -288,6 +288,7 @@ bool motion_start_jog() {
     Serial.println(F("err no step pin"));
     return false;
   }
+  dda_ramp_clear();  // a leftover `mp` ramp must not affect this jog's speed
   dda_engage();
   Serial.println(F("ok jog"));
   return true;
@@ -314,6 +315,7 @@ static bool setup_cartesian_jog(const Vec3 *dir) {
     return false;
   }
   cart_jog_mode = true;
+  dda_ramp_clear();  // a leftover `mp` ramp must not affect this jog's speed
   const int32_t deltas[MT4_NUM_JOINTS] = {rates.j1, rates.j2, rates.j3,
                                           rates.j4};
   return dda_arm(rates.master, deltas, false);
@@ -374,6 +376,7 @@ void start_relative_move(const long d[MT4_NUM_JOINTS], long dg) {
   cart_jog_mode = false;
   move_done_is_mp = false;
   mp_path_cancel();
+  dda_ramp_clear();  // a leftover `mp` ramp must not affect this move's speed
 
   int32_t master = 0;
   for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
@@ -469,6 +472,20 @@ bool start_absolute_move(float x, float y, float z, float j4_deg, long g,
   if (num_segments > MP_MAX_SEGMENTS) {
     num_segments = MP_MAX_SEGMENTS;
   }
+
+  // Estimate the whole move's master-tick count (start -> final target,
+  // straight joint-space line) purely to time the accel/decel ramp -- the
+  // actual path/positioning is unaffected, still solved per-segment below.
+  // A close-but-imperfect estimate (IK is mildly nonlinear across segments)
+  // only means the ramp starts decelerating a little early/late, not that
+  // the arm ends up anywhere different.
+  int32_t ramp_deltas[MT4_NUM_JOINTS];
+  int32_t master_total = 0;
+  if (!joint_angles_to_deltas(&target, ramp_deltas, &master_total)) {
+    master_total = 0;  // ramp estimate unavailable -- dda_set_ramp() no-ops
+  }
+  dda_set_ramp(MP_ACCEL_START_US, dda_get_speed_us(), master_total,
+               MP_ACCEL_RAMP_TICKS);
 
   cart_jog_mode = false;
   move_done_is_mp = true;

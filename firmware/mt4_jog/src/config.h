@@ -34,6 +34,16 @@ static const uint16_t CJ_REFRESH_MS = 40;
  * the number of segments per move (longer moves use a larger effective step). */
 static const float MP_CART_SEGMENT_MM = 2.0f;
 static const uint16_t MP_MAX_SEGMENTS = 250;
+/* `mp` acceleration ramp (dda.cpp): a move starts at this slower, safe-to-
+ * start-from-rest step period and ramps toward the move's cruise speed over
+ * up to this many master ticks, then symmetrically ramps back up to
+ * MP_ACCEL_START_US before the move ends. No-ops (falls back to the old
+ * constant-speed stepping) when the requested cruise speed is already this
+ * slow or slower, or the move is too short for a full ramp -- see
+ * dda_set_ramp(). Untuned against real stall/skip behavior yet; the values
+ * below are a conservative starting point for reaching the 700us max. */
+static const uint16_t MP_ACCEL_START_US = 1800;
+static const uint16_t MP_ACCEL_RAMP_TICKS = 60;
 /* Generous headroom; ~2 full sweeps of any joint at current steps/deg. */
 static const long MOVE_MAX_STEPS = 100000L;
 static const uint16_t HOME_STEP_PERIOD_US = 800;
