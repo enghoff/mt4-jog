@@ -9,7 +9,7 @@ volatile bool move_done_pending = false;
 volatile uint8_t dda_axis_mask = 0;
 volatile int32_t joint_steps[MT4_NUM_JOINTS];
 
-// Runtime-adjustable via `speed <us>` (bounded); default/initial value here.
+// Runtime-adjustable via `speed <us>` (bounded); session state, reset on reboot.
 // 70% of prior 1067 us tick rate.
 static uint16_t jog_step_period_us = 1524;
 
@@ -153,7 +153,7 @@ static void apply_jog_speed() {
   sei();
 }
 
-void dda_set_speed_us(long us) {
+static void set_speed_us_impl(long us, bool echo) {
   if (us < JOG_STEP_PERIOD_MIN_US) {
     us = JOG_STEP_PERIOD_MIN_US;
   } else if (us > JOG_STEP_PERIOD_MAX_US) {
@@ -161,9 +161,17 @@ void dda_set_speed_us(long us) {
   }
   jog_step_period_us = static_cast<uint16_t>(us);
   apply_jog_speed();
-  Serial.print(F("ok speed "));
-  Serial.println(jog_step_period_us);
+  if (echo) {
+    Serial.print(F("ok speed "));
+    Serial.println(jog_step_period_us);
+  }
 }
+
+void dda_set_speed_us(long us) { set_speed_us_impl(us, true); }
+
+void dda_set_speed_us_quiet(long us) { set_speed_us_impl(us, false); }
+
+uint16_t dda_get_speed_us() { return jog_step_period_us; }
 
 void dda_init() {
   TCCR1A = 0;

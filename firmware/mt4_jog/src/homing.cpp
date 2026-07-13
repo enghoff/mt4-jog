@@ -168,5 +168,6 @@ void do_home(uint16_t j1_center, uint16_t j2_pull) {
   step_pin = 0;
   homing_active = false;
   reset_joint_steps();
+  mt4_homed = true;
   Serial.println(F("home ok"));
 }

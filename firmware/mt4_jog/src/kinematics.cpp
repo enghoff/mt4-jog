@@ -44,6 +44,10 @@ void mt4_fk_tcp(const JointAnglesDeg *q, Vec3 *out) {
            HEAD_HEIGHT;
 }
 
+float mt4_ws_j4_deg(const JointAnglesDeg *q) {
+  return q->j4 + q->j1;
+}
+
 static void jacobian_mm_per_deg(const JointAnglesDeg *q, float j[3][MT4_NUM_JOINTS]) {
   Vec3 p0;
   JointAnglesDeg trial = *q;
@@ -191,5 +195,77 @@ bool mt4_cartesian_rates(const JointAnglesDeg *q, const Vec3 *dir_unit,
   out->j3 = (int32_t)lroundf(steps[2] * scale);
   out->j4 = (int32_t)lroundf(steps[3] * scale);
   out->master = MT4_CJ_MASTER;
+  return true;
+}
+
+static float wrap_deg(float a) {
+  a = fmodf(a + 180.0f, 360.0f);
+  if (a < 0.0f) {
+    a += 360.0f;
+  }
+  return a - 180.0f;
+}
+
+/* Closed-form two-link solve in the arm's vertical plane (circle-circle
+ * intersection): LINKAGE1*(cos q2, sin q2) + LINKAGE2*(cos q3, sin q3) =
+ * (tx, ty). Picks the branch nearest (near_q2, near_q3). Mirrors
+ * mt4_jog/kinematics.py's ik_q2_q3(). */
+static bool ik_q2_q3(float radial, float z, float near_q2, float near_q3,
+                     float *out_q2, float *out_q3) {
+  const float tx = radial - CENCER_OFFSET - HEAD_OFFSET;
+  const float ty = z - CENCER_HEIGHT + HEAD_HEIGHT;
+  const float d = sqrtf(tx * tx + ty * ty);
+  if (d < 1e-6f || d > LINKAGE1 + LINKAGE2 || d < fabsf(LINKAGE1 - LINKAGE2)) {
+    return false;
+  }
+
+  float cos_alpha = (LINKAGE1 * LINKAGE1 + d * d - LINKAGE2 * LINKAGE2) /
+                    (2.0f * LINKAGE1 * d);
+  cos_alpha = fmaxf(-1.0f, fminf(1.0f, cos_alpha));
+  const float alpha = acosf(cos_alpha);
+  const float beta = atan2f(ty, tx);
+  const float rad2deg = (float)(180.0 / M_PI);
+  const float deg2rad = (float)(M_PI / 180.0);
+
+  bool have_best = false;
+  float best_dist = 0.0f;
+  float best_q2 = 0.0f;
+  float best_q3 = 0.0f;
+  for (int8_t sign = -1; sign <= 1; sign += 2) {
+    const float q2 = (beta + (float)sign * alpha) * rad2deg;
+    const float p1x = LINKAGE1 * cosf(q2 * deg2rad);
+    const float p1y = LINKAGE1 * sinf(q2 * deg2rad);
+    const float q3 = atan2f(ty - p1y, tx - p1x) * rad2deg;
+    const float dist =
+        fabsf(wrap_deg(q2 - near_q2)) + fabsf(wrap_deg(q3 - near_q3));
+    if (!have_best || dist < best_dist) {
+      have_best = true;
+      best_dist = dist;
+      best_q2 = q2;
+      best_q3 = q3;
+    }
+  }
+  *out_q2 = best_q2;
+  *out_q3 = best_q3;
+  return true;
+}
+
+bool mt4_ik_position(const JointAnglesDeg *near, float x, float y, float z,
+                     float j4_deg, JointAnglesDeg *out) {
+  const float rad2deg = (float)(180.0 / M_PI);
+  float q1 = atan2f(y, x) * rad2deg;
+  q1 = near->j1 + wrap_deg(q1 - near->j1);
+
+  const float radial = sqrtf(x * x + y * y);
+  float q2 = 0.0f;
+  float q3 = 0.0f;
+  if (!ik_q2_q3(radial, z, near->j2, near->j3, &q2, &q3)) {
+    return false;
+  }
+
+  out->j1 = q1;
+  out->j2 = q2;
+  out->j3 = q3;
+  out->j4 = j4_deg;
   return true;
 }

@@ -76,6 +76,68 @@ static bool parse_cj_vec(const char *arg, Vec3 *out) {
   return false;
 }
 
+// Parses "<x> <y> <z> <j4> <g> [speed_us]" (mp command args) without relying
+// on sscanf's %f -- avr-libc's default sscanf doesn't support float conversion
+// unless linked against a non-default scanf flavor, which this build isn't.
+// strtod/strtol are always available. speed_us defaults to 0 (leave the current
+// jog/move step period unchanged); otherwise clamped to [700, 4000] us.
+static bool parse_mp_args(char *arg, float *x, float *y, float *z, float *j4,
+                          long *g, long *speed_us) {
+  float vals[4];
+  for (uint8_t i = 0; i < 4; ++i) {
+    while (*arg == ' ') {
+      ++arg;
+    }
+    if (!*arg) {
+      return false;
+    }
+    char *end = nullptr;
+    vals[i] = strtod(arg, &end);
+    if (end == arg) {
+      return false;
+    }
+    arg = end;
+  }
+  while (*arg == ' ') {
+    ++arg;
+  }
+  if (!*arg) {
+    return false;
+  }
+  char *end = nullptr;
+  const long gv = strtol(arg, &end, 10);
+  if (end == arg) {
+    return false;
+  }
+  arg = end;
+  *x = vals[0];
+  *y = vals[1];
+  *z = vals[2];
+  *j4 = vals[3];
+  *g = gv;
+  *speed_us = 0;
+  while (*arg == ' ') {
+    ++arg;
+  }
+  if (!*arg) {
+    return true;
+  }
+  end = nullptr;
+  const long sv = strtol(arg, &end, 10);
+  if (end == arg) {
+    return false;
+  }
+  *speed_us = sv;
+  arg = end;
+  while (*arg == ' ') {
+    ++arg;
+  }
+  if (*arg) {
+    return false;
+  }
+  return true;
+}
+
 void handle_line(char *line) {
   while (*line == ' ' || *line == '\t') {
     ++line;
@@ -215,6 +277,17 @@ void handle_line(char *line) {
       return;
     }
     start_cartesian_jog(dir);
+    return;
+  }
+  if ((line[0] == 'm' || line[0] == 'M') && (line[1] == 'p' || line[1] == 'P') &&
+      line[2] == ' ') {
+    float x, y, z, j4;
+    long g, speed_us;
+    if (!parse_mp_args(line + 3, &x, &y, &z, &j4, &g, &speed_us)) {
+      Serial.println(F("err mp <x> <y> <z> <j4> <g> [speed_us]"));
+      return;
+    }
+    start_absolute_move(x, y, z, j4, g, speed_us);
     return;
   }
   if ((line[0] == 'm' || line[0] == 'M') && line[1] == ' ') {

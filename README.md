@@ -4,8 +4,9 @@ Keyboard jog and on-device homing for the WLKATA MT4 arm (ATmega2560 @ COM6, 115
 
 Custom firmware (`firmware/mt4_jog/`) replaces the stock Grbl-derived firmware with a
 4-axis step/dir jog engine plus an on-device Cartesian (world-frame) resolved-rate
-jog. `jog_keyboard.py` is the only client: Cartesian jog is the sole motion mode
-(direct per-joint jog was dropped), plus J4 wrist roll and the gripper.
+jog. `jog_keyboard.py` is the main client: Cartesian jog is the sole motion mode
+(direct per-joint jog was dropped), plus J4 wrist roll and the gripper. `goto_position.py`
+is a second, prompt-driven client for one-shot absolute moves.
 
 ## Requirements
 
@@ -25,7 +26,53 @@ python flash_jog.py --port COM6
 
 # Run keyboard jog (focus terminal, hold one or more keys)
 python jog_keyboard.py --port COM6
+
+# Or move to an absolute position (prompts for x/y/z/j4/gripper; requires
+# having homed this session)
+python goto_position.py --port COM6
+
+# Local HTTP MCP server (Phase 1: status + stop only)
+python -m mt4_mcp
+# Then open MCP Inspector at http://127.0.0.1:8787/mcp
 ```
+
+### MCP server (`mt4_mcp`)
+
+Phase 1 exposes read-only status tools plus emergency stop over local HTTP
+(Streamable HTTP at `/mcp`). Motion tools (`mt4_home`, `mt4_move`) come in a
+later phase.
+
+```powershell
+# Default: serial COM6, MCP on http://127.0.0.1:8787/mcp
+python -m mt4_mcp
+
+# Override ports
+$env:MT4_SERIAL_PORT = "COM6"
+$env:MT4_MCP_PORT = "8787"
+python -m mt4_mcp
+```
+
+| Tool | Purpose |
+|------|---------|
+| `mt4_status` | Full `?` status as JSON |
+| `mt4_tcp` | Current TCP pose only |
+| `mt4_stop` | Stop jog / cancel move |
+
+Test with [MCP Inspector](https://github.com/modelcontextprotocol/inspector):
+connect to `http://127.0.0.1:8787/mcp`, transport **Streamable HTTP**.
+
+### Cursor
+
+This repo includes `.cursor/mcp.json`, which registers the MT4 server for this
+workspace. Cursor launches it over stdio (`python -m mt4_mcp --stdio`) when you
+enable the **MT4** MCP server in settings.
+
+1. Open **Cursor Settings → MCP** (or reload the window after pulling).
+2. Enable the **MT4** server.
+3. Stop `jog_keyboard.py` first — only one process can use COM6.
+
+For HTTP mode instead (e.g. MCP Inspector), run `python -m mt4_mcp` without
+`--stdio`.
 
 ### Keys (`jog_keyboard.py`)
 
@@ -66,10 +113,18 @@ single dropped serial line can't strand them mid-motion — same fix already app
 to Cartesian jog's `cj` resend.
 
 Firmware serial commands: `cj +x|-x|+y|-y|+z|-z|<dx> <dy> <dz>`, `orient on|off`,
-`speed <us>` (live jog step period, 700-4000us), `pos`, `setpos <j1> <j2> <j3> <j4>`,
+`speed <us>` (live jog step period, 700-4000us, session state), `pos` (joint steps + derived TCP
+mm/world-frame J4 deg/gripper S/move speed us), `setpos <j1> <j2> <j3> <j4>`,
 `m <dj1> <dj2> <dj3> <dj4> [dg]` (bounded relative move, all axes finish together),
-`home [j1 j2]`, `g o|c|stop|<120-285>`, `?`/`s`. Full reference in the header comment
-of `firmware/mt4_jog/src/main.cpp`.
+`mp <x> <y> <z> <j4> <g> [speed_us]` (absolute move to a TCP position in mm + world-frame J4 deg +
+absolute gripper S + optional step period 700-4000us; TCP xyz interpolated along straight world-frame lines in short
+segments with closed-form IK per segment; when the commanded J4 matches the current
+world-frame yaw, gripper orientation is held fixed in world space; rejected with `err not homed` unless homed this
+session), `home [j1 j2]`, `g o|c|stop|<120-285>`, `?`/`s`. Full reference in the header
+comment of `firmware/mt4_jog/src/main.cpp`.
+
+`goto_position.py` queries `pos` for the current TCP/J4/gripper state, prompts for
+each (blank = keep current), then sends `mp` and prints the async completion line.
 
 Kinematic model: the MT4 is a parallel-link (palletizing) arm — J2 sets the upper-arm
 absolute angle, J3 sets the forearm absolute angle through the link rods (independent of
@@ -112,6 +167,8 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 | Path | Purpose |
 |------|---------|
 | `jog_keyboard.py` | Keyboard + Xbox gamepad jog client (Cartesian + J4 roll + gripper) |
+| `goto_position.py` | Prompt-driven absolute-position client (firmware `mp`) |
+| `mt4_mcp/` | Local HTTP MCP server for arm status and control |
 | `flash_jog.py` | Flash custom firmware |
 | `restore_stock.py` | Flash stock firmware backup |
 | `mt4_jog/` | Python joint map, kinematics, serial helpers |

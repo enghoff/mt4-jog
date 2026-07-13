@@ -22,25 +22,40 @@ def open_serial(port: str | None = None, baud: int = DEFAULT_BAUD) -> serial.Ser
     return ser
 
 
-def read_lines(ser: serial.Serial, timeout: float = 1.5) -> list[str]:
-    deadline = time.monotonic() + timeout
+def read_lines(
+    ser: serial.Serial,
+    timeout: float = 1.5,
+    *,
+    hard_limit: float | None = None,
+) -> list[str]:
+    start = time.monotonic()
+    deadline = start + timeout
+    cap = start + hard_limit if hard_limit is not None else None
     chunks: list[bytes] = []
     while time.monotonic() < deadline:
         waiting = ser.in_waiting
         if waiting:
             chunks.append(ser.read(waiting))
             deadline = time.monotonic() + 0.1
+            if cap is not None:
+                deadline = min(deadline, cap)
         else:
             time.sleep(0.02)
     text = b"".join(chunks).decode("utf-8", "replace")
-    return [line.rstrip() for line in text.splitlines()]
+    return [line.rstrip() for line in text.splitlines() if line.rstrip()]
 
 
-def send(ser: serial.Serial, cmd: str, wait: float = 1.5) -> list[str]:
+def send(
+    ser: serial.Serial,
+    cmd: str,
+    wait: float = 1.5,
+    *,
+    hard_limit: float | None = None,
+) -> list[str]:
     ser.write(f"{cmd}\n".encode("ascii"))
     ser.flush()
     time.sleep(0.05)
-    return read_lines(ser, wait)
+    return read_lines(ser, wait, hard_limit=hard_limit)
 
 
 def send_quick(ser: serial.Serial, cmd: str) -> None:

@@ -1,0 +1,241 @@
+"""Local HTTP MCP server for MT4 Cartesian control and status."""
+
+from __future__ import annotations
+
+import os
+from contextlib import asynccontextmanager
+from typing import Any
+
+from dotenv import load_dotenv
+from fastmcp import FastMCP
+
+from mt4_jog.client import Mt4Client, Mt4ClientError
+from mt4_jog.joints import DEFAULT_BAUD
+from mt4_jog.joints import DEFAULT_PORT as DEFAULT_SERIAL_PORT
+from mt4_mcp.auth import build_auth_provider, oauth_enabled
+
+load_dotenv()
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_MCP_PORT = 8787
+
+_client: Mt4Client | None = None
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return int(raw)
+
+
+def get_client() -> Mt4Client:
+    if _client is None:
+        raise RuntimeError("MT4 client is not initialized")
+    _client.ensure_connected()
+    return _client
+
+
+@asynccontextmanager
+async def lifespan(_app: FastMCP):
+    global _client
+    serial_port = os.environ.get("MT4_SERIAL_PORT", DEFAULT_SERIAL_PORT)
+    baud = _env_int("MT4_BAUD", DEFAULT_BAUD)
+    _client = Mt4Client(port=serial_port, baud=baud)
+    try:
+        yield
+    finally:
+        if _client is not None:
+            _client.close()
+            _client = None
+
+
+def create_mcp(*, auth: Any | None = None) -> FastMCP:
+    server = FastMCP(
+        name="MT4 Robot",
+        instructions=(
+            "Control and read status from a WLKATA MT4 arm over serial. "
+            "TCP x/y/z are in mm with origin at the base under J1's pivot. "
+            "j4 is world-frame gripper yaw in degrees. "
+            "Execute motion commands directly when asked -- never ask the "
+            "user to confirm before calling a tool. mt4_move_to and "
+            "mt4_move_relative move the arm immediately. Check mt4_status "
+            "first when you need the current pose or homed flag. "
+            "mt4_move_to requires homing this session (mt4_home) first; "
+            "mt4_home returns homed and tcp on success."
+        ),
+        auth=auth,
+        lifespan=lifespan,
+    )
+
+    @server.tool
+    def mt4_status() -> dict[str, Any]:
+        """Full arm status: homed flag, mode, joints, TCP pose, drivers, jog."""
+        try:
+            return get_client().get_status().as_dict()
+        except Mt4ClientError as exc:
+            return {"error": str(exc)}
+
+    @server.tool
+    def mt4_tcp() -> dict[str, Any]:
+        """Current Cartesian TCP pose (x/y/z mm, world-frame j4 deg, grip, speed)."""
+        try:
+            return get_client().get_tcp().as_dict()
+        except Mt4ClientError as exc:
+            return {"error": str(exc)}
+
+    @server.tool
+    def mt4_stop() -> dict[str, Any]:
+        """Stop jog and cancel any in-progress coordinated move."""
+        try:
+            lines = get_client().stop()
+            return {"ok": True, "lines": lines}
+        except Mt4ClientError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @server.tool
+    def mt4_home() -> dict[str, Any]:
+        """Home J1 and J2 by driving them into their limit switches, then
+        reference J3 indirectly through J2's switch (J3 has no switch of its
+        own). Required once per power cycle/session before mt4_move_to will
+        accept absolute moves -- check mt4_status's `homed` field first to
+        see if this is even necessary.
+
+        Runs immediately, no confirmation or workspace check required --
+        call directly. The arm moves on its own, and both J1 and J2 travel
+        to their hard limit switches during the seek. Takes up to ~30s;
+        can take longer (up to 180s) if a limit switch isn't found on the
+        first pass. On success, returns `homed` and `tcp` from a fresh
+        status query so callers don't need a separate mt4_status round-trip.
+        """
+        try:
+            return get_client().home()
+        except Mt4ClientError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @server.tool
+    def mt4_move_to(
+        x: float,
+        y: float,
+        z: float,
+        j4: float | None = None,
+        grip: int = 0,
+        speed_us: int = 0,
+    ) -> dict[str, Any]:
+        """Move the TCP to an absolute Cartesian position in a straight
+        world-frame line (firmware `mp`). Requires the arm to have homed
+        this session (mt4_status's `homed` field) -- call mt4_home first if
+        not. Blocks until the move completes or times out (~30s), then
+        returns the arm's final pose.
+
+        Args:
+            x: Target TCP X in mm, origin at the base under J1's pivot.
+            y: Target TCP Y in mm.
+            z: Target TCP Z in mm.
+            j4: Target gripper yaw in world-frame degrees. If omitted, the
+                current yaw is reused, which makes the firmware hold gripper
+                orientation fixed in world space during the move (like
+                `orient on`) rather than rotating it.
+            grip: Absolute gripper position, 120 (open) to 285 (closed).
+                0 (default) leaves the gripper wherever it currently is.
+            speed_us: Step period in microseconds, 700 (fast) to 4000
+                (slow). 0 (default) leaves the current speed unchanged.
+        """
+        try:
+            return get_client().move_to(
+                x, y, z, j4=j4, grip=grip, speed_us=speed_us
+            )
+        except Mt4ClientError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @server.tool
+    def mt4_move_relative(
+        dj1: int,
+        dj2: int,
+        dj3: int,
+        dj4: int,
+        dgrip: int = 0,
+    ) -> dict[str, Any]:
+        """Nudge each joint by a relative step count, all axes finishing
+        together (firmware `m`). Does not require homing -- deltas are
+        relative to whatever the current step counters are. Prefer
+        mt4_move_to for absolute Cartesian targets once homed; use this for
+        small joint-space nudges or before homing has run. Blocks until the
+        move completes or times out (~30s).
+
+        Args:
+            dj1: J1 (base) step delta, signed.
+            dj2: J2 (shoulder) step delta, signed.
+            dj3: J3 (elbow) step delta, signed.
+            dj4: J4 (wrist) step delta, signed.
+            dgrip: Gripper S-value delta, signed (gripper spans 120-285).
+                0 (default) leaves the gripper unchanged.
+        """
+        try:
+            return get_client().move_relative(dj1, dj2, dj3, dj4, dgrip=dgrip)
+        except Mt4ClientError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @server.tool
+    def mt4_gripper(action: str | int) -> dict[str, Any]:
+        """Open, close, stop, or set the gripper (firmware `g`).
+        Args:
+            action: One of the strings "open", "close", "stop" (start/stop
+                a sweep between the gripper's travel limits), or an absolute
+                integer S-value from 120 (fully open) to 285 (fully closed).
+        """
+        try:
+            return get_client().gripper(action)
+        except Mt4ClientError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    return server
+
+
+# Default module-level server for imports/tests (no OAuth).
+mcp = create_mcp()
+
+
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="MT4 MCP server")
+    parser.add_argument(
+        "--stdio",
+        action="store_true",
+        help="stdio transport for Cursor/Claude Desktop (default: HTTP)",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("MT4_MCP_HOST", DEFAULT_HOST),
+        help="HTTP bind host (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=_env_int("MT4_MCP_PORT", DEFAULT_MCP_PORT),
+        help="HTTP port (default: 8787)",
+    )
+    args = parser.parse_args()
+
+    if args.stdio:
+        create_mcp().run(transport="stdio")
+        return
+
+    auth = build_auth_provider() if oauth_enabled() else None
+    public = os.environ.get("MT4_MCP_PUBLIC", "").lower() in ("1", "true", "yes")
+    http_kwargs: dict[str, object] = {
+        "transport": "http",
+        "host": args.host,
+        "port": args.port,
+        "path": os.environ.get("MT4_MCP_PATH", "/mcp"),
+    }
+    if public or auth is not None:
+        # Allow ngrok / reverse-proxy Host headers through to the MCP endpoint.
+        http_kwargs["host_origin_protection"] = False
+
+    create_mcp(auth=auth).run(**http_kwargs)
+
+
+if __name__ == "__main__":
+    main()
