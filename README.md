@@ -81,7 +81,7 @@ For HTTP mode instead (e.g. MCP Inspector), run `python -m mt4_mcp` without
 | I/K | World +Z / -Z |
 | S/W | World +Y / -Y |
 | A/D | World +X / -X |
-| J/L | J4 wrist roll (when no Cartesian key held) |
+| J/L | J4 wrist roll (also while moving XYZ) |
 | Q/E | Gripper sweep open / close (S120–S285 on MT4; release = stop) |
 | -/= | Jog speed slower / faster (live, repeats while held) |
 | H | Home (on-device) |
@@ -95,7 +95,7 @@ For HTTP mode instead (e.g. MCP Inspector), run `python -m mt4_mcp` without
 |---------|--------|
 | Left stick | World X / Y |
 | Right stick Y | World Z |
-| Right stick X | J4 wrist roll (when not moving XYZ) |
+| Right stick X | J4 wrist roll (also while moving XYZ) |
 | LT / RT | Gripper open / close |
 | LB / RB or D-pad up/down | Jog speed faster / slower |
 | A | Home |
@@ -112,7 +112,9 @@ Gripper and J4-roll commands resend on a ~50ms timer while their key is held, so
 single dropped serial line can't strand them mid-motion — same fix already applied
 to Cartesian jog's `cj` resend.
 
-Firmware serial commands: `cj +x|-x|+y|-y|+z|-z|<dx> <dy> <dz>`, `orient on|off`,
+Firmware serial commands: `cj +x|-x|+y|-y|+z|-z|<dx> <dy> <dz> [j4]` (optional
+J4 roll -1|0|1 layered onto the solved rates so the wrist rotates during the
+move; zero direction + nonzero j4 = pure wrist roll), `orient on|off`,
 `speed <us>` (live jog step period, 700-4000us, session state), `pos` (joint steps + derived TCP
 mm/world-frame J4 deg/gripper S/move speed us), `setpos <j1> <j2> <j3> <j4>`,
 `m <dj1> <dj2> <dj3> <dj4> [dg]` (bounded relative move, all axes finish together),

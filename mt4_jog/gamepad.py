@@ -134,13 +134,15 @@ class XboxGamepad:
         if (x, y, z) != (0, 0, 0):
             cart = (x, y, z)
 
+        # J4 roll is intentionally NOT gated on cart being idle: the firmware
+        # layers the roll onto the Cartesian jog (`cj dx dy dz [j4]`), so the
+        # wrist can rotate while the TCP moves.
         j4: bool | None = None
-        if cart is None:
-            rx = _axis_sign(int(pad.sThumbRX), dz)
-            if rx < 0:
-                j4 = False
-            elif rx > 0:
-                j4 = True
+        rx = _axis_sign(int(pad.sThumbRX), dz)
+        if rx < 0:
+            j4 = False
+        elif rx > 0:
+            j4 = True
 
         lt = int(pad.bLeftTrigger)
         rt = int(pad.bRightTrigger)

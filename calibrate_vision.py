@@ -35,18 +35,15 @@ from jog_keyboard import (
     gripper_sweep_open,
     gripper_sweep_stop,
     gripper_key_state,
-    j4_key_state,
+    j4_roll_state,
     key_down,
     pressed_cart_vector,
-    resend_j4_jog,
     run_home,
     stop_jog,
     sync_cart_jog,
-    sync_j4_jog,
     wait_until_released,
     CJ_RESEND_S,
     GRIP_RESEND_S,
-    J4_RESEND_S,
 )
 from mt4_jog.gamepad import A, B, BACK, START, X, Y, XboxGamepad
 from mt4_jog.joints import DEFAULT_BAUD, J1_HOME_CENTER_STEPS, J2_HOME_PULLOFF_STEPS
@@ -265,10 +262,9 @@ def main() -> int:
         print(f"markers in view: {sorted(ref_ids)} -- record at least 3 reachable ones")
         print()
 
-        active_j4: bool | None = None
-        active_cart: tuple[int, int, int] | None = None
+        active_cart: tuple[tuple[int, int, int] | None, int] | None = None
         grip_state: str | None = None
-        last_cj_send = last_j4_send = last_grip_send = 0.0
+        last_cj_send = last_grip_send = 0.0
         speed_us = DEFAULT_SPEED_US
         last_speed_adjust = 0.0
         invert_xy = False
@@ -292,7 +288,7 @@ def main() -> int:
                     break
 
                 if key_down("enter") or pad_edges & START:
-                    active_j4, active_cart, grip_state = clear_active_motion(ser)
+                    active_cart, grip_state = clear_active_motion(ser)
                     wait_until_released(
                         ser, buf, args.verbose, poll_s, gamepad=gamepad,
                         keyboard_keys=("enter",), gamepad_mask=START,
@@ -305,7 +301,7 @@ def main() -> int:
                     down = key_down(digit)
                     if down and not digit_was_down[digit]:
                         marker_id = int(digit)
-                        active_j4, active_cart, grip_state = clear_active_motion(ser)
+                        active_cart, grip_state = clear_active_motion(ser)
                         if marker_id not in ref_ids:
                             print(f"marker {marker_id} is not in the camera's view "
                                   f"(visible: {sorted(ref_ids)})")
@@ -315,14 +311,14 @@ def main() -> int:
 
                 # ... or auto-identified via occlusion on gamepad A.
                 if pad_edges & A:
-                    active_j4, active_cart, grip_state = clear_active_motion(ser)
+                    active_cart, grip_state = clear_active_motion(ser)
                     marker_id = autodetect_touched_marker(cap, args.dict, ref_ids)
                     if marker_id is not None:
                         record_marker(ser, buf, args.verbose, marker_id, recorded)
 
                 g_down = key_down("g")
                 if g_down and not g_was_down:
-                    active_j4, active_cart, grip_state = clear_active_motion(ser)
+                    active_cart, grip_state = clear_active_motion(ser)
                     status = query_status(ser, buf, args.verbose)
                     if status.tcp is None:
                         print("grip record failed: no TCP pose in status reply")
@@ -342,7 +338,7 @@ def main() -> int:
                 grave_was_down = grave_down
 
                 if key_down("space") or pad_edges & X:
-                    active_j4, active_cart, grip_state = clear_active_motion(ser)
+                    active_cart, grip_state = clear_active_motion(ser)
                     for line in send(ser, "?", wait=1.0):
                         print(line)
                     wait_until_released(
@@ -352,7 +348,7 @@ def main() -> int:
                     continue
 
                 if key_down("x") or pad_edges & B:
-                    active_j4, active_cart, grip_state = clear_active_motion(ser)
+                    active_cart, grip_state = clear_active_motion(ser)
                     send(ser, "e0", wait=0.2)
                     send(ser, "all f", wait=0.3)
                     wait_until_released(
@@ -362,7 +358,7 @@ def main() -> int:
                     continue
 
                 if key_down("h") or pad_edges & Y:
-                    active_j4, active_cart, grip_state = clear_active_motion(ser)
+                    active_cart, grip_state = clear_active_motion(ser)
                     run_home(ser, buf, args.j1_center, args.j2_pull, args.verbose)
                     wait_until_released(
                         ser, buf, args.verbose, poll_s, gamepad=gamepad,
@@ -381,31 +377,19 @@ def main() -> int:
                     send_quick(ser, f"speed {speed_us}")
                     last_speed_adjust = now
 
+                # Unified jog: Cartesian direction and J4 roll are one `cj`
+                # command, so the wrist rotates while the TCP moves.
                 desired_cart = pressed_cart_vector(pad_cart, invert_xy=invert_xy)
-                if desired_cart is not None:
-                    if active_j4 is not None:
-                        stop_jog(ser)
-                        active_j4 = None
-                    if desired_cart != active_cart or now - last_cj_send >= CJ_RESEND_S:
-                        sync_cart_jog(ser, desired_cart)
-                        active_cart = desired_cart
+                desired_roll = j4_roll_state(pad_j4)
+                if desired_cart is not None or desired_roll != 0:
+                    desired = (desired_cart, desired_roll)
+                    if desired != active_cart or now - last_cj_send >= CJ_RESEND_S:
+                        sync_cart_jog(ser, desired_cart, desired_roll)
+                        active_cart = desired
                         last_cj_send = now
-                else:
-                    if active_cart is not None:
-                        stop_jog(ser)
-                        active_cart = None
-                    j4 = j4_key_state(pad_j4)
-                    if j4 is None:
-                        if active_j4 is not None:
-                            stop_jog(ser)
-                            active_j4 = None
-                    elif j4 != active_j4:
-                        sync_j4_jog(ser, j4)
-                        active_j4 = j4
-                        last_j4_send = now
-                    elif now - last_j4_send >= J4_RESEND_S:
-                        resend_j4_jog(ser)
-                        last_j4_send = now
+                elif active_cart is not None:
+                    stop_jog(ser)
+                    active_cart = None
 
                 desired_grip = gripper_key_state(pad_grip)
                 if desired_grip is None:

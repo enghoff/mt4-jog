@@ -35,8 +35,11 @@ bool remove_jog_pin(uint8_t pin);
 bool motion_start_jog();
 
 /* Cartesian jog (`cj` command): resolved-rate world-frame TCP jog, on-device
- * Jacobian/DLS solve re-run every CJ_REFRESH_MS while active. */
-void start_cartesian_jog(Vec3 dir);
+ * Jacobian/DLS solve re-run every CJ_REFRESH_MS while active. j4_roll
+ * (-1/0/+1) adds a wrist roll on top of the solved rates (including on top
+ * of the orient-hold counter-rotation), so J4 can rotate while the TCP
+ * translates; a zero dir with nonzero roll is a pure J4 roll. */
+void start_cartesian_jog(Vec3 dir, int8_t j4_roll);
 void refresh_cartesian_jog_if_due();
 
 /* Bounded relative move (`m` command): all joints move proportionally so

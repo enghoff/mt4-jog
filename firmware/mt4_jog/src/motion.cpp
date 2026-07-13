@@ -12,6 +12,7 @@ bool mt4_homed = false;
 static bool cart_jog_mode = false;
 static Vec3 cart_dir_active = {0.0f, 0.0f, 0.0f};
 static bool cart_dir_active_valid = false;
+static int8_t cart_j4_roll = 0;
 static unsigned long cart_refresh_ms = 0;
 
 static void mp_path_cancel();
@@ -309,9 +310,37 @@ static void normalize_vec3(Vec3 *v) {
 }
 
 static bool setup_cartesian_jog(const Vec3 *dir) {
-  const JointAnglesDeg q = angles_from_steps();
   CartesianRates rates;
-  if (!mt4_cartesian_rates(&q, dir, cart_orient_hold, &rates)) {
+  const bool has_dir =
+      fabsf(dir->x) + fabsf(dir->y) + fabsf(dir->z) > 1e-6f;
+  if (has_dir) {
+    const JointAnglesDeg q = angles_from_steps();
+    if (!mt4_cartesian_rates(&q, dir, cart_orient_hold, &rates)) {
+      return false;
+    }
+  } else {
+    /* Pure J4 roll: nothing for the Cartesian solver to do (a zero
+     * direction has no solution anyway). */
+    rates.j1 = rates.j2 = rates.j3 = 0;
+    rates.j4 = 0;
+    rates.master = MT4_CJ_MASTER;
+  }
+
+  if (cart_j4_roll != 0) {
+    /* Full-rate roll (one step per tick, same feel as the old standalone
+     * J4 jog), added on top of any orient-hold counter-rotation and
+     * clamped to the DDA's one-step-per-tick ceiling. Sign convention:
+     * positive roll = positive joint direction (dda_arm derives the DIR
+     * pin level from the delta's sign). */
+    int32_t j4 = rates.j4 + static_cast<int32_t>(cart_j4_roll) * MT4_CJ_MASTER;
+    if (j4 > MT4_CJ_MASTER) {
+      j4 = MT4_CJ_MASTER;
+    } else if (j4 < -MT4_CJ_MASTER) {
+      j4 = -MT4_CJ_MASTER;
+    }
+    rates.j4 = j4;
+  }
+  if (rates.j1 == 0 && rates.j2 == 0 && rates.j3 == 0 && rates.j4 == 0) {
     return false;
   }
   cart_jog_mode = true;
@@ -321,11 +350,12 @@ static bool setup_cartesian_jog(const Vec3 *dir) {
   return dda_arm(rates.master, deltas, false);
 }
 
-void start_cartesian_jog(Vec3 dir) {
+void start_cartesian_jog(Vec3 dir, int8_t j4_roll) {
   mp_path_cancel();
   normalize_vec3(&dir);
   cart_dir_active = dir;
   cart_dir_active_valid = true;
+  cart_j4_roll = j4_roll;
   cart_refresh_ms = millis();
 
   const bool was_active = jog_active;

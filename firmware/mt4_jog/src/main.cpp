@@ -13,7 +13,11 @@
  *
  * Cartesian jog:
  *   cj +x|-x|+y|-y|+z|-z   world-frame TCP jog (multi-axis DDA on device)
- *   cj <dx> <dy> <dz>      direction vector (integer components, normalized)
+ *   cj <dx> <dy> <dz> [j4] direction vector (integer components, normalized)
+ *                            + optional J4 roll -1|0|1 layered on top of the
+ *                            solved rates (incl. orient hold), so the wrist
+ *                            rotates while the TCP moves; all-zero dir with
+ *                            nonzero j4 = pure wrist roll
  *   orient on|off          J4 wrist unwind when J1 moves (default on, 1:1)
  *   pos                      print joint step counters (since last home),
  *                              plus a derived "tcp x=.. y=.. z=.. j4=..

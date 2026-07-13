@@ -25,7 +25,8 @@ static bool parse_pin(const char *token, uint8_t *out) {
   return true;
 }
 
-static bool parse_cj_vec(const char *arg, Vec3 *out) {
+static bool parse_cj_vec(const char *arg, Vec3 *out, int8_t *j4_roll) {
+  *j4_roll = 0;
   while (*arg == ' ') {
     ++arg;
   }
@@ -62,16 +63,25 @@ static bool parse_cj_vec(const char *arg, Vec3 *out) {
     return true;
   }
 
-  // General signed triple, parsed from the ORIGINAL (unstripped) arg so
-  // each component keeps its own sign.
+  // General signed triple with an optional 4th J4-roll direction, parsed
+  // from the ORIGINAL (unstripped) arg so each component keeps its own
+  // sign. The roll rides along with the Cartesian jog (rotate the wrist
+  // while translating); a zero direction with nonzero roll is a pure
+  // J4 roll through the same code path.
   long dx = 0;
   long dy = 0;
   long dz = 0;
-  if (sscanf(arg, "%ld %ld %ld", &dx, &dy, &dz) == 3) {
+  long roll = 0;
+  const int n = sscanf(arg, "%ld %ld %ld %ld", &dx, &dy, &dz, &roll);
+  if (n >= 3) {
     out->x = static_cast<float>(dx);
     out->y = static_cast<float>(dy);
     out->z = static_cast<float>(dz);
-    return fabsf(out->x) + fabsf(out->y) + fabsf(out->z) > 1e-6f;
+    if (n == 4) {
+      *j4_roll = (roll > 0) ? 1 : (roll < 0 ? -1 : 0);
+    }
+    return fabsf(out->x) + fabsf(out->y) + fabsf(out->z) > 1e-6f ||
+           *j4_roll != 0;
   }
   return false;
 }
@@ -272,11 +282,12 @@ void handle_line(char *line) {
   }
   if (!strncmp(line, "cj ", 3)) {
     Vec3 dir = {0.0f, 0.0f, 0.0f};
-    if (!parse_cj_vec(line + 3, &dir)) {
-      Serial.println(F("err cj +x|-x|+y|-y|+z|-z|dx dy dz"));
+    int8_t j4_roll = 0;
+    if (!parse_cj_vec(line + 3, &dir, &j4_roll)) {
+      Serial.println(F("err cj +x|-x|+y|-y|+z|-z|dx dy dz [j4]"));
       return;
     }
-    start_cartesian_jog(dir);
+    start_cartesian_jog(dir, j4_roll);
     return;
   }
   if ((line[0] == 'm' || line[0] == 'M') && (line[1] == 'p' || line[1] == 'P') &&
