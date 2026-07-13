@@ -16,7 +16,6 @@ import time
 from mt4_jog.gamepad import A, B, BACK, X, XboxGamepad
 from mt4_jog.joints import (
     DEFAULT_BAUD,
-    DEFAULT_PORT,
     GRIPPER_S_CLOSED,
     GRIPPER_S_OPEN,
     J1_HOME_CENTER_STEPS,
@@ -24,6 +23,7 @@ from mt4_jog.joints import (
     KEYBOARD_JOINTS,
     LIMIT_JOINTS,
 )
+from mt4_jog.ports import Mt4PortError, port_display, resolve_port
 from mt4_jog.serial import drain_lines, open_serial, read_lines, send, send_quick
 
 POLL_MS = 10
@@ -240,7 +240,11 @@ def gripper_key_state(gamepad_grip: str | None = None) -> str | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="MT4 keyboard jog")
-    parser.add_argument("--port", default=DEFAULT_PORT)
+    parser.add_argument(
+        "--port",
+        default=None,
+        help="serial port (auto-detect MT4 if omitted)",
+    )
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
     parser.add_argument("--poll-ms", type=int, default=POLL_MS)
     parser.add_argument("--j1-center", type=int, default=J1_HOME_CENTER_STEPS)
@@ -275,8 +279,14 @@ def main() -> int:
             print("XInput not available — keyboard only.", file=sys.stderr)
             gamepad = None
 
+    try:
+        port = resolve_port(args.port, baud=args.baud)
+    except Mt4PortError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
     print_help(gamepad=gamepad is not None)
-    print(f"Port {args.port} @ {args.baud} — focus this window for keyboard.")
+    print(f"{port_display(port, baud=args.baud, explicit=args.port is not None)} — focus this window for keyboard.")
     if gamepad is not None:
         print("Xbox controller: plug in before start; sticks work without focus.")
     print("WARNING: drivers energize while any jog key is held.")
@@ -292,7 +302,7 @@ def main() -> int:
     speed_us = DEFAULT_SPEED_US
     last_speed_adjust = 0.0
 
-    with open_serial(args.port, args.baud) as ser:
+    with open_serial(port, args.baud) as ser:
         time.sleep(1.0)
         if args.verbose:
             for line in read_lines(ser, 1.0):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-DEFAULT_PORT = "COM6"
+DEFAULT_PORT: str | None = None
 DEFAULT_BAUD = 115200
 
 J1_HOME_CENTER_STEPS = 4580

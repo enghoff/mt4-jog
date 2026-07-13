@@ -8,16 +8,21 @@ import subprocess
 import sys
 from pathlib import Path
 
+from mt4_jog.joints import DEFAULT_BAUD
+from mt4_jog.ports import Mt4PortError, port_display, resolve_port
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_HEX = ROOT / "backups" / "mt4_flash_2026-07-02.hex"
 DEFAULT_EEPROM = ROOT / "backups" / "mt4_eeprom_2026-07-02.hex"
-DEFAULT_PORT = "COM6"
-DEFAULT_BAUD = 115200
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Restore stock MT4 firmware")
-    parser.add_argument("--port", default=DEFAULT_PORT)
+    parser.add_argument(
+        "--port",
+        default=None,
+        help="serial port (auto-detect MT4 if omitted)",
+    )
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
     parser.add_argument("--hex", dest="hex_path", type=Path, default=DEFAULT_HEX)
     parser.add_argument(
@@ -30,12 +35,18 @@ def main() -> int:
     parser.add_argument("--yes", action="store_true", help="Skip confirmation")
     args = parser.parse_args()
 
+    try:
+        port = resolve_port(args.port, baud=args.baud, probe=False)
+    except Mt4PortError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
     if not args.hex_path.is_file():
         print(f"Missing firmware image: {args.hex_path}", file=sys.stderr)
         return 1
 
     print(f"This will flash STOCK firmware from:\n  {args.hex_path}")
-    print(f"Target: {args.port} @ {args.baud} (avrdude -c wiring)")
+    print(f"Target: {port_display(port, baud=args.baud, explicit=args.port is not None)} (avrdude -c wiring)")
     if not args.yes:
         print("Press Enter to continue, Ctrl+C to abort.")
         try:
@@ -51,7 +62,7 @@ def main() -> int:
         "-c",
         "wiring",
         "-P",
-        args.port,
+        port,
         "-b",
         str(args.baud),
         "-D",
@@ -74,7 +85,7 @@ def main() -> int:
             "-c",
             "wiring",
             "-P",
-            args.port,
+            port,
             "-b",
             str(args.baud),
             "-D",

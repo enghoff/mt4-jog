@@ -6,10 +6,12 @@ import time
 
 import serial
 
-from mt4_jog.joints import DEFAULT_BAUD, DEFAULT_PORT
+from mt4_jog.joints import DEFAULT_BAUD
+from mt4_jog.ports import resolve_port
 
 
-def open_serial(port: str = DEFAULT_PORT, baud: int = DEFAULT_BAUD) -> serial.Serial:
+def open_serial(port: str | None = None, baud: int = DEFAULT_BAUD) -> serial.Serial:
+    port = resolve_port(port, baud=baud)
     ser = serial.Serial()
     ser.port = port
     ser.baudrate = baud
