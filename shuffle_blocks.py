@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Shuffle cubes between the open work surface and calibrated marker slots.
 
-Homes once, then in a loop:
-  - If any marker is empty: pick a random visible cube and place it on a random
-    empty marker.
-  - Else if every marker is occupied: pick a cube from a random occupied marker
-    and place it on a random clear open-table slot.
+Homes once, then in a loop plans from the latest camera frame only:
+  - Pick a visually confirmed open-table cube onto a marker that the same
+    frame showed free (decoded tag + no nearby cube).
+  - Else pick a visually confirmed marker cube onto a clear open-table slot.
+  - After each pick+place, capture again before planning another drop.
 
-Requires vision_calibration.json (see calibrate_vision.py).
+Obscured cubes/markers are simply absent from the scene and are never used.
 """
 
 from __future__ import annotations

@@ -15,8 +15,11 @@ from mt4_vision.detect import CubeDetection, detect_cubes
 # enough to call the marker free -- see PLACE_CLEARANCE_MM below.
 # With the cube-top calibration fitted, on-marker cubes read 5-15mm from
 # center while beside-the-paper cubes read 20mm+; 40mm classified adjacent
-# cubes as occupants.
-MARKER_OCCUPY_RADIUS_MM = 22.0
+# cubes as occupants. Measured live 2026-07-14: a cube resting on the tag
+# read 23mm from center, 1mm outside the old 22mm radius -- missed
+# "occupied" and (with the tag covered) landed in unknown instead, where
+# the planner can neither place onto it nor pick it off.
+MARKER_OCCUPY_RADIUS_MM = 26.0
 # Min center-to-center gap when folding a completed move into the state.
 CUBE_CLEARANCE_MM = 35.0
 # Min distance from any other cube for a *placement destination*: the
@@ -269,63 +272,6 @@ def rebuild_workspace_state(
     )
 
 
-def apply_completed_move(
-    state: WorkspaceState,
-    move: ShuffleMove,
-    calib: Calibration,
-) -> WorkspaceState:
-    """Fold a successful pick+place into the workspace (vision often lags here)."""
-    place_x = move.place_x
-    place_y = move.place_y
-    if move.place_marker_id is not None:
-        marker = next(m for m in state.markers if m.marker_id == move.place_marker_id)
-        place_x = marker.x
-        place_y = marker.y
-
-    # Remove only the cube that was picked -- the single detection nearest the
-    # pick point. Wiping everything within clearance erased innocent neighbors
-    # too, which could flip an occupied marker to "free" and invite a stack.
-    cubes = list(state.cubes)
-    near_pick = [
-        c for c in cubes
-        if dist_mm(c.x, c.y, move.pick_x, move.pick_y) < CUBE_CLEARANCE_MM
-    ]
-    if near_pick:
-        cubes.remove(
-            min(near_pick, key=lambda c: dist_mm(c.x, c.y, move.pick_x, move.pick_y))
-        )
-
-    # The post-move frame usually already shows the cube at its destination.
-    # Drop that detection -- for slot placements just like marker ones --
-    # so the synthetic cube below doesn't duplicate it. (The destination was
-    # verified clear at plan time, so anything inside clearance here is the
-    # placed cube itself.)
-    cubes = [
-        c
-        for c in cubes
-        if dist_mm(c.x, c.y, place_x, place_y) >= CUBE_CLEARANCE_MM
-    ]
-
-    cubes.append(
-        CubeDetection(
-            color=move.pick_color,
-            px=0.0,
-            py=0.0,
-            area=400.0,
-            x=place_x,
-            y=place_y,
-        )
-    )
-    # The placed cube now covers its marker's tag even if the source frame
-    # still showed it decoded.
-    visible = state.visible_marker_ids
-    if visible is not None and move.place_marker_id is not None:
-        visible = visible - {move.place_marker_id}
-    return rebuild_workspace_state(
-        calib, state.markers, cubes, visible_marker_ids=visible
-    )
-
-
 class MarkerOccupancyTracker:
     """Carry marker occupancy across frames.
 
@@ -449,11 +395,35 @@ def pick_largest_cube(cubes: list[CubeDetection]) -> CubeDetection | None:
 
 
 def plan_shuffle_move(state: WorkspaceState) -> ShuffleMove | None:
-    """Pick a random cube and an empty marker, or relocate off a full marker."""
-    pickable = pickable_cubes(state.cubes)
-    place_markers = mp_reachable_markers(state.free_markers)
-    if place_markers and pickable:
-        cube = random.choice(pickable)
+    """Legacy planner: only visually present pickable cubes / free markers.
+
+    Prefer open-table blockers onto placeable free markers; otherwise relocate
+    an occupied-marker cube onto a free slot. Prefer the scene/policy planner
+    for the live shuffle loop.
+    """
+    from mt4_vision.pickplace import near_camera_park
+
+    pickable = [
+        c
+        for c in pickable_cubes(state.cubes)
+        if not near_camera_park(float(c.x), float(c.y))
+    ]
+    place_markers = [
+        m
+        for m in mp_reachable_markers(state.free_markers)
+        if not near_camera_park(m.x, m.y)
+    ]
+    occupied_ids = {m.marker_id for m, _ in state.occupied}
+
+    def _off_marker(cube: CubeDetection) -> bool:
+        return all(
+            dist_mm(cube.x, cube.y, m.x, m.y) >= MARKER_OCCUPY_RADIUS_MM
+            for m in state.markers
+        )
+
+    blockers = [c for c in pickable if _off_marker(c)]
+    if place_markers and blockers:
+        cube = random.choice(blockers)
         marker = random.choice(place_markers)
         return ShuffleMove(
             cube.x,
@@ -464,17 +434,19 @@ def plan_shuffle_move(state: WorkspaceState) -> ShuffleMove | None:
             "to_marker",
             place_marker_id=marker.marker_id,
         )
-    # Identity check against the pickable set: this also skips occupants the
-    # tracker merely carries from an earlier frame (not in state.cubes) --
-    # no blind picks at markers the arm is currently occluding.
     clear_pickable = set(map(id, pickable))
     reachable_occupied = [
         (marker, cube)
         for marker, cube in state.occupied
-        if id(cube) in clear_pickable
+        if id(cube) in clear_pickable and marker.marker_id in occupied_ids
     ]
-    if reachable_occupied and state.free_slots:
+    free_slots = [
+        (sx, sy)
+        for sx, sy in state.free_slots
+        if not near_camera_park(sx, sy)
+    ]
+    if reachable_occupied and free_slots:
         marker, cube = random.choice(reachable_occupied)
-        sx, sy = random.choice(state.free_slots)
+        sx, sy = random.choice(free_slots)
         return ShuffleMove(cube.x, cube.y, cube.color, sx, sy, "to_slot")
     return None

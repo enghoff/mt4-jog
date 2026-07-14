@@ -46,7 +46,7 @@ def _approach(
 CAMERA_PARK_X = 200.0
 CAMERA_PARK_Y = 0.0
 CAMERA_PARK_Z = 260.0
-CAMERA_PARK_CLEARANCE_MM = 40.0
+CAMERA_PARK_CLEARANCE_MM = 80.0
 
 
 def near_camera_park(x: float, y: float) -> bool:

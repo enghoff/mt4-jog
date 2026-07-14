@@ -3,10 +3,10 @@
 Each clear camera frame builds a fresh ``Scene`` from cube detections and
 ArUco visibility. No persistent tracks -- vacated poses cannot linger.
 
-Detections outside the calibrated marker hull (plus a small margin), near the
-camera-park pose, or outside the typical cube-top area band are treated as
-phantoms and dropped before planning -- arm paint, desk clutter, and FOV
-noise otherwise become pick targets when sorted largest-first.
+Occupancy and place-clearance use every robot-mapped detection. Pick
+candidates are a stricter subset (area / hull / park / reach filters) so
+arm paint is not grasped -- but a filtered blob still blocks placing on
+a nearby marker.
 """
 
 from __future__ import annotations
@@ -34,15 +34,18 @@ from mt4_vision.workspace import (
     rebuild_workspace_state,
 )
 
-# Real cube top faces under this camera land ~200-650px^2 (see detect.py).
-# Looser detect bounds still let phantoms into raw detections; planning uses
-# this tighter band.
-PICK_MIN_AREA = 200.0
+# Real cube top faces under this camera land ~280-650px^2. Tighter than
+# detect.py's floor so low-area glare/arm flecks are not pick targets while
+# still counting toward marker occupancy via the raw detection list.
+PICK_MIN_AREA = 280.0
 PICK_MAX_AREA = 650.0
 # Allow cubes a bit outside the marker convex hull (markers aren't at the
 # desk edge). Measured phantoms run 60-90mm outside; real near-pad cubes
-# sit within ~15mm.
-HULL_OUTSIDE_MARGIN_MM = 40.0
+# sit within ~15mm -- but measured live 2026-07-14, several genuine
+# open-table cubes on this desk's layout sat 42-53mm outside the hull and
+# were wrongly dropped as phantoms at the old 40mm margin. 55mm recovers
+# those while staying short of the 60-90mm phantom range.
+HULL_OUTSIDE_MARGIN_MM = 55.0
 
 
 @dataclass(frozen=True)
@@ -56,7 +59,7 @@ class Scene:
     unknown_markers: list[MarkerSlot]
     free_slots: list[tuple[float, float]]
     visible_marker_ids: set[int]
-    # Raw detections before phantom filtering (debug / logging).
+    # Raw detections (occupancy source); cubes is the pick-quality subset.
     raw_cubes: list[CubeDetection] | None = None
 
     @classmethod
@@ -64,11 +67,13 @@ class Scene:
         cls,
         state: WorkspaceState,
         *,
+        pick_cubes: list[CubeDetection] | None = None,
         raw_cubes: list[CubeDetection] | None = None,
     ) -> Scene:
         visible = state.visible_marker_ids or set()
+        cubes = list(pick_cubes) if pick_cubes is not None else list(state.cubes)
         return cls(
-            cubes=list(state.cubes),
+            cubes=cubes,
             markers=list(state.markers),
             occupied=list(state.occupied),
             free_markers=list(state.free_markers),
@@ -111,7 +116,7 @@ class Scene:
         return best_id
 
     def blockers(self) -> list[CubeDetection]:
-        """Cubes not sitting on any calibrated marker."""
+        """Pick-quality cubes not sitting on any calibrated marker."""
         return [c for c in self.cubes if self.marker_for_cube(c) is None]
 
     def placeable_markers(self) -> list[MarkerSlot]:
@@ -122,13 +127,20 @@ class Scene:
             if is_mp_reachable_xy(m.x, m.y) and not near_camera_park(m.x, m.y)
         ]
 
+    def occupied_pick_cubes(self) -> list[CubeDetection]:
+        """Occupied-marker cubes that are also pick-quality (in Scene.cubes)."""
+        pick_ids = {id(c) for c in self.cubes}
+        return [c for _m, c in self.occupied if id(c) in pick_ids]
+
     def pickable(self, cubes: list[CubeDetection]) -> list[CubeDetection]:
-        """Reachable cubes with finger clearance from every other detection."""
+        """Reachable cubes with finger clearance from every other pick cube."""
         out: list[CubeDetection] = []
         for c in cubes:
             if not is_mp_reachable_xy(float(c.x), float(c.y)):
                 continue
             if math.hypot(float(c.x), float(c.y)) > MAX_REACH_MM:
+                continue
+            if near_camera_park(float(c.x), float(c.y)):
                 continue
             if any(
                 dist_mm(float(c.x), float(c.y), float(o.x), float(o.y))
@@ -138,8 +150,6 @@ class Scene:
             ):
                 continue
             out.append(c)
-        # Prefer mid-size blobs closer to the workspace center -- largest
-        # first kept promoting oversize outside-hull phantoms.
         cx = sum(m.x for m in self.markers) / max(len(self.markers), 1)
         cy = sum(m.y for m in self.markers) / max(len(self.markers), 1)
         out.sort(
@@ -164,7 +174,7 @@ def is_phantom_detection(
     *,
     hull: np.ndarray | None = None,
 ) -> bool:
-    """True when a blob should not be treated as a real desk cube."""
+    """True when a blob should not be treated as a pick target."""
     if cube.x is None or cube.y is None:
         return True
     if cube.area < PICK_MIN_AREA or cube.area > PICK_MAX_AREA:
@@ -177,7 +187,6 @@ def is_phantom_detection(
         return True
     hull = hull if hull is not None else _marker_hull_robot(markers)
     if hull is not None:
-        # OpenCV: positive = inside. Reject well outside the marker hull.
         inside = cv2.pointPolygonTest(
             hull, (float(cube.x), float(cube.y)), True
         )
@@ -194,14 +203,19 @@ def filter_phantoms(
 
 
 def capture_scene(calib: Calibration, frame: np.ndarray) -> Scene:
+    """Build a scene from one frame.
+
+    Occupancy / free-marker / free-slot clearance uses *every* robot-mapped
+    detection (raw). Phantom filtering only removes pick candidates.
+    """
     markers = marker_slots_from_calibration(calib)
     raw = cubes_with_robot_coords(detect_cubes(frame, calib))
-    cubes = filter_phantoms(raw, markers)
     visible = {m.marker_id for m in detect_markers(frame, MARKER_DICT)}
     state = rebuild_workspace_state(
-        calib, markers, cubes, visible_marker_ids=visible
+        calib, markers, raw, visible_marker_ids=visible
     )
-    return Scene.from_workspace(state, raw_cubes=raw)
+    pick_cubes = filter_phantoms(raw, markers)
+    return Scene.from_workspace(state, pick_cubes=pick_cubes, raw_cubes=raw)
 
 
 # Post-move verification radii (mm).

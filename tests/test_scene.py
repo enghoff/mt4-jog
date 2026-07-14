@@ -40,7 +40,7 @@ def scene(
 
 
 def test_blocker_to_free_marker():
-    s = scene([cube("red", 240.0, 0.0)], visible={0, 1, 2, 3})
+    s = scene([cube("red", 240.0, 100.0)], visible={0, 1, 2, 3})
     action = plan_shuffle(s)
     assert action.kind == "pick"
     assert action.place_kind == "to_marker"
@@ -68,7 +68,7 @@ def test_occupied_marker_not_placeable():
 
 def test_prefer_blocker_over_marker_cube():
     s = scene(
-        [cube("red", 240.0, 0.0), cube("blue", 177.2, 181.5)],
+        [cube("red", 240.0, 100.0), cube("blue", 177.2, 181.5)],
         visible={0, 1, 2},  # 3 occupied; others free
     )
     action = plan_shuffle(s)
@@ -92,18 +92,52 @@ def test_marker_to_slot_when_full():
     assert action.place_marker_id is None
 
 
-def test_idle_when_free_marker_but_no_blocker():
+def test_marker_cube_to_free_marker_when_no_blocker():
+    # Free markers 0,1,2; cube only on marker 3 -- relocate onto a free marker.
     s = scene(
         [cube("green", 177.2, 181.5)],
         visible={0, 1, 2},
     )
     action = plan_shuffle(s)
-    assert action.kind == "wait"
+    assert action.kind == "pick", action
+    assert action.place_kind == "to_marker", action
+    assert action.place_marker_id in {0, 1, 2}
+    assert action.cube is not None
+    assert action.cube.color == "green"
+
+
+def test_park_adjacent_ghost_not_pickable():
+    """Live ghost class green ~(193,-51) sits next to camera park -- not a pick."""
+    from mt4_vision.scene import is_phantom_detection
+
+    ghost = cube("green", 193.0, -51.0, area=412.0)
+    assert is_phantom_detection(ghost, MARKERS)
+    s = scene([ghost, cube("red", 184.0, -163.0)], visible={0, 1, 2, 3})
+    action = plan_shuffle(s)
+    if action.kind == "pick" and action.cube is not None:
+        assert not (
+            action.cube.color == "green"
+            and abs(float(action.cube.x) - 193.0) < 5
+            and abs(float(action.cube.y) - (-51.0)) < 5
+        )
+
+
+def test_raw_near_marker_blocks_place_even_if_filtered_from_picks():
+    """Occupancy uses raw blobs; a too-small blob still blocks place."""
+    small = cube("green", 177.2, 181.5, area=150.0)
+    state = rebuild_workspace_state(
+        None, MARKERS, [small], visible_marker_ids={0, 1, 2, 3}
+    )
+    assert any(m.marker_id == 3 for m, _ in state.occupied)
+    assert 3 not in {m.marker_id for m in state.free_markers}
+    s = Scene.from_workspace(state, pick_cubes=[], raw_cubes=[small])
+    assert 3 not in {m.marker_id for m in s.placeable_markers()}
+    assert plan_shuffle(s).kind == "wait"
 
 
 def test_vacated_pose_not_planned_after_fresh_scene():
     """Detection-as-state: a gone cube simply isn't in the next scene."""
-    before = scene([cube("red", 240.0, 0.0)], visible={0, 1, 2, 3})
+    before = scene([cube("red", 240.0, 100.0)], visible={0, 1, 2, 3})
     assert plan_shuffle(before).kind == "pick"
     after = scene([], visible={0, 1, 2, 3})
     assert plan_shuffle(after).kind == "wait"
@@ -142,12 +176,12 @@ def test_verify_pick_place_outcomes():
         )
         == "placed"
     )
-    failed = scene([cube("blue", 241.0, 1.0)], visible={0, 1, 2, 3})
+    failed = scene([cube("blue", 241.0, 101.0)], visible={0, 1, 2, 3})
     assert (
         verify_pick_place(
             failed,
             pick_x=240.0,
-            pick_y=0.0,
+            pick_y=100.0,
             pick_color="blue",
             place_x=177.2,
             place_y=181.5,
@@ -159,7 +193,7 @@ def test_verify_pick_place_outcomes():
         verify_pick_place(
             lost,
             pick_x=240.0,
-            pick_y=0.0,
+            pick_y=100.0,
             pick_color="blue",
             place_x=177.2,
             place_y=181.5,
