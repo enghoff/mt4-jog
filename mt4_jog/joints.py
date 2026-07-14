@@ -10,6 +10,17 @@ DEFAULT_BAUD = 115200
 J1_HOME_CENTER_STEPS = 4580
 J2_HOME_PULLOFF_STEPS = 1000
 
+# All four measured 2026-07-06 (J2-J4 with a phone clinometer against the
+# link; J1 by direct measurement of its yaw rotation), replacing the
+# factory-EEPROM-derived guesses -- J1/J2/J3 share a physical motor/gearbox
+# design (~35 steps/deg each). J3's own EEPROM setting was missing from the
+# dump entirely (the old 35.556 was borrowed from unrelated extra axes), and
+# J4's old value (852) was a wrong axis-letter assumption ("d" = J4).
+# Per README.md: duplicated in firmware/mt4_jog/src/kinematics.{h,cpp} and
+# mt4_jog/kinematics.py -- no shared config file, edit all three together.
+# Zero Python importers of this copy is expected, not dead code.
+STEPS_PER_DEG: tuple[float, float, float, float] = (35.0, 35.0, 35.0, 45.0)
+
 # Enforced in jog firmware (g o / g c sweep); client only starts/stops sweep.
 GRIPPER_S_OPEN = 120
 GRIPPER_S_CLOSED = 285
