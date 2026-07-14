@@ -141,6 +141,97 @@ def key_down(key: str) -> bool:
     return vk is not None and bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
 
 
+def _process_parents() -> dict[int, int]:
+    """pid -> parent pid for every running process (Toolhelp32 snapshot)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    kernel32 = ctypes.windll.kernel32
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snapshot == -1:
+        return {}
+    parents: dict[int, int] = {}
+    try:
+        entry = PROCESSENTRY32()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        if kernel32.Process32First(snapshot, ctypes.byref(entry)):
+            while True:
+                parents[entry.th32ProcessID] = entry.th32ParentProcessID
+                if not kernel32.Process32Next(snapshot, ctypes.byref(entry)):
+                    break
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return parents
+
+
+def console_focused() -> bool:
+    """True when the foreground window belongs to this process's own
+    terminal/shell -- i.e. an ancestor of this process currently has OS
+    input focus.
+
+    GetAsyncKeyState (key_down above) is global -- it fires from any window,
+    not just this one. Callers that want a key to act only while this
+    terminal is the foreground window (e.g. a background loop's re-home
+    hotkey) should gate on this too.
+
+    A direct GetConsoleWindow() == GetForegroundWindow() comparison doesn't
+    work here: under Windows Terminal / VS Code / Cursor, the visible,
+    focusable window belongs to the terminal-emulator process, not the
+    hidden conhost window GetConsoleWindow() returns a handle for -- that
+    comparison is always False under those hosts, silently disabling
+    whatever depends on it. Instead, walk up the process tree from the
+    foreground window's owning PID and this process's own PID; if they
+    share an ancestor, the terminal hosting us is the one in focus. This
+    can't distinguish separate tabs/panes within the same terminal window
+    (not exposed by these APIs), but correctly ignores focus in unrelated
+    apps (browser, editor, etc).
+    """
+    if sys.platform != "win32":
+        return True
+    import ctypes
+    import os
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    fg_hwnd = user32.GetForegroundWindow()
+    if not fg_hwnd:
+        return True
+
+    fg_pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(fg_hwnd, ctypes.byref(fg_pid))
+    target = fg_pid.value
+    if not target:
+        return True
+
+    return _pid_shares_ancestry(_process_parents(), os.getpid(), target)
+
+
+def _pid_shares_ancestry(parents: dict[int, int], pid: int, target: int) -> bool:
+    """True when ``target`` is ``pid`` itself or one of its ancestors."""
+    seen: set[int] = set()
+    while pid and pid not in seen:
+        if pid == target:
+            return True
+        seen.add(pid)
+        pid = parents.get(pid, 0)
+    return False
+
+
 def gamepad_button_held(gamepad: XboxGamepad | None, mask: int) -> bool:
     """Poll fresh controller state before testing a held button."""
     if gamepad is None or not mask:

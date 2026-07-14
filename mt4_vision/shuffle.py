@@ -48,7 +48,12 @@ POST_MOVE_RECHECK_DELAY_S = 0.4
 
 
 class _HomeKeyWatcher:
-    """Detect a tap of H (same binding as jog_keyboard.py) without blocking."""
+    """Detect a tap of H (same binding as jog_keyboard.py) without blocking.
+
+    Gated on this process's console having OS focus -- GetAsyncKeyState is
+    global, so without that check an H press in any other window (browser,
+    another terminal) would re-home the arm mid-shuffle.
+    """
 
     def __init__(self, client: Mt4Client) -> None:
         self._client = client
@@ -75,10 +80,10 @@ class _HomeKeyWatcher:
         return False
 
     def _run(self) -> None:
-        from jog_keyboard import key_down
+        from jog_keyboard import console_focused, key_down
 
         while not self._stop.is_set():
-            down = key_down("h")
+            down = console_focused() and key_down("h")
             if down and not self._h_down:
                 self._requested.set()
                 self._client.request_interrupt()
