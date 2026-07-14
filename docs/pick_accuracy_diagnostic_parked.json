@@ -1,0 +1,416 @@
+{
+  "report": {
+    "calib_path": "D:\\mt4\\vision_calibration.json",
+    "cube_top_homography": "NULL",
+    "pick_z": 156.9,
+    "table_z": 146.9,
+    "cube_height_mm": 20.0,
+    "1_table_plane_calibration": {
+      "per_marker_mm": {
+        "0": 8.38,
+        "1": 10.79,
+        "2": 2.23,
+        "3": 10.36,
+        "4": 5.89
+      },
+      "n": 5,
+      "mean_mm": 7.53,
+      "max_mm": 10.79,
+      "rms_mm": 8.17
+    },
+    "2_camera_align": {
+      "markers_calib": 5,
+      "markers_live": 2,
+      "per_marker": [
+        {
+          "marker_id": 0,
+          "status": "ok",
+          "pixel_drift_px": 0.25,
+          "pixel_drift_mm": 0.39,
+          "live_map_vs_touch_mm": 8.03,
+          "live_robot": [
+            59.6,
+            -258.9
+          ],
+          "calib_robot": [
+            51.6,
+            -259.1
+          ]
+        },
+        {
+          "marker_id": 1,
+          "status": "not_seen"
+        },
+        {
+          "marker_id": 2,
+          "status": "not_seen"
+        },
+        {
+          "marker_id": 3,
+          "status": "not_seen"
+        },
+        {
+          "marker_id": 4,
+          "status": "ok",
+          "pixel_drift_px": 0.26,
+          "pixel_drift_mm": 0.34,
+          "live_map_vs_touch_mm": 6.27,
+          "live_robot": [
+            235.3,
+            6.7
+          ],
+          "calib_robot": [
+            241.5,
+            5.5
+          ]
+        }
+      ],
+      "pixel_drift": {
+        "n": 2,
+        "mean_mm": 0.37,
+        "max_mm": 0.39,
+        "rms_mm": 0.37
+      },
+      "live_map_vs_touch": {
+        "n": 2,
+        "mean_mm": 7.15,
+        "max_mm": 8.03,
+        "rms_mm": 7.2
+      }
+    },
+    "3_cube_top_parallax": {
+      "live_cube_top_homography": "NULL",
+      "backup_cube_top_homography": "set",
+      "cubes": [
+        {
+          "color": "red",
+          "pixel": [
+            424.0,
+            370.8
+          ],
+          "area_px": 734,
+          "table_xy": [
+            271.3,
+            -196.3
+          ],
+          "cube_top_xy": null,
+          "delta_mm": 7.71,
+          "cube_top_xy_proxy": [
+            272.3,
+            -188.6
+          ],
+          "proxy": "backup_cubetop"
+        },
+        {
+          "color": "blue",
+          "pixel": [
+            461.4,
+            374.7
+          ],
+          "area_px": 610,
+          "table_xy": [
+            276.4,
+            -154.2
+          ],
+          "cube_top_xy": null,
+          "delta_mm": 6.36,
+          "cube_top_xy_proxy": [
+            278.8,
+            -148.3
+          ],
+          "proxy": "backup_cubetop"
+        },
+        {
+          "color": "red",
+          "pixel": [
+            741.8,
+            340.4
+          ],
+          "area_px": 530,
+          "table_xy": [
+            227.0,
+            164.0
+          ],
+          "cube_top_xy": null,
+          "delta_mm": 14.83,
+          "cube_top_xy_proxy": [
+            241.5,
+            161.2
+          ],
+          "proxy": "backup_cubetop"
+        },
+        {
+          "color": "red",
+          "pixel": [
+            455.3,
+            309.5
+          ],
+          "area_px": 469,
+          "table_xy": [
+            182.4,
+            -175.3
+          ],
+          "cube_top_xy": null,
+          "delta_mm": 10.94,
+          "cube_top_xy_proxy": [
+            186.2,
+            -165.0
+          ],
+          "proxy": "backup_cubetop"
+        },
+        {
+          "color": "blue",
+          "pixel": [
+            719.2,
+            188.2
+          ],
+          "area_px": 400,
+          "table_xy": [
+            -37.4,
+            152.5
+          ],
+          "cube_top_xy": null,
+          "delta_mm": 20.71,
+          "cube_top_xy_proxy": [
+            -18.8,
+            161.6
+          ],
+          "proxy": "backup_cubetop"
+        },
+        {
+          "color": "green",
+          "pixel": [
+            875.4,
+            221.5
+          ],
+          "area_px": 388,
+          "table_xy": [
+            24.9,
+            360.7
+          ],
+          "cube_top_xy": null,
+          "delta_mm": 24.76,
+          "cube_top_xy_proxy": [
+            49.6,
+            361.5
+          ],
+          "proxy": "backup_cubetop"
+        },
+        {
+          "color": "green",
+          "pixel": [
+            786.0,
+            307.7
+          ],
+          "area_px": 382,
+          "table_xy": [
+            176.7,
+            222.0
+          ],
+          "cube_top_xy": null,
+          "delta_mm": 17.73,
+          "cube_top_xy_proxy": [
+            194.3,
+            219.6
+          ],
+          "proxy": "backup_cubetop"
+        },
+        {
+          "color": "green",
+          "pixel": [
+            744.9,
+            301.1
+          ],
+          "area_px": 359,
+          "table_xy": [
+            166.7,
+            172.4
+          ],
+          "cube_top_xy": null,
+          "delta_mm": 16.06,
+          "cube_top_xy_proxy": [
+            182.8,
+            172.0
+          ],
+          "proxy": "backup_cubetop"
+        }
+      ],
+      "live_table_vs_cubetop": {
+        "n": 0
+      },
+      "estimated_pick_error_without_cubetop": {
+        "n": 8,
+        "mean_mm": 14.89,
+        "max_mm": 24.76,
+        "rms_mm": 16.02
+      },
+      "marker_pixel_proxy_deltas": [
+        {
+          "marker_id": 0,
+          "delta_mm": 18.07
+        },
+        {
+          "marker_id": 1,
+          "delta_mm": 23.58
+        },
+        {
+          "marker_id": 2,
+          "delta_mm": 10.63
+        },
+        {
+          "marker_id": 3,
+          "delta_mm": 16.06
+        },
+        {
+          "marker_id": 4,
+          "delta_mm": 9.1
+        }
+      ],
+      "marker_pixel_proxy": {
+        "n": 5,
+        "mean_mm": 15.49,
+        "max_mm": 23.58,
+        "rms_mm": 16.35
+      },
+      "note": "Live calibration has no cube_top_homography; cubes are mapped through the table-plane homography. Deltas use the 2026-07-14 backup cube_top fit as a truth proxy."
+    },
+    "4_visual_detection_noise": {
+      "frames": 8,
+      "tracks": [
+        {
+          "track": "red#0",
+          "frames": 8,
+          "rms_px": 0.53,
+          "rms_mm": 0.66,
+          "mean_pixel": [
+            423.4,
+            370.9
+          ]
+        },
+        {
+          "track": "blue#1",
+          "frames": 8,
+          "rms_px": 0.04,
+          "rms_mm": 0.05,
+          "mean_pixel": [
+            461.4,
+            374.8
+          ]
+        },
+        {
+          "track": "red#2",
+          "frames": 8,
+          "rms_px": 0.27,
+          "rms_mm": 0.36,
+          "mean_pixel": [
+            741.7,
+            340.8
+          ]
+        },
+        {
+          "track": "red#3",
+          "frames": 8,
+          "rms_px": 0.06,
+          "rms_mm": 0.09,
+          "mean_pixel": [
+            455.4,
+            309.5
+          ]
+        },
+        {
+          "track": "blue#4",
+          "frames": 8,
+          "rms_px": 0.05,
+          "rms_mm": 0.09,
+          "mean_pixel": [
+            719.1,
+            188.2
+          ]
+        },
+        {
+          "track": "green#5",
+          "frames": 8,
+          "rms_px": 0.18,
+          "rms_mm": 0.31,
+          "mean_pixel": [
+            875.4,
+            221.4
+          ]
+        },
+        {
+          "track": "green#6",
+          "frames": 8,
+          "rms_px": 0.12,
+          "rms_mm": 0.17,
+          "mean_pixel": [
+            785.9,
+            307.6
+          ]
+        },
+        {
+          "track": "green#7",
+          "frames": 8,
+          "rms_px": 0.1,
+          "rms_mm": 0.14,
+          "mean_pixel": [
+            745.0,
+            301.4
+          ]
+        }
+      ],
+      "centroid_rms": {
+        "n": 8,
+        "mean_mm": 0.23,
+        "max_mm": 0.66,
+        "rms_mm": 0.3
+      }
+    },
+    "5_mt4_control": {
+      "skipped": true
+    },
+    "error_budget": [
+      {
+        "source": "cube_top_parallax_or_missing_correction",
+        "rms_mm": 16.02,
+        "max_mm": 24.76
+      },
+      {
+        "source": "table_plane_calibration",
+        "rms_mm": 8.17,
+        "max_mm": 10.79
+      },
+      {
+        "source": "camera_align_drift",
+        "rms_mm": 0.37,
+        "max_mm": 0.39
+      },
+      {
+        "source": "visual_detection_noise",
+        "rms_mm": 0.3,
+        "max_mm": 0.66
+      }
+    ]
+  },
+  "budget": [
+    {
+      "source": "cube_top_parallax_or_missing_correction",
+      "rms_mm": 16.02,
+      "max_mm": 24.76
+    },
+    {
+      "source": "table_plane_calibration",
+      "rms_mm": 8.17,
+      "max_mm": 10.79
+    },
+    {
+      "source": "camera_align_drift",
+      "rms_mm": 0.37,
+      "max_mm": 0.39
+    },
+    {
+      "source": "visual_detection_noise",
+      "rms_mm": 0.3,
+      "max_mm": 0.66
+    }
+  ]
+}

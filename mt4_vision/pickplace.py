@@ -38,6 +38,32 @@ def _approach(
     )
 
 
+# Camera-clear parking spot for between-move captures: the homed TCP pose.
+# From the front-mounted camera the arm parked here only occludes the strip
+# behind it -- essentially the mp keep-out region, where nothing pickable or
+# placeable ever sits. Anywhere over the workspace, the forearm hides cubes
+# and markers AND reads as cube-sized red blobs inside the workspace hull.
+CAMERA_PARK_X = 200.0
+CAMERA_PARK_Y = 0.0
+CAMERA_PARK_Z = 260.0
+CAMERA_PARK_CLEARANCE_MM = 40.0
+
+
+def near_camera_park(x: float, y: float) -> bool:
+    """True when (x, y) is too close to the camera-park TCP to place/pick."""
+    return (
+        (x - CAMERA_PARK_X) ** 2 + (y - CAMERA_PARK_Y) ** 2
+    ) < CAMERA_PARK_CLEARANCE_MM**2
+
+
+def retreat_for_camera(client: Mt4Client, calib: Calibration) -> dict[str, object]:
+    """Move the TCP to the camera-clear park pose (post-move capture prep)."""
+    return _travel(
+        client, calib, CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z,
+        "retreat to camera park",
+    )
+
+
 def ensure_homed(client: Mt4Client) -> None:
     status = client.get_status()
     if not status.homed:
