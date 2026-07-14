@@ -4,9 +4,15 @@ Each clear camera frame builds a fresh ``Scene`` from cube detections and
 ArUco visibility. No persistent tracks -- vacated poses cannot linger.
 
 Occupancy and place-clearance use every robot-mapped detection. Pick
-candidates are a stricter subset (area / hull / park / reach filters) so
-arm paint is not grasped -- but a filtered blob still blocks placing on
-a nearby marker.
+candidates are a stricter subset (area / hull / reach filters) so arm
+paint is not grasped -- but a filtered blob still blocks placing on a
+nearby marker.
+
+No camera-park exclusion here: that guarded against the arm's own
+silhouette being misread near its old capture-retreat pose, but the live
+loop (shuffle.py) never retreats there between captures -- it was quietly
+vetoing real desk locations (e.g. marker 4, ~42mm from that pose) that
+have nothing to do with the arm's position during capture.
 """
 
 from __future__ import annotations
@@ -19,7 +25,6 @@ import numpy as np
 
 from mt4_vision.calib import Calibration
 from mt4_vision.detect import CubeDetection, detect_cubes, detect_markers
-from mt4_vision.pickplace import near_camera_park
 from mt4_vision.workspace import (
     MARKER_DICT,
     MARKER_OCCUPY_RADIUS_MM,
@@ -120,12 +125,8 @@ class Scene:
         return [c for c in self.cubes if self.marker_for_cube(c) is None]
 
     def placeable_markers(self) -> list[MarkerSlot]:
-        """Tag visible, place-clearance free, reachable, not near camera park."""
-        return [
-            m
-            for m in self.free_markers
-            if is_mp_reachable_xy(m.x, m.y) and not near_camera_park(m.x, m.y)
-        ]
+        """Tag visible, place-clearance free, reachable."""
+        return [m for m in self.free_markers if is_mp_reachable_xy(m.x, m.y)]
 
     def occupied_pick_cubes(self) -> list[CubeDetection]:
         """Occupied-marker cubes that are also pick-quality (in Scene.cubes)."""
@@ -139,8 +140,6 @@ class Scene:
             if not is_mp_reachable_xy(float(c.x), float(c.y)):
                 continue
             if math.hypot(float(c.x), float(c.y)) > MAX_REACH_MM:
-                continue
-            if near_camera_park(float(c.x), float(c.y)):
                 continue
             if any(
                 dist_mm(float(c.x), float(c.y), float(o.x), float(o.y))
@@ -178,8 +177,6 @@ def is_phantom_detection(
     if cube.x is None or cube.y is None:
         return True
     if cube.area < PICK_MIN_AREA or cube.area > PICK_MAX_AREA:
-        return True
-    if near_camera_park(float(cube.x), float(cube.y)):
         return True
     if not is_mp_reachable_xy(float(cube.x), float(cube.y)):
         return True

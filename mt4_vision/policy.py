@@ -30,7 +30,6 @@ import random
 from dataclasses import dataclass
 
 from mt4_vision.detect import CubeDetection
-from mt4_vision.pickplace import near_camera_park
 from mt4_vision.scene import Scene
 from mt4_vision.workspace import dist_mm
 
@@ -97,11 +96,7 @@ def plan_shuffle(
         scene.pickable(scene.occupied_pick_cubes()), avoid_xy
     )
     occupied_cubes = [c for c in occupied_cubes if c is not exclude_cube]
-    slots = [
-        (sx, sy)
-        for sx, sy in scene.free_slots
-        if not near_camera_park(sx, sy) and (sx, sy) != exclude_slot
-    ]
+    slots = [(sx, sy) for sx, sy in scene.free_slots if (sx, sy) != exclude_slot]
 
     if free_markers and blockers:
         cube = random.choice(blockers)

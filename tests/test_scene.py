@@ -106,20 +106,18 @@ def test_marker_cube_to_free_marker_when_no_blocker():
     assert action.cube.color == "green"
 
 
-def test_park_adjacent_ghost_not_pickable():
-    """Live ghost class green ~(193,-51) sits next to camera park -- not a pick."""
+def test_camera_park_adjacent_cube_is_pickable():
+    """A cube near the old camera-park pose (200,0) is a normal pick target.
+
+    That exclusion existed to hide the arm's own silhouette when it used to
+    retreat to (200,0) between captures via retreat_for_camera() -- the live
+    loop (shuffle.py) never calls that, so this position isn't special and
+    shouldn't veto a real cube (it used to permanently exclude marker 4,
+    ~42mm away, and two PLACEMENT_SLOTS entries)."""
     from mt4_vision.scene import is_phantom_detection
 
-    ghost = cube("green", 193.0, -51.0, area=412.0)
-    assert is_phantom_detection(ghost, MARKERS)
-    s = scene([ghost, cube("red", 184.0, -163.0)], visible={0, 1, 2, 3})
-    action = plan_shuffle(s)
-    if action.kind == "pick" and action.cube is not None:
-        assert not (
-            action.cube.color == "green"
-            and abs(float(action.cube.x) - 193.0) < 5
-            and abs(float(action.cube.y) - (-51.0)) < 5
-        )
+    near_park = cube("green", 193.0, -51.0, area=412.0)
+    assert not is_phantom_detection(near_park, MARKERS)
 
 
 def test_raw_near_marker_blocks_place_even_if_filtered_from_picks():
@@ -156,11 +154,10 @@ def test_outside_hull_blob_filtered_as_phantom():
     assert [c.color for c in kept] == ["green"]
 
 
-def test_keepout_and_park_blobs_filtered():
+def test_keepout_blob_filtered():
     from mt4_vision.scene import is_phantom_detection
 
     assert is_phantom_detection(cube("blue", -19.0, 161.0, area=400.0), MARKERS)
-    assert is_phantom_detection(cube("blue", 200.0, 0.0, area=400.0), MARKERS)
 
 
 def test_verify_pick_place_outcomes():
