@@ -1,9 +1,25 @@
 """Indefinite cube shuffle loop (see shuffle_blocks.py CLI).
 
 Plans only from the latest camera frame via detection-as-state Scene.
-No synthetic cubes, no camera-park retreat, no post-move stigma: if the arm
-obscures a cube or marker, that object simply isn't in the scene. Ghosts must
-be filtered out of pick candidates; they are never "handled" as grips.
+No synthetic cubes, no camera-park retreat: if the arm obscures a cube or
+marker, that object simply isn't in the scene. Ghosts must be filtered out
+of pick candidates; they are never "handled" as grips.
+
+The one deliberate exception is `last_place`: the destination of the last
+completed move is passed to plan_shuffle so it deprioritizes (never
+excludes) re-picking that same cube next cycle. Unlike the old removed
+"LastAttempt" stigma -- which hid grasp/vision bugs by refusing to repeat a
+move at all -- this only prefers variety and always falls back to the same
+cube if it is the only pickable one.
+
+Lookahead: before executing a planned move, also ask plan_shuffle (via
+_lookahead_action) whether a *second*, independent move is already visible
+in that same capture. If so, both moves run back to back under one
+continuous begin_motion()/end_motion() span -- no capture, settle pause, or
+verification happens between them, only after the pair. This trades
+verifying the first move immediately for fewer pauses; a first move that
+actually failed still shows up as a pickable cube on the next real capture,
+just one cycle later than it otherwise would.
 """
 
 from __future__ import annotations
@@ -149,9 +165,34 @@ def _action_targets(
     )
 
 
-def _plan_from_capture(prefetch: _VisionPrefetch) -> tuple[Scene, Action]:
+def _lookahead_action(
+    scene: Scene, first_action: Action, avoid_xy: tuple[float, float] | None
+) -> Action | None:
+    """A second, independent move already visible in the same capture as
+    `first_action`, or None. Lets the caller skip the capture+settle pause
+    between two moves planned from the same frame."""
+    if first_action.kind != "pick":
+        return None
+    exclude_slot = (
+        (first_action.place_x, first_action.place_y)
+        if first_action.place_kind == "to_slot"
+        else None
+    )
+    candidate = plan_shuffle(
+        scene,
+        avoid_xy=avoid_xy,
+        exclude_cube=first_action.cube,
+        exclude_marker_id=first_action.place_marker_id,
+        exclude_slot=exclude_slot,
+    )
+    return candidate if candidate.kind == "pick" else None
+
+
+def _plan_from_capture(
+    prefetch: _VisionPrefetch, avoid_xy: tuple[float, float] | None = None
+) -> tuple[Scene, Action]:
     scene = prefetch.capture()
-    return scene, plan_shuffle(scene)
+    return scene, plan_shuffle(scene, avoid_xy=avoid_xy)
 
 
 def _plan_after_move(
@@ -186,7 +227,7 @@ def _plan_after_move(
             place_y=place_y,
         )
     print(f"post-move check: {verdict} (after {attempts} recheck(s))")
-    return scene, plan_shuffle(scene)
+    return scene, plan_shuffle(scene, avoid_xy=(place_x, place_y))
 
 
 def _check_home_request(
@@ -194,9 +235,10 @@ def _check_home_request(
     client: Mt4Client,
     prefetch: _VisionPrefetch,
     calib: Calibration,
+    avoid_xy: tuple[float, float] | None = None,
 ) -> tuple[Scene, Action] | None:
     if watcher.consume():
-        return _run_home(client, prefetch, calib)
+        return _run_home(client, prefetch, calib, avoid_xy)
     return None
 
 
@@ -206,22 +248,24 @@ def _sleep_or_home(
     client: Mt4Client,
     prefetch: _VisionPrefetch,
     calib: Calibration,
+    avoid_xy: tuple[float, float] | None = None,
 ) -> tuple[Scene, Action] | None:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         if watcher.consume():
-            return _run_home(client, prefetch, calib)
+            return _run_home(client, prefetch, calib, avoid_xy)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         time.sleep(min(0.05, remaining))
-    return _check_home_request(watcher, client, prefetch, calib)
+    return _check_home_request(watcher, client, prefetch, calib, avoid_xy)
 
 
 def _run_home(
     client: Mt4Client,
     prefetch: _VisionPrefetch,
     calib: Calibration,
+    avoid_xy: tuple[float, float] | None = None,
 ) -> tuple[Scene, Action]:
     print("homing (H)...")
     client.clear_interrupt()
@@ -232,7 +276,7 @@ def _run_home(
     prefetch.end_motion()
     home_arm(client)
     print("home ok")
-    return _plan_from_capture(prefetch)
+    return _plan_from_capture(prefetch, avoid_xy)
 
 
 def _home_was_requested(watcher: _HomeKeyWatcher, exc: Mt4ClientError) -> bool:
@@ -258,10 +302,13 @@ def run_shuffle_loop(
     watcher = _HomeKeyWatcher(client)
     watcher.start()
     prefetch = _VisionPrefetch(calib, camera, settle_s=pause_s)
+    # Destination of the last completed move -- passed to plan_shuffle so it
+    # doesn't move the same cube twice in a row when another is pickable.
+    last_place: tuple[float, float] | None = None
     try:
-        scene, action = _plan_from_capture(prefetch)
+        scene, action = _plan_from_capture(prefetch, last_place)
         while True:
-            refreshed = _check_home_request(watcher, client, prefetch, calib)
+            refreshed = _check_home_request(watcher, client, prefetch, calib, last_place)
             if refreshed is not None:
                 scene, action = refreshed
                 continue
@@ -273,47 +320,72 @@ def run_shuffle_loop(
             if targets is None:
                 print(f"waiting {retry_s:.0f}s for a clearer scene")
                 refreshed = _sleep_or_home(
-                    retry_s, watcher, client, prefetch, calib
+                    retry_s, watcher, client, prefetch, calib, last_place
                 )
                 if refreshed is not None:
                     scene, action = refreshed
                 else:
-                    scene, action = _plan_from_capture(prefetch)
+                    scene, action = _plan_from_capture(prefetch, last_place)
                 continue
 
-            pick_x, pick_y, color, place_x, place_y = targets
-            print(
-                f"pick-and-place: {color} ({pick_x:.0f},{pick_y:.0f}) "
-                f"-> ({place_x:.0f},{place_y:.0f})"
-            )
+            moves = [targets]
+            lookahead = _lookahead_action(scene, action, last_place)
+            if lookahead is not None:
+                lookahead_targets = _action_targets(lookahead)
+                assert lookahead_targets is not None
+                moves.append(lookahead_targets)
+                print(
+                    f"lookahead: {lookahead.reason} -- also visible in this "
+                    f"capture, chaining it in (no capture in between)"
+                )
+
+            # One continuous motion span across all queued moves: the
+            # prefetch keeps draining throughout, and we only capture+verify
+            # once, after the last move -- the capture between chained moves
+            # is exactly what's being skipped.
+            executed: list[tuple[float, float, str, float, float]] = []
+            failed_exc: Mt4ClientError | None = None
             prefetch.begin_motion()
-            try:
-                pick(client, calib, pick_x, pick_y)
-                place(client, calib, place_x, place_y)
-            except Mt4ClientError as exc:
-                prefetch.end_motion()
-                if _home_was_requested(watcher, exc):
-                    scene, action = _run_home(client, prefetch, calib)
+            for mpick_x, mpick_y, mcolor, mplace_x, mplace_y in moves:
+                print(
+                    f"pick-and-place: {mcolor} ({mpick_x:.0f},{mpick_y:.0f}) "
+                    f"-> ({mplace_x:.0f},{mplace_y:.0f})"
+                )
+                try:
+                    pick(client, calib, mpick_x, mpick_y)
+                    place(client, calib, mplace_x, mplace_y)
+                except Mt4ClientError as exc:
+                    failed_exc = exc
+                    break
+                executed.append((mpick_x, mpick_y, mcolor, mplace_x, mplace_y))
+            prefetch.end_motion()
+
+            if executed:
+                last_place = (executed[-1][3], executed[-1][4])
+
+            if failed_exc is not None:
+                if _home_was_requested(watcher, failed_exc):
+                    scene, action = _run_home(client, prefetch, calib, last_place)
                     continue
-                print(f"move failed: {exc} -- retrying next cycle")
+                print(f"move failed: {failed_exc} -- retrying next cycle")
                 refreshed = _sleep_or_home(
-                    retry_s, watcher, client, prefetch, calib
+                    retry_s, watcher, client, prefetch, calib, last_place
                 )
                 if refreshed is not None:
                     scene, action = refreshed
                 else:
                     prefetch.take()
-                    scene, action = _plan_from_capture(prefetch)
+                    scene, action = _plan_from_capture(prefetch, last_place)
                 continue
 
-            prefetch.end_motion()
+            last_pick_x, last_pick_y, last_color, last_place_x, last_place_y = executed[-1]
             scene, action = _plan_after_move(
                 prefetch,
-                pick_x=pick_x,
-                pick_y=pick_y,
-                pick_color=color,
-                place_x=place_x,
-                place_y=place_y,
+                pick_x=last_pick_x,
+                pick_y=last_pick_y,
+                pick_color=last_color,
+                place_x=last_place_x,
+                place_y=last_place_y,
             )
     finally:
         watcher.close()

@@ -202,6 +202,72 @@ def test_verify_pick_place_outcomes():
     )
 
 
+def test_avoid_last_cube_when_alternative_exists():
+    s = scene(
+        [cube("red", 240.0, 100.0), cube("blue", 240.0, -150.0)],
+        visible={0, 1, 2, 3},
+    )
+    action = plan_shuffle(s, avoid_xy=(240.0, 100.0))
+    assert action.kind == "pick"
+    assert action.cube is not None
+    assert action.cube.color == "blue"
+
+
+def test_avoid_last_cube_falls_back_when_sole_option():
+    s = scene([cube("red", 240.0, 100.0)], visible={0, 1, 2, 3})
+    action = plan_shuffle(s, avoid_xy=(240.0, 100.0))
+    assert action.kind == "pick"
+    assert action.cube is not None
+    assert action.cube.color == "red"
+
+
+def test_lookahead_second_move_visible_in_same_capture():
+    """Two blockers, two free markers: a second independent move should be
+    plannable from the same scene by excluding the first action's cube and
+    destination marker -- this is the basis for shuffle.py's capture skip."""
+    from mt4_vision.shuffle import _lookahead_action
+
+    s = scene(
+        [cube("red", 240.0, 100.0), cube("blue", 240.0, -150.0)],
+        visible={0, 1, 2, 3},
+    )
+    first = plan_shuffle(s)
+    assert first.kind == "pick"
+    second = _lookahead_action(s, first, avoid_xy=None)
+    assert second is not None
+    assert second.kind == "pick"
+    assert second.cube is not first.cube
+    assert second.place_marker_id != first.place_marker_id
+
+
+def test_blocker_choice_is_randomized_not_always_first():
+    """Regression guard: picking candidates must not collapse back to
+    always-the-first-in-list (the original repeating-pattern complaint)."""
+    s = scene(
+        [
+            cube("red", 240.0, 100.0),
+            cube("blue", 240.0, -150.0),
+            cube("yellow", 150.0, 250.0),
+        ],
+        visible={0, 1, 2, 3},
+    )
+    seen = set()
+    for _ in range(200):
+        action = plan_shuffle(s)
+        if action.kind == "pick" and action.cube is not None:
+            seen.add(action.cube.color)
+    assert len(seen) > 1, f"expected varied picks across trials, got {seen}"
+
+
+def test_lookahead_none_when_only_one_move_available():
+    from mt4_vision.shuffle import _lookahead_action
+
+    s = scene([cube("red", 240.0, 100.0)], visible={0, 1, 2, 3})
+    first = plan_shuffle(s)
+    assert first.kind == "pick"
+    assert _lookahead_action(s, first, avoid_xy=None) is None
+
+
 def run() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
