@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from mt4_jog.client import Mt4Client, Mt4ClientError
 from mt4_vision.calib import Calibration
+from mt4_vision.workspace import KEEPOUT_RADIUS_MM, is_mp_reachable_xy
 
 
 def _check(result: dict[str, object], step: str) -> dict[str, object]:
@@ -38,12 +41,26 @@ def _approach(
 def ensure_homed(client: Mt4Client) -> None:
     status = client.get_status()
     if not status.homed:
-        _check(client.home(), "home")
+        home_arm(client)
+
+
+def home_arm(client: Mt4Client) -> None:
+    """Run firmware homing regardless of the session homed flag."""
+    _check(client.home(), "home")
+
+
+def _require_mp_reachable(x: float, y: float, step: str) -> None:
+    if not is_mp_reachable_xy(x, y):
+        raise Mt4ClientError(
+            f"{step}: ({x:.1f}, {y:.1f}) is inside the {KEEPOUT_RADIUS_MM:.0f}mm "
+            f"J1 keep-out zone (mp cannot move there)"
+        )
 
 
 def pick(client: Mt4Client, calib: Calibration, x: float, y: float) -> dict[str, object]:
     """Grip a cube at robot-frame (x, y): open, descend, close, lift."""
     ensure_homed(client)
+    _require_mp_reachable(x, y, "pick target")
     client.gripper(calib.grip_open_s)
     _travel(client, calib, x, y, calib.safe_z, "move to safe height")
     _approach(client, calib, x, y, calib.pick_z, "descend to pick height")
@@ -57,17 +74,27 @@ def pick(client: Mt4Client, calib: Calibration, x: float, y: float) -> dict[str,
     return {"ok": True, "picked_at": [x, y]}
 
 
-def place(client: Mt4Client, calib: Calibration, x: float, y: float) -> dict[str, object]:
+def place(
+    client: Mt4Client,
+    calib: Calibration,
+    x: float,
+    y: float,
+    *,
+    on_released: Callable[[], None] | None = None,
+) -> dict[str, object]:
     """Release the held cube at robot-frame (x, y).
 
     Releases slightly above pick height so the cube drops the last couple of
     mm instead of being pressed into the table.
     """
     ensure_homed(client)
+    _require_mp_reachable(x, y, "place target")
     release_z = calib.pick_z + 3.0
     _travel(client, calib, x, y, calib.safe_z, "move to safe height")
     _approach(client, calib, x, y, release_z, "descend to release height")
     client.gripper(calib.grip_open_s)
+    if on_released is not None:
+        on_released()
     _travel(client, calib, x, y, calib.safe_z, "lift after release")
     return {"ok": True, "placed_at": [x, y]}
 

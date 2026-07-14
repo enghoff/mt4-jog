@@ -30,8 +30,9 @@ def main() -> int:
     parser.add_argument(
         "--pause",
         type=float,
-        default=2.0,
-        help="seconds between shuffle cycles (default 2)",
+        default=0.5,
+        help="seconds to let the scene settle before capture after release "
+        "(overlaps with the post-place lift; default 0.5)",
     )
     parser.add_argument(
         "--retry",
@@ -45,7 +46,7 @@ def main() -> int:
     client = Mt4Client() if args.port is None else Mt4Client(port=args.port)
     try:
         time.sleep(1.0)
-        print("shuffle loop started (Ctrl+C to stop)")
+        print("shuffle loop started (Ctrl+C to stop, H to re-home)")
         run_shuffle_loop(
             client,
             calib,

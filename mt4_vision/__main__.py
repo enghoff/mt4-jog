@@ -158,7 +158,7 @@ def cmd_shuffle(args: argparse.Namespace) -> int:
     client = _pick_place_client(args)
     try:
         time.sleep(1.0)
-        print("shuffle loop started (Ctrl+C to stop)")
+        print("shuffle loop started (Ctrl+C to stop, H to re-home)")
         run_shuffle_loop(
             client,
             calib,
@@ -245,7 +245,12 @@ def main() -> None:
         help="home then shuffle cubes between markers and open table (Ctrl+C to stop)",
     )
     p.add_argument("--port", default="")
-    p.add_argument("--pause", type=float, default=2.0)
+    p.add_argument(
+        "--pause",
+        type=float,
+        default=0.5,
+        help="settle time before post-release capture (overlaps with lift)",
+    )
     p.add_argument("--retry", type=float, default=5.0)
     p.set_defaults(func=cmd_shuffle)
 

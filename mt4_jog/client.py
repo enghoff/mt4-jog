@@ -63,6 +63,7 @@ class Mt4Client:
         # Reentrant so methods like move_to() can call _get_status_unlocked()
         # (to default J4 / check homed) while already holding the lock.
         self._lock = threading.RLock()
+        self._interrupt = threading.Event()
 
     @property
     def connected(self) -> bool:
@@ -155,6 +156,31 @@ class Mt4Client:
             self._ensure_connected_unlocked()
             return self._send_and_collect("stop", wait=COMMAND_WAIT_S)
 
+    def request_interrupt(self) -> None:
+        """Ask an in-flight move/gripper settle to abort (e.g. shuffle home key)."""
+        self._interrupt.set()
+
+    def clear_interrupt(self) -> None:
+        self._interrupt.clear()
+
+    def _sleep_interruptible(self, seconds: float) -> bool:
+        """Sleep in short slices; return True if interrupted."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self._interrupt.is_set():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.05, remaining))
+        return False
+
+    def _abort_if_interrupted_unlocked(self, collected: list[str]) -> dict[str, object] | None:
+        if not self._interrupt.is_set():
+            return None
+        self._send_and_collect("stop", wait=COMMAND_WAIT_S)
+        return {"ok": False, "error": "interrupted", "lines": collected}
+
     def _await_completion(
         self,
         *,
@@ -197,6 +223,9 @@ class Mt4Client:
         ser = self._require_serial()
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            aborted = self._abort_if_interrupted_unlocked(collected)
+            if aborted is not None:
+                return aborted
             lines = read_lines(ser, POLL_WAIT_S, hard_limit=POLL_WAIT_S + READ_HARD_LIMIT_S)
             collected.extend(lines)
             result = scan(lines)
@@ -212,6 +241,7 @@ class Mt4Client:
     ) -> dict[str, object]:
         """Run on-device homing (`home <j1> <j2>`) and wait for completion."""
         with self._lock:
+            self.clear_interrupt()
             self._ensure_connected_unlocked()
             ser = self._require_serial()
             self._drain_serial_unlocked()
@@ -341,5 +371,8 @@ class Mt4Client:
             if line.startswith("err"):
                 return {"ok": False, "error": line, "lines": lines}
         if settle:
-            time.sleep(GRIPPER_SETTLE_S)
+            with self._lock:
+                if self._sleep_interruptible(GRIPPER_SETTLE_S):
+                    self._send_and_collect("stop", wait=COMMAND_WAIT_S)
+                    return {"ok": False, "error": "interrupted", "lines": lines}
         return {"ok": True, "lines": lines}
