@@ -73,9 +73,6 @@ class Mt4Client:
         with self._lock:
             self._ensure_connected_unlocked()
 
-    def connect(self) -> None:
-        self.ensure_connected()
-
     def _ensure_connected_unlocked(self) -> None:
         if self.connected:
             return
