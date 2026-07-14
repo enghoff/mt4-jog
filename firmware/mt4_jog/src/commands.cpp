@@ -156,10 +156,16 @@ void handle_line(char *line) {
     return;
   }
 
+  /* Any command outside this exemption list safely stops an active jog
+   * first (e.g. "?", "e0") -- but gripper commands ("g o"/"g c"/"g stop"/
+   * "g <S>") don't touch TCP motion and used to be caught by this net too,
+   * silently killing cartesian jog every time the gripper was actuated
+   * while jogging. Exempt them so the gripper sweeps concurrently with an
+   * active `cj` jog instead of interrupting it. */
   if (strcmp(line, "!") && strcmp(line, "stop") && strcmp(line, "j") &&
       strcmp(line, "jog") && strcmp(line, "home") && strcmp(line, "$H") &&
       strncmp(line, "home ", 5) && strncmp(line, "cj ", 3) &&
-      strncmp(line, "speed ", 6)) {
+      strncmp(line, "speed ", 6) && line[0] != 'g' && line[0] != 'G') {
     stop_jog();
   }
 
