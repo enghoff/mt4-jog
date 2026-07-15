@@ -36,6 +36,22 @@ GRIPPER_SETTLE_S = 0.8
 # Homing seeks limit switches with no position feedback beforehand, so it
 # needs the same generous ceiling as jog_keyboard.py's HOME_WAIT_S.
 HOME_TIMEOUT_S = 180.0
+# Opening the CH340 port can reset the MCU into its serial bootloader (DTR
+# pulse on the first open after USB enumeration -- i.e. exactly the runs
+# where the arm just power-cycled and needs homing). The bootloader swallows
+# every line we send AND restarts its ~9.4s exit timer on each received
+# byte, so retrying commands is precisely wrong: the retry traffic keeps the
+# application firmware from ever starting (measured live: app boots 1.25s
+# after a reset with a silent host, never boots while `?` polls arrive every
+# 2s). The only cure is to shut up and wait for the app's boot banner:
+# ~9.4s window + ~1.3s app boot, plus margin.
+BOOTLOADER_QUIET_S = 13.0
+# If firmware hasn't acked a `home` command (home start/fail/err) within
+# this long, assume the line was swallowed (e.g. an MCU reset between
+# connect and the write) and re-send once. Harmless if homing actually is
+# in flight: do_home()'s serial_abort() reads and discards any line that
+# isn't "!"/"stop".
+HOME_ACK_RESEND_S = 5.0
 # Matches goto_position.py's MOVE_TIMEOUT_S for coordinated m/mp moves.
 MOVE_TIMEOUT_S = 30.0
 # Cap line collection so a chatty firmware stream cannot block forever.
@@ -84,6 +100,40 @@ class Mt4Client:
             ) from exc
         time.sleep(BOOT_WAIT_S)
         read_lines(self._ser, 0.5, hard_limit=0.6)  # discard boot banner
+        self._await_firmware_alive_unlocked()
+
+    def _await_firmware_alive_unlocked(self) -> None:
+        """Handshake until the application firmware answers `?`.
+
+        If the open (or the port auto-probe just before it) reset the MCU,
+        it may be sitting in the serial bootloader, which eats our commands
+        and stays resident as long as traffic keeps arriving (see
+        BOOTLOADER_QUIET_S). So: one `?`; on silence, read passively --
+        sending nothing -- until the boot banner shows up or the quiet
+        window elapses, then confirm with `?` once more.
+        """
+        ser = self._require_serial()
+        for attempt in range(2):
+            lines = self._send_and_collect("?", wait=STATUS_WAIT_S)
+            status = parse_status_lines(lines)
+            if status.tcp is not None or status.joints:
+                return
+            if attempt > 0:
+                break
+            deadline = time.monotonic() + BOOTLOADER_QUIET_S
+            while time.monotonic() < deadline:
+                quiet_lines = read_lines(
+                    ser, POLL_WAIT_S, hard_limit=POLL_WAIT_S + READ_HARD_LIMIT_S
+                )
+                if any("MT4 jog firmware ready" in line for line in quiet_lines):
+                    self._drain_serial_unlocked()
+                    break
+        self._ser.close()
+        self._ser = None
+        raise Mt4ClientError(
+            f"{self.port or 'auto-detected port'} opened but the MT4 firmware "
+            "never responded to `?` (device stuck in bootloader or not an MT4?)"
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -242,12 +292,26 @@ class Mt4Client:
             self._ensure_connected_unlocked()
             ser = self._require_serial()
             self._drain_serial_unlocked()
-            ser.write(f"home {j1_center} {j2_pull}\n".encode("ascii"))
+            cmd = f"home {j1_center} {j2_pull}\n".encode("ascii")
+            ser.write(cmd)
             ser.flush()
             collected: list[str] = []
             saw_home_start = False
+            resent = False
+            ack_deadline = time.monotonic() + HOME_ACK_RESEND_S
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
+                if (
+                    not saw_home_start
+                    and not resent
+                    and time.monotonic() > ack_deadline
+                ):
+                    # No ack yet -- the command was likely swallowed (MCU
+                    # reset since connect). Re-send once; if homing actually
+                    # is running, the firmware discards this line unread.
+                    ser.write(cmd)
+                    ser.flush()
+                    resent = True
                 lines = read_lines(ser, POLL_WAIT_S, hard_limit=POLL_WAIT_S + READ_HARD_LIMIT_S)
                 collected.extend(lines)
                 for line in lines:

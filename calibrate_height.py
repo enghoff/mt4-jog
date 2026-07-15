@@ -44,7 +44,7 @@ from mt4_vision.calib import (
 )
 from mt4_vision.camera import capture_frame
 from mt4_vision.detect import CubeDetection, detect_cubes
-from mt4_vision.pickplace import pick, place
+from mt4_vision.pickplace import home_arm, pick, place
 from mt4_vision.workspace import MAX_REACH_MM, PLACEMENT_SLOTS
 
 # Grid of robot-frame (x, y) targets spread across the reachable workspace,
@@ -132,7 +132,7 @@ def main() -> int:
         status = client.get_status()
         if not status.homed:
             print("homing first...")
-            client.home()
+            home_arm(client)  # raises on failure instead of sailing on unhomed
             status = client.get_status()
         # No-op move at the current pose, purely to reset cruise speed (see
         # RESET_SPEED_US) before the real moves below.
@@ -232,7 +232,7 @@ def main() -> int:
 
             try:
                 pick(client, calib, *probe_xy)
-                client.home()
+                home_arm(client)
             except Mt4ClientError as exc:
                 print(f"  pick failed ({exc}), skipping this point")
                 known_xy = None
@@ -267,7 +267,7 @@ def main() -> int:
                 # base avoidance is the firmware's job now: mp routes around
                 # the keep-out cylinder on its own
                 place(client, calib, gx, gy)
-                client.home()
+                home_arm(client)
             except Mt4ClientError as exc:
                 print(f"  place failed ({exc}), skipping this point")
                 known_xy = None
