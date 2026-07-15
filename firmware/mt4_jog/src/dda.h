@@ -30,6 +30,26 @@ void dda_set_speed_us(long us);
 /* Same clamp/apply as dda_set_speed_us() but without the serial ack line. */
 void dda_set_speed_us_quiet(long us);
 uint16_t dda_get_speed_us();
+/* Configure an acceleration ramp for an upcoming multi-segment coordinated
+ * move (the `mp` command): starts at start_us, ramps toward cruise_us over
+ * up to ramp_ticks master ticks, holds cruise, then ramps symmetrically back
+ * toward start_us over the last ramp_ticks of total_ticks (the summed
+ * per-segment master ticks along the planned `mp` path).
+ *
+ * Persists across dda_arm()/dda_engage() calls (segment boundaries) --
+ * `mp` calls dda_stop() between every segment, but neither dda_stop() nor
+ * dda_arm() touch ramp state, so the ramp continues seamlessly across
+ * segments. Only a fresh call to this function or dda_ramp_clear() changes
+ * it. Falls back to plain constant-speed stepping (no ramp) if cruise_us is
+ * already as slow or slower than start_us, or total_ticks is too short for
+ * a meaningful ramp. */
+void dda_set_ramp(uint16_t start_us, uint16_t cruise_us, int32_t total_ticks,
+                   uint16_t ramp_ticks);
+/* Disable ramping -- OCR1A stays fixed at whatever dda_set_speed_us() last
+ * set. Call before starting any non-`mp` coordinated move (`m`, cj jog,
+ * legacy jog) so a still-active `mp` ramp can't bleed into unrelated
+ * motion. */
+void dda_ramp_clear();
 void dda_stop();
 void dda_engage();
 /* Arms a coordinated move: master ticks + per-joint signed step deltas

@@ -20,7 +20,6 @@ from mt4_jog.joints import (
     GRIPPER_S_OPEN,
     J1_HOME_CENTER_STEPS,
     J2_HOME_PULLOFF_STEPS,
-    KEYBOARD_JOINTS,
     LIMIT_JOINTS,
 )
 from mt4_jog.ports import Mt4PortError, port_display, resolve_port
@@ -29,11 +28,10 @@ from mt4_jog.serial import drain_lines, open_serial, read_lines, send, send_quic
 POLL_MS = 10
 HOME_WAIT_S = 180.0
 CJ_RESEND_S = 0.05
-# Gripper/J4 commands used to be sent once per key-transition only; a single
+# Gripper commands used to be sent once per key-transition only; a single
 # dropped serial line then left them stuck until the next transition. Resend
 # on a timer while held, same fix already applied to Cartesian jog above.
 GRIP_RESEND_S = 0.05
-J4_RESEND_S = 0.05
 SPEED_STEP_US = 100
 SPEED_MIN_US = 700
 SPEED_MAX_US = 4000
@@ -41,8 +39,6 @@ DEFAULT_SPEED_US = 1524
 # `speed <us>` is a plain idempotent set command (no start/stop state), so
 # holding -/= just re-sends it on a repeat timer -- no protocol change needed.
 SPEED_REPEAT_S = 0.08
-
-J4_JOINT = KEYBOARD_JOINTS[3]
 
 # World-frame TCP jog (mm/s direction; firmware normalizes).
 CART_BINDINGS: dict[str, tuple[int, int, int]] = {
@@ -82,7 +78,7 @@ def print_help(*, gamepad: bool) -> None:
     print("  I / K     world +Z / -Z")
     print("  S / W     world +Y / -Y")
     print("  A / D     world +X / -X")
-    print("  J / L     J4 wrist roll (when no Cartesian key held)")
+    print("  J / L     J4 wrist roll (also while moving XYZ)")
     print("  -  / =    nudge jog speed slower / faster (live)")
     print("  H       home J1 + J2 (on-device)")
     print(
@@ -98,7 +94,7 @@ def print_help(*, gamepad: bool) -> None:
         print("Xbox controller (player 1):")
         print("  Left stick        world X / Y")
         print("  Right stick Y     world Z")
-        print("  Right stick X     J4 wrist roll (when not moving XYZ)")
+        print("  Right stick X     J4 wrist roll (also while moving XYZ)")
         print("  LT / RT           gripper open / close")
         print("  LB / RB or D-pad  jog speed slower / faster")
         print("  A                 home")
@@ -145,6 +141,97 @@ def key_down(key: str) -> bool:
     return vk is not None and bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
 
 
+def _process_parents() -> dict[int, int]:
+    """pid -> parent pid for every running process (Toolhelp32 snapshot)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    kernel32 = ctypes.windll.kernel32
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snapshot == -1:
+        return {}
+    parents: dict[int, int] = {}
+    try:
+        entry = PROCESSENTRY32()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        if kernel32.Process32First(snapshot, ctypes.byref(entry)):
+            while True:
+                parents[entry.th32ProcessID] = entry.th32ParentProcessID
+                if not kernel32.Process32Next(snapshot, ctypes.byref(entry)):
+                    break
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return parents
+
+
+def console_focused() -> bool:
+    """True when the foreground window belongs to this process's own
+    terminal/shell -- i.e. an ancestor of this process currently has OS
+    input focus.
+
+    GetAsyncKeyState (key_down above) is global -- it fires from any window,
+    not just this one. Callers that want a key to act only while this
+    terminal is the foreground window (e.g. a background loop's re-home
+    hotkey) should gate on this too.
+
+    A direct GetConsoleWindow() == GetForegroundWindow() comparison doesn't
+    work here: under Windows Terminal / VS Code / Cursor, the visible,
+    focusable window belongs to the terminal-emulator process, not the
+    hidden conhost window GetConsoleWindow() returns a handle for -- that
+    comparison is always False under those hosts, silently disabling
+    whatever depends on it. Instead, walk up the process tree from the
+    foreground window's owning PID and this process's own PID; if they
+    share an ancestor, the terminal hosting us is the one in focus. This
+    can't distinguish separate tabs/panes within the same terminal window
+    (not exposed by these APIs), but correctly ignores focus in unrelated
+    apps (browser, editor, etc).
+    """
+    if sys.platform != "win32":
+        return True
+    import ctypes
+    import os
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    fg_hwnd = user32.GetForegroundWindow()
+    if not fg_hwnd:
+        return True
+
+    fg_pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(fg_hwnd, ctypes.byref(fg_pid))
+    target = fg_pid.value
+    if not target:
+        return True
+
+    return _pid_shares_ancestry(_process_parents(), os.getpid(), target)
+
+
+def _pid_shares_ancestry(parents: dict[int, int], pid: int, target: int) -> bool:
+    """True when ``target`` is ``pid`` itself or one of its ancestors."""
+    seen: set[int] = set()
+    while pid and pid not in seen:
+        if pid == target:
+            return True
+        seen.add(pid)
+        pid = parents.get(pid, 0)
+    return False
+
+
 def gamepad_button_held(gamepad: XboxGamepad | None, mask: int) -> bool:
     """Poll fresh controller state before testing a held button."""
     if gamepad is None or not mask:
@@ -176,11 +263,11 @@ def stop_jog(ser) -> None:
     time.sleep(0.02)
 
 
-def clear_active_motion(ser) -> tuple[None, None, None]:
+def clear_active_motion(ser) -> tuple[None, None]:
     """Stop jog/gripper and return cleared motion state."""
     stop_jog(ser)
     gripper_sweep_stop(ser)
-    return None, None, None
+    return None, None
 
 
 def apply_xy_invert(
@@ -212,37 +299,38 @@ def pressed_cart_vector(
     return apply_xy_invert((vec[0], vec[1], vec[2]), invert_xy)
 
 
-def sync_cart_jog(ser, vector: tuple[int, int, int] | None) -> None:
-    if vector is None:
+def sync_cart_jog(
+    ser, vector: tuple[int, int, int] | None, j4_roll: int = 0
+) -> None:
+    """Send the unified jog command: Cartesian direction and/or J4 roll.
+    The firmware layers the roll onto the resolved-rate solution (`cj dx dy
+    dz [j4]`), so the wrist can rotate while the TCP moves; a zero vector
+    with nonzero roll is a pure wrist roll through the same path (the old
+    separate single-axis J4 jog is gone)."""
+    if vector is None and j4_roll == 0:
         stop_jog(ser)
         return
-    send_quick(ser, f"cj {vector[0]} {vector[1]} {vector[2]}")
+    x, y, z = vector if vector is not None else (0, 0, 0)
+    send_quick(ser, f"cj {x} {y} {z} {j4_roll}")
 
 
-def sync_j4_jog(ser, dir_high: bool | None) -> None:
-    if dir_high is None:
-        return
-    level = "h" if dir_high else "l"
-    for cmd in ("stop", "e1", "xc", f"d{J4_JOINT.direction} {level}", f"x+{J4_JOINT.drive}", "j"):
-        send_quick(ser, cmd)
-        time.sleep(0.01)
-
-
-def resend_j4_jog(ser) -> None:
-    """Cheap keep-alive while J/L stays held: re-arms the jog ISR without the
-    stop/dir/axis-select preamble, so a dropped `j` can't strand it mid-jog."""
-    send_quick(ser, "j")
-
-
-def j4_key_state(gamepad_j4: bool | None = None) -> bool | None:
-    """Return dir_high for J4 roll, or None when J/L not held (or both held)."""
+def j4_roll_state(gamepad_j4: bool | None = None) -> int:
+    """J4 roll direction from J/L keys or right stick X: +1 / -1 in joint
+    step sign (J = positive), 0 when idle or both held."""
     j = key_down("j")
     l = key_down("l")
+    dir_high: bool | None = None
     if j and not l:
-        return False
-    if l and not j:
-        return True
-    return gamepad_j4
+        dir_high = False
+    elif l and not j:
+        dir_high = True
+    elif gamepad_j4 is not None:
+        dir_high = gamepad_j4
+    if dir_high is None:
+        return 0
+    # DIR-high on J4 is the negative joint direction (J_DIR_POS_HIGH is
+    # false), matching the retired single-axis jog's physical direction.
+    return -1 if dir_high else 1
 
 
 def run_home(ser, buf: list[str], j1: int, j2: int, verbose: bool) -> None:
@@ -343,11 +431,11 @@ def main() -> int:
 
     poll_s = args.poll_ms / 1000.0
     buf: list[str] = [""]
-    active_j4: bool | None = None
-    active_cart: tuple[int, int, int] | None = None
+    # Active jog command: (cart vector or None, j4 roll) once anything is
+    # held, else None.
+    active_cart: tuple[tuple[int, int, int] | None, int] | None = None
     grip_state: str | None = None
     last_cj_send = 0.0
-    last_j4_send = 0.0
     last_grip_send = 0.0
     speed_us = DEFAULT_SPEED_US
     last_speed_adjust = 0.0
@@ -411,7 +499,7 @@ def main() -> int:
                     continue
 
                 if key_down("space") or (pad is not None and pad.status):
-                    active_j4, active_cart, grip_state = clear_active_motion(ser)
+                    active_cart, grip_state = clear_active_motion(ser)
                     for line in send(ser, "?", wait=1.0):
                         print(line)
                     wait_until_released(
@@ -421,7 +509,7 @@ def main() -> int:
                     continue
 
                 if key_down("0") or (pad is not None and pad.stop_all):
-                    active_j4, active_cart, grip_state = clear_active_motion(ser)
+                    active_cart, grip_state = clear_active_motion(ser)
                     send(ser, "e0", wait=0.2)
                     send(ser, "all f", wait=0.3)
                     wait_until_released(
@@ -431,7 +519,7 @@ def main() -> int:
                     continue
 
                 if key_down("h") or (pad is not None and pad.home):
-                    active_j4, active_cart, grip_state = clear_active_motion(ser)
+                    active_cart, grip_state = clear_active_motion(ser)
                     run_home(ser, buf, args.j1_center, args.j2_pull, args.verbose)
                     wait_until_released(
                         ser, buf, args.verbose, poll_s, gamepad=gamepad,
@@ -452,32 +540,19 @@ def main() -> int:
                     send_quick(ser, f"speed {speed_us}")
                     last_speed_adjust = now
 
-                # Cartesian keys take priority over J4 roll when held.
+                # Unified jog: Cartesian direction and J4 roll are one `cj`
+                # command, so the wrist rotates while the TCP moves.
                 desired_cart = pressed_cart_vector(pad_cart, invert_xy=invert_xy)
-                if desired_cart is not None:
-                    if active_j4 is not None:
-                        stop_jog(ser)
-                        active_j4 = None
-                    if desired_cart != active_cart or now - last_cj_send >= CJ_RESEND_S:
-                        sync_cart_jog(ser, desired_cart)
-                        active_cart = desired_cart
+                desired_roll = j4_roll_state(pad_j4)
+                if desired_cart is not None or desired_roll != 0:
+                    desired = (desired_cart, desired_roll)
+                    if desired != active_cart or now - last_cj_send >= CJ_RESEND_S:
+                        sync_cart_jog(ser, desired_cart, desired_roll)
+                        active_cart = desired
                         last_cj_send = now
-                else:
-                    if active_cart is not None:
-                        stop_jog(ser)
-                        active_cart = None
-                    j4 = j4_key_state(pad_j4)
-                    if j4 is None:
-                        if active_j4 is not None:
-                            stop_jog(ser)
-                            active_j4 = None
-                    elif j4 != active_j4:
-                        sync_j4_jog(ser, j4)
-                        active_j4 = j4
-                        last_j4_send = now
-                    elif now - last_j4_send >= J4_RESEND_S:
-                        resend_j4_jog(ser)
-                        last_j4_send = now
+                elif active_cart is not None:
+                    stop_jog(ser)
+                    active_cart = None
 
                 desired_grip = gripper_key_state(pad_grip)
                 if desired_grip is None:

@@ -20,6 +20,19 @@ static StepPinIO dda_pin_io[MT4_NUM_JOINTS];
 static volatile bool step_pulse_high = false;
 static volatile int32_t move_remaining[MT4_NUM_JOINTS];
 
+// Acceleration ramp for `mp` moves -- see dda_set_ramp() in dda.h. Lives
+// independently of the per-segment dda_arm()/dda_stop() state above so it
+// survives the segment-boundary dda_stop() calls motion.cpp's mp_continue_path()
+// makes between segments of the same `mp` command.
+enum RampPhase : uint8_t { RAMP_NONE, RAMP_ACCEL, RAMP_CRUISE, RAMP_DECEL };
+static volatile RampPhase ramp_phase = RAMP_NONE;
+static volatile uint16_t ramp_current_ticks;  // live OCR1A target, timer ticks
+static volatile uint16_t ramp_start_ticks;
+static volatile uint16_t ramp_cruise_ticks;
+static volatile uint16_t ramp_step_ticks;     // per-master-tick change during accel/decel
+static volatile int32_t ramp_decel_at;        // begin decel once ramp_remaining <= this
+static volatile int32_t ramp_remaining;       // master ticks left in the whole planned move
+
 static void set_joint_dir(uint8_t joint, bool positive) {
   const bool high = positive ? J_DIR_POS_HIGH[joint] : !J_DIR_POS_HIGH[joint];
   set_dir(J_DIR_PIN[joint], high);
@@ -173,6 +186,45 @@ void dda_set_speed_us_quiet(long us) { set_speed_us_impl(us, false); }
 
 uint16_t dda_get_speed_us() { return jog_step_period_us; }
 
+void dda_ramp_clear() { ramp_phase = RAMP_NONE; }
+
+void dda_set_ramp(uint16_t start_us, uint16_t cruise_us, int32_t total_ticks,
+                   uint16_t ramp_ticks) {
+  const uint16_t start_ticks =
+      static_cast<uint16_t>(start_us * TIMER_TICKS_PER_US);
+  const uint16_t cruise_ticks =
+      static_cast<uint16_t>(cruise_us * TIMER_TICKS_PER_US);
+  // Nothing to ramp: already at/below the safe-start speed, the move is too
+  // short to estimate a ramp for, or too short to fit one at all.
+  if (cruise_ticks >= start_ticks || total_ticks < 4 || ramp_ticks == 0) {
+    ramp_phase = RAMP_NONE;
+    return;
+  }
+  uint16_t len = ramp_ticks;
+  if (static_cast<int32_t>(len) * 2 > total_ticks) {
+    len = static_cast<uint16_t>(total_ticks / 2);
+  }
+  if (len == 0) {
+    ramp_phase = RAMP_NONE;
+    return;
+  }
+  uint16_t step = static_cast<uint16_t>((start_ticks - cruise_ticks) / len);
+  if (step == 0) {
+    step = 1;
+  }
+
+  cli();
+  ramp_start_ticks = start_ticks;
+  ramp_cruise_ticks = cruise_ticks;
+  ramp_step_ticks = step;
+  ramp_decel_at = len;
+  ramp_remaining = total_ticks;
+  ramp_current_ticks = start_ticks;
+  OCR1A = static_cast<uint16_t>(ramp_current_ticks - 1);
+  ramp_phase = RAMP_ACCEL;
+  sei();
+}
+
 void dda_init() {
   TCCR1A = 0;
   TCCR1B = 0;
@@ -215,6 +267,34 @@ void dda_engage() {
 ISR(TIMER1_COMPA_vect) {
   if (!jog_active || homing_active || dda_axis_mask == 0 || step_pulse_high) {
     return;
+  }
+
+  // Advance the `mp` acceleration ramp, if one is active, before this
+  // tick's stepping -- integer add/sub/compare only (no float, no divide;
+  // that was all precomputed once in dda_set_ramp(), outside the ISR).
+  if (ramp_phase != RAMP_NONE) {
+    if (ramp_phase == RAMP_ACCEL) {
+      if (ramp_current_ticks > ramp_cruise_ticks + ramp_step_ticks) {
+        ramp_current_ticks -= ramp_step_ticks;
+      } else {
+        ramp_current_ticks = ramp_cruise_ticks;
+        ramp_phase = RAMP_CRUISE;
+      }
+    }
+    if (ramp_phase != RAMP_DECEL && ramp_remaining <= ramp_decel_at) {
+      ramp_phase = RAMP_DECEL;
+    }
+    if (ramp_phase == RAMP_DECEL) {
+      if (ramp_current_ticks + ramp_step_ticks < ramp_start_ticks) {
+        ramp_current_ticks += ramp_step_ticks;
+      } else {
+        ramp_current_ticks = ramp_start_ticks;
+      }
+    }
+    OCR1A = static_cast<uint16_t>(ramp_current_ticks - 1);
+    if (ramp_remaining > 0) {
+      --ramp_remaining;
+    }
   }
 
   uint8_t step_mask = 0;

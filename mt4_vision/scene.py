@@ -1,0 +1,247 @@
+"""Detection-as-state desk snapshot for the shuffle planner.
+
+Each clear camera frame builds a fresh ``Scene`` from cube detections and
+ArUco visibility. No persistent tracks -- vacated poses cannot linger.
+
+Occupancy and place-clearance use every robot-mapped detection. Pick
+candidates are a stricter subset (area / hull / reach filters) so arm
+paint is not grasped -- but a filtered blob still blocks placing on a
+nearby marker.
+
+No camera-park exclusion here: that guarded against the arm's own
+silhouette being misread near its old capture-retreat pose, but the live
+loop (shuffle.py) never retreats there between captures -- it was quietly
+vetoing real desk locations (e.g. marker 4, ~42mm from that pose) that
+have nothing to do with the arm's position during capture.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import cv2
+import numpy as np
+
+from mt4_vision.calib import Calibration
+from mt4_vision.detect import CubeDetection, detect_cubes, detect_markers
+from mt4_vision.workspace import (
+    MARKER_DICT,
+    MARKER_OCCUPY_RADIUS_MM,
+    MAX_REACH_MM,
+    PICK_CLEARANCE_MM,
+    MarkerSlot,
+    WorkspaceState,
+    cubes_with_robot_coords,
+    dist_mm,
+    is_mp_reachable_xy,
+    marker_slots_from_calibration,
+    rebuild_workspace_state,
+)
+
+# Real cube top faces under this camera land ~280-650px^2. Tighter than
+# detect.py's floor so low-area glare/arm flecks are not pick targets while
+# still counting toward marker occupancy via the raw detection list.
+PICK_MIN_AREA = 280.0
+PICK_MAX_AREA = 650.0
+# Allow cubes a bit outside the marker convex hull (markers aren't at the
+# desk edge). Measured phantoms run 60-90mm outside; real near-pad cubes
+# sit within ~15mm -- but measured live 2026-07-14, several genuine
+# open-table cubes on this desk's layout sat 42-53mm outside the hull and
+# were wrongly dropped as phantoms at the old 40mm margin. 55mm recovers
+# those while staying short of the 60-90mm phantom range.
+HULL_OUTSIDE_MARGIN_MM = 55.0
+
+
+@dataclass(frozen=True)
+class Scene:
+    """One clear-frame world: only what the camera sees right now."""
+
+    cubes: list[CubeDetection]
+    markers: list[MarkerSlot]
+    occupied: list[tuple[MarkerSlot, CubeDetection]]
+    free_markers: list[MarkerSlot]
+    unknown_markers: list[MarkerSlot]
+    free_slots: list[tuple[float, float]]
+    visible_marker_ids: set[int]
+    # Raw detections (occupancy source); cubes is the pick-quality subset.
+    raw_cubes: list[CubeDetection] | None = None
+
+    @classmethod
+    def from_workspace(
+        cls,
+        state: WorkspaceState,
+        *,
+        pick_cubes: list[CubeDetection] | None = None,
+        raw_cubes: list[CubeDetection] | None = None,
+    ) -> Scene:
+        visible = state.visible_marker_ids or set()
+        cubes = list(pick_cubes) if pick_cubes is not None else list(state.cubes)
+        return cls(
+            cubes=cubes,
+            markers=list(state.markers),
+            occupied=list(state.occupied),
+            free_markers=list(state.free_markers),
+            unknown_markers=list(state.unknown_markers),
+            free_slots=list(state.free_slots),
+            visible_marker_ids=set(visible),
+            raw_cubes=list(raw_cubes) if raw_cubes is not None else None,
+        )
+
+    def summary_line(self) -> str:
+        raw_n = len(self.raw_cubes) if self.raw_cubes is not None else len(self.cubes)
+        dropped = max(0, raw_n - len(self.cubes))
+        extra = f" phantoms_dropped={dropped}" if dropped else ""
+        return (
+            f"cubes={len(self.cubes)} blockers={len(self.blockers())} "
+            f"free_markers={len(self.placeable_markers())} "
+            f"occupied={len(self.occupied)} "
+            f"unknown={len(self.unknown_markers)} "
+            f"free_slots={len(self.free_slots)}{extra}"
+        )
+
+    def cube_lines(self) -> list[str]:
+        lines = []
+        for c in sorted(self.cubes, key=lambda x: (-(x.area or 0), x.color)):
+            on = self.marker_for_cube(c)
+            tag = f" marker {on}" if on is not None else " open"
+            lines.append(
+                f"  {c.color} ({c.x:.0f},{c.y:.0f}) area={c.area:.0f}{tag}"
+            )
+        return lines
+
+    def marker_for_cube(self, cube: CubeDetection) -> int | None:
+        best_id: int | None = None
+        best_d = MARKER_OCCUPY_RADIUS_MM
+        for m in self.markers:
+            d = dist_mm(float(cube.x), float(cube.y), m.x, m.y)
+            if d < best_d:
+                best_d = d
+                best_id = m.marker_id
+        return best_id
+
+    def blockers(self) -> list[CubeDetection]:
+        """Pick-quality cubes not sitting on any calibrated marker."""
+        return [c for c in self.cubes if self.marker_for_cube(c) is None]
+
+    def placeable_markers(self) -> list[MarkerSlot]:
+        """Tag visible, place-clearance free, reachable."""
+        return [m for m in self.free_markers if is_mp_reachable_xy(m.x, m.y)]
+
+    def occupied_pick_cubes(self) -> list[CubeDetection]:
+        """Occupied-marker cubes that are also pick-quality (in Scene.cubes)."""
+        pick_ids = {id(c) for c in self.cubes}
+        return [c for _m, c in self.occupied if id(c) in pick_ids]
+
+    def pickable(self, cubes: list[CubeDetection]) -> list[CubeDetection]:
+        """Reachable cubes with finger clearance from every other pick cube."""
+        out: list[CubeDetection] = []
+        for c in cubes:
+            if not is_mp_reachable_xy(float(c.x), float(c.y)):
+                continue
+            if math.hypot(float(c.x), float(c.y)) > MAX_REACH_MM:
+                continue
+            if any(
+                dist_mm(float(c.x), float(c.y), float(o.x), float(o.y))
+                < PICK_CLEARANCE_MM
+                for o in self.cubes
+                if o is not c
+            ):
+                continue
+            out.append(c)
+        cx = sum(m.x for m in self.markers) / max(len(self.markers), 1)
+        cy = sum(m.y for m in self.markers) / max(len(self.markers), 1)
+        out.sort(
+            key=lambda c: (
+                abs(c.area - 400.0),
+                dist_mm(float(c.x), float(c.y), cx, cy),
+            )
+        )
+        return out
+
+
+def _marker_hull_robot(markers: list[MarkerSlot]) -> np.ndarray | None:
+    if len(markers) < 3:
+        return None
+    pts = np.array([[m.x, m.y] for m in markers], dtype=np.float32)
+    return cv2.convexHull(pts)
+
+
+def is_phantom_detection(
+    cube: CubeDetection,
+    markers: list[MarkerSlot],
+    *,
+    hull: np.ndarray | None = None,
+) -> bool:
+    """True when a blob should not be treated as a pick target."""
+    if cube.x is None or cube.y is None:
+        return True
+    if cube.area < PICK_MIN_AREA or cube.area > PICK_MAX_AREA:
+        return True
+    if not is_mp_reachable_xy(float(cube.x), float(cube.y)):
+        return True
+    if math.hypot(float(cube.x), float(cube.y)) > MAX_REACH_MM:
+        return True
+    hull = hull if hull is not None else _marker_hull_robot(markers)
+    if hull is not None:
+        inside = cv2.pointPolygonTest(
+            hull, (float(cube.x), float(cube.y)), True
+        )
+        if inside < -HULL_OUTSIDE_MARGIN_MM:
+            return True
+    return False
+
+
+def filter_phantoms(
+    cubes: list[CubeDetection], markers: list[MarkerSlot]
+) -> list[CubeDetection]:
+    hull = _marker_hull_robot(markers)
+    return [c for c in cubes if not is_phantom_detection(c, markers, hull=hull)]
+
+
+def capture_scene(calib: Calibration, frame: np.ndarray) -> Scene:
+    """Build a scene from one frame.
+
+    Occupancy / free-marker / free-slot clearance uses *every* robot-mapped
+    detection (raw). Phantom filtering only removes pick candidates.
+    """
+    markers = marker_slots_from_calibration(calib)
+    raw = cubes_with_robot_coords(detect_cubes(frame, calib))
+    visible = {m.marker_id for m in detect_markers(frame, MARKER_DICT)}
+    state = rebuild_workspace_state(
+        calib, markers, raw, visible_marker_ids=visible
+    )
+    pick_cubes = filter_phantoms(raw, markers)
+    return Scene.from_workspace(state, pick_cubes=pick_cubes, raw_cubes=raw)
+
+
+# Post-move verification radii (mm).
+VERIFY_PLACED_RADIUS_MM = 35.0
+VERIFY_ORIGIN_RADIUS_MM = 30.0
+
+
+def verify_pick_place(
+    scene: Scene,
+    *,
+    pick_x: float,
+    pick_y: float,
+    pick_color: str,
+    place_x: float,
+    place_y: float,
+) -> str:
+    """Judge an atomic pick+place from the post-move scene.
+
+    Returns ``placed``, ``grasp_failed``, or ``lost``.
+    """
+    same = [c for c in scene.cubes if c.color == pick_color]
+    if any(
+        dist_mm(float(c.x), float(c.y), place_x, place_y) < VERIFY_PLACED_RADIUS_MM
+        for c in same
+    ):
+        return "placed"
+    if any(
+        dist_mm(float(c.x), float(c.y), pick_x, pick_y) < VERIFY_ORIGIN_RADIUS_MM
+        for c in same
+    ):
+        return "grasp_failed"
+    return "lost"

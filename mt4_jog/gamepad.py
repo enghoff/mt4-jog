@@ -39,6 +39,10 @@ class GamepadSnapshot:
     speed_down: bool = False
     toggle_invert_xy: bool = False
     connected: bool = False
+    # Raw button state for callers that remap buttons (e.g. calibration):
+    # currently-held mask and newly-pressed-this-poll mask.
+    buttons: int = 0
+    edges: int = 0
 
 
 def _axis_sign(value: int, deadzone: int) -> int:
@@ -130,13 +134,15 @@ class XboxGamepad:
         if (x, y, z) != (0, 0, 0):
             cart = (x, y, z)
 
+        # J4 roll is intentionally NOT gated on cart being idle: the firmware
+        # layers the roll onto the Cartesian jog (`cj dx dy dz [j4]`), so the
+        # wrist can rotate while the TCP moves.
         j4: bool | None = None
-        if cart is None:
-            rx = _axis_sign(int(pad.sThumbRX), dz)
-            if rx < 0:
-                j4 = False
-            elif rx > 0:
-                j4 = True
+        rx = _axis_sign(int(pad.sThumbRX), dz)
+        if rx < 0:
+            j4 = False
+        elif rx > 0:
+            j4 = True
 
         lt = int(pad.bLeftTrigger)
         rt = int(pad.bRightTrigger)
@@ -150,6 +156,8 @@ class XboxGamepad:
             cart=cart,
             j4=j4,
             grip=grip,
+            buttons=buttons,
+            edges=buttons & ~self._prev_buttons,
             home=self._button_edge(buttons, A),
             stop_all=self._button_edge(buttons, B),
             status=self._button_edge(buttons, X),

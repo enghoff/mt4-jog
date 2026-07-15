@@ -81,7 +81,7 @@ For HTTP mode instead (e.g. MCP Inspector), run `python -m mt4_mcp` without
 | I/K | World +Z / -Z |
 | S/W | World +Y / -Y |
 | A/D | World +X / -X |
-| J/L | J4 wrist roll (when no Cartesian key held) |
+| J/L | J4 wrist roll (also while moving XYZ) |
 | Q/E | Gripper sweep open / close (S120–S285 on MT4; release = stop) |
 | -/= | Jog speed slower / faster (live, repeats while held) |
 | H | Home (on-device) |
@@ -95,7 +95,7 @@ For HTTP mode instead (e.g. MCP Inspector), run `python -m mt4_mcp` without
 |---------|--------|
 | Left stick | World X / Y |
 | Right stick Y | World Z |
-| Right stick X | J4 wrist roll (when not moving XYZ) |
+| Right stick X | J4 wrist roll (also while moving XYZ) |
 | LT / RT | Gripper open / close |
 | LB / RB or D-pad up/down | Jog speed faster / slower |
 | A | Home |
@@ -112,7 +112,9 @@ Gripper and J4-roll commands resend on a ~50ms timer while their key is held, so
 single dropped serial line can't strand them mid-motion — same fix already applied
 to Cartesian jog's `cj` resend.
 
-Firmware serial commands: `cj +x|-x|+y|-y|+z|-z|<dx> <dy> <dz>`, `orient on|off`,
+Firmware serial commands: `cj +x|-x|+y|-y|+z|-z|<dx> <dy> <dz> [j4]` (optional
+J4 roll -1|0|1 layered onto the solved rates so the wrist rotates during the
+move; zero direction + nonzero j4 = pure wrist roll), `orient on|off`,
 `speed <us>` (live jog step period, 700-4000us, session state), `pos` (joint steps + derived TCP
 mm/world-frame J4 deg/gripper S/move speed us), `setpos <j1> <j2> <j3> <j4>`,
 `m <dj1> <dj2> <dj3> <dj4> [dg]` (bounded relative move, all axes finish together),
@@ -168,13 +170,73 @@ avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom
 |------|---------|
 | `jog_keyboard.py` | Keyboard + Xbox gamepad jog client (Cartesian + J4 roll + gripper) |
 | `goto_position.py` | Prompt-driven absolute-position client (firmware `mp`) |
-| `mt4_mcp/` | Local HTTP MCP server for arm status and control |
+| `calibrate_vision.py` | Interactive jog-to-marker camera calibration |
+| `calibrate_height.py` | Auto probe-fit cube-top / pick-height correction after vision calib |
+| `recalibrate_camera.py` | Camera-only homography refit when the camera moved but markers/base did not |
+| `shuffle_blocks.py` | Live loop: detect cubes and shuffle them between markers / open table |
+| `mt4_mcp/` | Local HTTP MCP server for arm status, control, and vision pick/place |
+| `mt4_vision/` | Overhead-camera vision: ArUco calibration, cube detection, pick/place |
 | `flash_jog.py` | Flash custom firmware |
 | `restore_stock.py` | Flash stock firmware backup |
 | `mt4_jog/` | Python joint map, kinematics, serial helpers |
 | `firmware/mt4_jog/` | Arduino firmware: `config`/`pins`/`gripper`/`dda`/`motion`/`homing`/`commands`/`kinematics` modules |
 | `backups/` | Stock flash/EEPROM images |
-| `docs/` | Hardware and pin map reference (`MT4_ARCHITECTURE.md`) |
+| `docs/` | Hardware reference (`MT4_ARCHITECTURE.md`), sort occupancy requirements, printable ArUco sheet |
+
+## Vision pick-and-place
+
+An overhead USB camera watches the work surface, which carries ArUco markers
+(DICT_4X4_50; printable sheet in `docs/ArUco Markers A4 5x5cm.pdf`). The
+camera is auto-detected by scanning for the one that sees the markers
+(override with `MT4_CAMERA_INDEX` or `--camera`). Serial ports auto-detect
+the CH340 USB-UART when `--port` / `MT4_SERIAL_PORT` are omitted (COM numbers
+often change after a re-plug).
+
+One-time calibration maps camera pixels to robot-frame XY on the table plane
+-- no camera intrinsics needed:
+
+```powershell
+python -m mt4_vision markers    # verify the markers are seen
+python calibrate_vision.py      # jog-to-marker interactive calibration
+python calibrate_height.py      # optional probe-fit for cube-top / pick height
+python -m mt4_vision scene      # sanity-check cube detections in robot coords
+python -m mt4_vision pick red   # hardware test: pick a cube by color
+python shuffle_blocks.py --camera 1   # live shuffle loop (Ctrl+C stop, H re-home)
+```
+
+`calibrate_vision.py` homes the arm, then drops into the jog controls from
+`jog_keyboard.py`. Jog the TCP onto any reachable marker (any order; markers
+the arm can't reach are simply skipped) and record it with its digit key, or
+with gamepad **A** -- which identifies the marker automatically as the one
+the arm is hiding from the camera. **G** records the pick height and gripper
+S while physically gripping a cube; **Enter**/**Start** fits and saves.
+Because digits and A are taken, drivers-off moves to **X** and home to
+gamepad **Y**. Three recorded markers give an affine fit (accurate within
+the marker triangle); four or more give a full perspective homography.
+
+If the **camera** moves but the arm base and markers do not, skip
+re-touching markers and instead:
+
+```powershell
+python recalibrate_camera.py --camera 1
+python calibrate_height.py    # refit cube-top map (cleared by recalibrate)
+```
+
+Calibration lands in `vision_calibration.json` (transform, pick/safe
+heights, gripper S values, HSV overrides -- tuning fields carry over when
+re-calibrating). Colored cubes are detected by HSV
+threshold inside the marker quadrilateral; detections outside it (the arm's
+orange body, off-desk clutter) are rejected.
+
+`shuffle_blocks.py` runs an interruptible detect→plan→pick/place loop that
+moves cubes between free markers and open-table slots. Sort-into-rows
+behavior (S key) is specified in `docs/SORT_OCCUPANCY_REQUIREMENTS.md` and is
+not implemented yet.
+
+Natural-language control comes via the MCP server: `mt4_scene` reports cube
+colors and robot-frame positions from a fresh frame, `mt4_pick_cube` grabs a
+cube by color, `mt4_place_at` sets it down at x/y. Connect Claude (or any MCP
+client) to the server and say "put the red cube next to the blue one".
 
 ## Safety
 

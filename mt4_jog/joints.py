@@ -16,6 +16,9 @@ J2_HOME_PULLOFF_STEPS = 1000
 # design (~35 steps/deg each). J3's own EEPROM setting was missing from the
 # dump entirely (the old 35.556 was borrowed from unrelated extra axes), and
 # J4's old value (852) was a wrong axis-letter assumption ("d" = J4).
+# Per README.md: duplicated in firmware/mt4_jog/src/kinematics.{h,cpp} and
+# mt4_jog/kinematics.py -- no shared config file, edit all three together.
+# Zero Python importers of this copy is expected, not dead code.
 STEPS_PER_DEG: tuple[float, float, float, float] = (35.0, 35.0, 35.0, 45.0)
 
 # Enforced in jog firmware (g o / g c sweep); client only starts/stops sweep.
@@ -25,7 +28,6 @@ GRIPPER_S_CLOSED = 285
 # Shared jog / `mp` move step period (microseconds between DDA ticks).
 JOG_SPEED_MIN_US = 700
 JOG_SPEED_MAX_US = 4000
-DEFAULT_JOG_SPEED_US = 1524
 
 
 @dataclass(frozen=True)
@@ -48,11 +50,6 @@ JOINTS: tuple[Joint, ...] = (
     Joint(3, "elbow", "Z", 27, 26),
     Joint(4, "wrist", "A", 35, 36),
 )
-
-JOINT_BY_GCODE: dict[str, Joint] = {j.gcode: j for j in JOINTS}
-
-# Keyboard layout (left to right): Q/A=J1, W/S=J2, E/D=J3, R/F=J4
-KEYBOARD_JOINTS: tuple[Joint, ...] = JOINTS
 
 LIMIT_JOINTS: dict[str, str] = {
     f"I{j.limit_pin}": j.label for j in JOINTS if j.limit_pin is not None
