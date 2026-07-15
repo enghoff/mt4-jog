@@ -21,11 +21,15 @@ invalidated is the *pixel* side of each correspondence. So this script:
 
 If the "robot and markers didn't move" assumption is wrong, this produces a
 confidently wrong calibration with no independent way to catch it from
-pixels alone -- the touch-residual check below is an internal consistency
-check (does one homography explain every marker's old robot XY from its
-new pixel position), not proof the assumption holds. A residual outlier
-usually *does* mean a marker moved (or the wrong marker id matched) and is
-worth investigating before trusting the result.
+pixels alone -- the consistency check below (does one homography explain
+every marker's old robot XY from its new pixel position) is internal, not
+proof the assumption holds. An outlier usually *does* mean a marker moved
+(or the wrong marker id matched, or its original touch was recorded off)
+and is worth investigating before trusting the result. The check uses the
+worst of the in-fit and leave-one-out errors: least squares smears a single
+bad correspondence across all markers, so the culprit's own in-fit residual
+can sit under the threshold while its leave-one-out error -- refit without
+it, then measure it -- shows the disagreement at full size.
 
 Usage:
   python recalibrate_camera.py --camera 1
@@ -125,8 +129,11 @@ def main() -> int:
 
     touch_px = {mid: (detected[mid].px, detected[mid].py) for mid in matched_ids}
     touch_robot = {mid: old_robot[mid] for mid in matched_ids}
+    # Corners from EVERY visible marker, not just the matched ones -- the
+    # bundle's perspective doesn't need robot XYs, only equal-size squares
+    # (same superset behavior as calibrate_vision.py's ref_markers).
     marker_corners = {
-        mid: detected[mid].corners for mid in matched_ids if detected[mid].corners is not None
+        mid: m.corners for mid, m in detected.items() if m.corners is not None
     }
 
     matrix, report = fit_table_map(marker_corners, touch_px, touch_robot)
@@ -142,16 +149,20 @@ def main() -> int:
     for note in report.notes:
         print(f"NOTE: {note}")
 
-    suspects = [m for m, e in report.touch_residuals_mm.items() if e > SUSPECT_RESIDUAL_MM]
+    worst_err = dict(report.touch_residuals_mm)
+    for mid, err in report.touch_loo_mm.items():
+        worst_err[mid] = max(worst_err.get(mid, 0.0), err)
+    suspects = sorted(m for m, e in worst_err.items() if e > SUSPECT_RESIDUAL_MM)
     if suspects:
         print(
             f"\nWARNING: marker(s) {suspects} disagree with the new camera geometry "
-            f"by >{SUSPECT_RESIDUAL_MM}mm."
+            f"by >{SUSPECT_RESIDUAL_MM}mm (worst of in-fit and leave-one-out error)."
         )
         print(
-            "  This usually means that marker (or the robot) actually moved, not "
-            "just the camera -- inspect before trusting this calibration. If it "
-            "genuinely moved, run calibrate_vision.py's full touch process instead."
+            "  This usually means that marker (or the robot) moved, or its stored "
+            "touch was recorded off-center -- inspect before trusting this "
+            "calibration. If it moved (or the touch is suspect), re-record that "
+            "marker with calibrate_vision.py's touch process."
         )
 
     if args.dry_run:
@@ -164,6 +175,12 @@ def main() -> int:
             "and does not carry over. Run calibrate_height.py next (fully "
             "automatic, no touching required) before picking cubes; until then, "
             "cube picks fall back to the less accurate table-plane map."
+        )
+    if prev.cam_xy_robot is not None or prev.cam_height_mm is not None:
+        print(
+            "cam_xy_robot/cam_height_mm cleared -- they encode the OLD camera's "
+            "position for the parallax fallback, which would misdirect cube "
+            "picks at the new pose."
         )
 
     backup_dir = calib_path.parent / "backups"
@@ -194,11 +211,18 @@ def main() -> int:
             }
             for mid in matched_ids
         },
-        cam_xy_robot=prev.cam_xy_robot,
-        cam_height_mm=prev.cam_height_mm,
+        # The parallax-fallback camera pose belongs to the OLD camera position
+        # -- carrying it over would actively misdirect cube picks once
+        # cube_top_homography is cleared (pixel_to_robot falls back to it).
+        cam_xy_robot=None,
+        cam_height_mm=None,
         color_ranges=prev.color_ranges,
+        # Hull from every visible marker (matched or not), like
+        # calibrate_vision.py -- a hull of only the matched markers would
+        # silently exclude an occluded marker's corner of the desk from cube
+        # detection until the next full calibration.
         workspace_hull_px=cv2.convexHull(
-            np.array([[detected[mid].px, detected[mid].py] for mid in matched_ids], dtype=np.float32)
+            np.array([[m.px, m.py] for m in detected.values()], dtype=np.float32)
         ).reshape(-1, 2).tolist(),
     )
     new_calib.save(output_path)
