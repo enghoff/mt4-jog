@@ -1,80 +1,81 @@
-# MT4 custom jog
+# WLKATA MT4 — custom control stack
 
-Keyboard jog and on-device homing for the WLKATA MT4 arm (ATmega2560 @ COM6, 115200).
+A full replacement software stack for the WLKATA MT4 desktop robot arm
+(ATmega2560, 115200 baud serial): custom firmware with on-device Cartesian
+motion, interactive jog clients (keyboard + Xbox gamepad), overhead-camera
+vision pick-and-place for colored cubes, and an MCP server that lets an LLM
+drive the arm — "put the red cube next to the blue one".
 
-Custom firmware (`firmware/mt4_jog/`) replaces the stock Grbl-derived firmware with a
-4-axis step/dir jog engine plus an on-device Cartesian (world-frame) resolved-rate
-jog. `jog_keyboard.py` is the main client: Cartesian jog is the sole motion mode
-(direct per-joint jog was dropped), plus J4 wrist roll and the gripper. `goto_position.py`
-is a second, prompt-driven client for one-shot absolute moves.
+The stock Grbl-derived firmware is replaced entirely (original images are
+backed up and restorable, see [Restoring stock firmware](#restoring-stock-firmware)).
+
+## Repo layout
+
+| Path | Purpose |
+|------|---------|
+| `firmware/mt4_jog/` | Custom Arduino firmware: `config`/`pins`/`gripper`/`dda`/`motion`/`homing`/`commands`/`kinematics` modules |
+| `mt4_jog/` | Python client library: serial protocol, joint map, kinematics, gamepad |
+| `mt4_vision/` | Overhead-camera vision: ArUco calibration, cube detection, pick/place, shuffle |
+| `mt4_mcp/` | MCP server (HTTP or stdio) exposing status, motion, and vision pick/place tools |
+| `jog_keyboard.py` | Keyboard + Xbox gamepad jog client (Cartesian + J4 roll + gripper) |
+| `goto_position.py` | Prompt-driven absolute-position client (firmware `mp`) |
+| `calibrate_vision.py` | Interactive jog-to-marker camera calibration |
+| `calibrate_height.py` | Auto probe-fit cube-top / pick-height correction after vision calibration |
+| `recalibrate_camera.py` | Camera-only homography refit when the camera moved but markers/base did not |
+| `shuffle_blocks.py` | Live loop: detect cubes and shuffle them between markers / open table |
+| `flash_jog.py` | Flash the custom firmware |
+| `restore_stock.py` | Flash the stock firmware backup |
+| `backups/` | Stock flash/EEPROM images |
+| `scripts/` | Diagnostics (`diagnose_pick_accuracy.py`, `validate_scene_live.py`), ngrok launcher |
+| `tests/` | Unit tests |
+| `docs/` | Hardware reference, OAuth setup, sort-behavior spec, printable ArUco sheet |
 
 ## Requirements
 
-- Python 3.10+
-- `pip install -r requirements.txt`
-- [PlatformIO](https://platformio.org/) + avrdude (to flash firmware)
-- Windows (keyboard client uses `GetAsyncKeyState`)
+- Python 3.10+ — `pip install -r requirements.txt`
+- [PlatformIO](https://platformio.org/) + avrdude (only to flash firmware)
+- Windows (jog client uses `GetAsyncKeyState` / XInput)
+- For vision: an overhead USB camera and printed ArUco markers
+  (DICT_4X4_50; sheet in `docs/ArUco Markers A4 5x5cm.pdf`)
+
+Serial ports auto-detect the CH340 USB-UART when `--port` / `MT4_SERIAL_PORT`
+are omitted (COM numbers often change after a re-plug). The camera is
+auto-detected by scanning for the one that sees the markers (override with
+`MT4_CAMERA_INDEX` or `--camera`).
 
 ## Quick start
 
 ```powershell
-cd d:\mt4
 pip install -r requirements.txt
 
-# Flash custom jog firmware
+# Flash the custom firmware (one-time, or after firmware changes)
 python flash_jog.py --port COM6
 
-# Run keyboard jog (focus terminal, hold one or more keys)
-python jog_keyboard.py --port COM6
+# Jog interactively (focus the terminal, hold keys; gamepad works unfocused)
+python jog_keyboard.py
 
-# Or move to an absolute position (prompts for x/y/z/j4/gripper; requires
-# having homed this session)
-python goto_position.py --port COM6
+# One-shot absolute moves (prompts for x/y/z/j4/gripper; requires homing first)
+python goto_position.py
 
-# Local HTTP MCP server (Phase 1: status + stop only)
-python -m mt4_mcp
-# Then open MCP Inspector at http://127.0.0.1:8787/mcp
+# Vision: calibrate once, then pick/place/shuffle
+python -m mt4_vision markers        # verify the markers are seen
+python calibrate_vision.py          # jog-to-marker interactive calibration
+python calibrate_height.py          # optional probe-fit for pick height
+python -m mt4_vision scene          # sanity-check cube detections in robot coords
+python -m mt4_vision pick red       # hardware test: pick a cube by color
+python shuffle_blocks.py            # live shuffle loop (Ctrl+C stop, H re-home)
+
+# MCP server for LLM control
+python -m mt4_mcp                   # HTTP at http://127.0.0.1:8787/mcp
 ```
 
-### MCP server (`mt4_mcp`)
+## Jog clients
 
-Phase 1 exposes read-only status tools plus emergency stop over local HTTP
-(Streamable HTTP at `/mcp`). Motion tools (`mt4_home`, `mt4_move`) come in a
-later phase.
+`jog_keyboard.py` drives the arm in world-frame Cartesian jog (the sole
+motion mode — direct per-joint jog was dropped), plus J4 wrist roll and the
+gripper.
 
-```powershell
-# Default: serial COM6, MCP on http://127.0.0.1:8787/mcp
-python -m mt4_mcp
-
-# Override ports
-$env:MT4_SERIAL_PORT = "COM6"
-$env:MT4_MCP_PORT = "8787"
-python -m mt4_mcp
-```
-
-| Tool | Purpose |
-|------|---------|
-| `mt4_status` | Full `?` status as JSON |
-| `mt4_tcp` | Current TCP pose only |
-| `mt4_stop` | Stop jog / cancel move |
-
-Test with [MCP Inspector](https://github.com/modelcontextprotocol/inspector):
-connect to `http://127.0.0.1:8787/mcp`, transport **Streamable HTTP**.
-
-### Cursor
-
-This repo includes `.cursor/mcp.json`, which registers the MT4 server for this
-workspace. Cursor launches it over stdio (`python -m mt4_mcp --stdio`) when you
-enable the **MT4** MCP server in settings.
-
-1. Open **Cursor Settings → MCP** (or reload the window after pulling).
-2. Enable the **MT4** server.
-3. Stop `jog_keyboard.py` first — only one process can use COM6.
-
-For HTTP mode instead (e.g. MCP Inspector), run `python -m mt4_mcp` without
-`--stdio`.
-
-### Keys (`jog_keyboard.py`)
+### Keyboard
 
 | Key | Action |
 |-----|--------|
@@ -82,14 +83,16 @@ For HTTP mode instead (e.g. MCP Inspector), run `python -m mt4_mcp` without
 | S/W | World +Y / -Y |
 | A/D | World +X / -X |
 | J/L | J4 wrist roll (also while moving XYZ) |
-| Q/E | Gripper sweep open / close (S120–S285 on MT4; release = stop) |
+| Q/E | Gripper sweep open / close (S120–S285; release = stop) |
 | -/= | Jog speed slower / faster (live, repeats while held) |
 | H | Home (on-device) |
 | SPACE | Status |
 | 0 | Stop, drivers off |
 | ESC | Quit |
 
-**Xbox controller** (player 1, via Windows XInput; works without terminal focus):
+### Xbox controller
+
+Player 1, via Windows XInput; works without terminal focus.
 
 | Control | Action |
 |---------|--------|
@@ -103,151 +106,75 @@ For HTTP mode instead (e.g. MCP Inspector), run `python -m mt4_mcp` without
 | X | Status |
 | Back | Quit |
 
-Use `--no-gamepad` for keyboard only. `--gamepad-deadzone` adjusts stick deadzone (default 9000).
+Use `--no-gamepad` for keyboard only; `--gamepad-deadzone` adjusts the stick
+deadzone (default 9000).
 
-Use `--no-orient` to disable J4 wrist unwind during Cartesian moves (also
-live-toggleable via serial `orient on|off`). When on, J4 counters J1's yaw 1:1.
+### Behavior notes
 
-Gripper and J4-roll commands resend on a ~50ms timer while their key is held, so a
-single dropped serial line can't strand them mid-motion — same fix already applied
-to Cartesian jog's `cj` resend.
+- `--no-orient` disables J4 wrist unwind during Cartesian moves (also
+  live-toggleable via serial `orient on|off`). When on, J4 counters J1's yaw
+  1:1 so the gripper holds its world-frame orientation.
+- Gripper and J4-roll commands resend on a ~50 ms timer while their key is
+  held, so a single dropped serial line can't strand them mid-motion — the
+  same fix applied to Cartesian jog's `cj` resend.
+- `goto_position.py` queries `pos` for the current TCP/J4/gripper state,
+  prompts for each field (blank = keep current), then sends `mp` and prints
+  the async completion line.
 
-Firmware serial commands: `cj +x|-x|+y|-y|+z|-z|<dx> <dy> <dz> [j4]` (optional
-J4 roll -1|0|1 layered onto the solved rates so the wrist rotates during the
-move; zero direction + nonzero j4 = pure wrist roll), `orient on|off`,
-`speed <us>` (live jog step period, 700-4000us, session state), `pos` (joint steps + derived TCP
-mm/world-frame J4 deg/gripper S/move speed us), `setpos <j1> <j2> <j3> <j4>`,
-`m <dj1> <dj2> <dj3> <dj4> [dg]` (bounded relative move, all axes finish together),
-`mp <x> <y> <z> <j4> <g> [speed_us]` (absolute move to a TCP position in mm + world-frame J4 deg +
-absolute gripper S + optional step period 700-4000us; TCP xyz interpolated along straight world-frame lines in short
-segments with closed-form IK per segment; when the commanded J4 matches the current
-world-frame yaw, gripper orientation is held fixed in world space; rejected with `err not homed` unless homed this
-session), `home [j1 j2]`, `g o|c|stop|<120-285>`, `?`/`s`. Full reference in the header
-comment of `firmware/mt4_jog/src/main.cpp`.
+## Firmware
 
-`goto_position.py` queries `pos` for the current TCP/J4/gripper state, prompts for
-each (blank = keep current), then sends `mp` and prints the async completion line.
+`firmware/mt4_jog/` is a 4-axis step/dir jog engine with an on-device
+world-frame resolved-rate jog and closed-form IK for straight-line moves.
+Build/flash with PlatformIO via `flash_jog.py`.
 
-Kinematic model: the MT4 is a parallel-link (palletizing) arm — J2 sets the upper-arm
-absolute angle, J3 sets the forearm absolute angle through the link rods (independent of
-J2), and the head platform stays level, using EEPROM link/offset geometry (L1 130, L2 150,
-base 45/140, head 35/14.43). The homed pose (step counters = 0) is **q2 = 103°, q3 =
-4.7°** — measured directly (J2-J4 straight-line distance + J4 height above the base), not
-the upper-arm-vertical/forearm-horizontal (90°, 0°) previously assumed. This custom
-firmware's homing pull-off distances don't reach the same physical pose the factory
-firmware's own homing does, so the model no longer matches the factory-reported home TCP
-(230, 0, 255.57) — it reports (200.2, 0, 264.6) instead.
+### Serial protocol
 
-Per-joint calibration (`MT4_STEPS_PER_DEG` / `J_STEP_SIGN`, duplicated in
+Full reference lives in the header comment of
+`firmware/mt4_jog/src/main.cpp`. Summary:
+
+| Command | Effect |
+|---------|--------|
+| `cj +x\|-x\|+y\|-y\|+z\|-z\|<dx> <dy> <dz> [j4]` | Cartesian jog. Optional J4 roll `-1\|0\|1` layers onto the solved rates so the wrist rotates during the move; zero direction + nonzero j4 = pure wrist roll |
+| `orient on\|off` | J4 wrist unwind during Cartesian moves |
+| `speed <us>` | Live jog step period, 700–4000 µs (session state) |
+| `pos` | Joint steps + derived TCP mm, world-frame J4 deg, gripper S, move speed |
+| `setpos <j1> <j2> <j3> <j4>` | Overwrite step counters |
+| `m <dj1> <dj2> <dj3> <dj4> [dg]` | Bounded relative move; all axes finish together |
+| `mp <x> <y> <z> <j4> <g> [speed_us]` | Absolute move: TCP position (mm) + world-frame J4 (deg) + gripper S + optional step period. XYZ interpolated along straight world-frame lines in short segments with closed-form IK per segment; when the commanded J4 matches the current world-frame yaw, gripper orientation is held fixed in world space. Rejected with `err not homed` unless homed this session |
+| `home [j1 j2]` | On-device homing (see below) |
+| `g o\|c\|stop\|<120-285>` | Gripper open / close / stop / set; bare `g` queries |
+| `?` / `s` | Status |
+
+### Kinematics and calibration
+
+The MT4 is a parallel-link (palletizing) arm: J2 sets the upper-arm absolute
+angle, J3 sets the forearm absolute angle through the link rods (independent
+of J2), and the head platform stays level. The model uses EEPROM link/offset
+geometry (L1 130, L2 150, base 45/140, head 35/14.43).
+
+The homed pose (step counters = 0) is **q2 = 103°, q3 = 4.7°** — measured
+directly (J2–J4 straight-line distance + J4 height above the base), not the
+upper-arm-vertical / forearm-horizontal (90°, 0°) previously assumed. This
+firmware's homing pull-off distances don't reach the same physical pose the
+factory firmware's homing does, so the home TCP is (200.2, 0, 264.6) rather
+than the factory-reported (230, 0, 255.57).
+
+Per-joint calibration is from direct measurement (phone clinometer for
+J2–J4, direct yaw measurement for J1): J1/J2/J3 = 35 steps/deg, J4 = 45
+steps/deg. `MT4_STEPS_PER_DEG` / `J_STEP_SIGN` are duplicated in
 `firmware/mt4_jog/src/kinematics.{h,cpp}`, `mt4_jog/joints.py`, and
-`mt4_jog/kinematics.py` — no shared config file, so edit all three together) is from
-direct measurement (phone clinometer for J2-J4, direct yaw measurement for J1): J1/J2/J3
-= 35 steps/deg, J4 = 45 steps/deg.
+`mt4_jog/kinematics.py` — there is no shared config file, so edit all three
+together.
 
-Homing seeks J1/J2's limit switches directly; J3 has no limit switch of its own, so it's
-homed indirectly by driving it into mechanical interference with J2 until that
-displaces J2 enough to release J2's own limit switch. J1 center **4580** steps, J2/J3
-pull-off **1000** steps by default (override with `--j1-center` / `--j2-pull`).
+### Homing
 
-## Restore stock firmware
+Homing seeks J1/J2's limit switches directly. J3 has no switch of its own,
+so it's homed indirectly by driving it into mechanical interference with J2
+until that displaces J2 enough to release J2's own limit switch. Defaults:
+J1 center **4580** steps, J2/J3 pull-off **1000** steps (override with
+`--j1-center` / `--j2-pull` on the clients).
 
-Original factory images are in `backups/`:
-
-```powershell
-python restore_stock.py --port COM6 --yes
-python restore_stock.py --port COM6 --yes --eeprom backups/mt4_eeprom_2026-07-02.hex
-```
-
-Optional EEPROM restore:
-
-```powershell
-avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom_2026-07-02.hex:i
-```
-
-## Layout
-
-| Path | Purpose |
-|------|---------|
-| `jog_keyboard.py` | Keyboard + Xbox gamepad jog client (Cartesian + J4 roll + gripper) |
-| `goto_position.py` | Prompt-driven absolute-position client (firmware `mp`) |
-| `calibrate_vision.py` | Interactive jog-to-marker camera calibration |
-| `calibrate_height.py` | Auto probe-fit cube-top / pick-height correction after vision calib |
-| `recalibrate_camera.py` | Camera-only homography refit when the camera moved but markers/base did not |
-| `shuffle_blocks.py` | Live loop: detect cubes and shuffle them between markers / open table |
-| `mt4_mcp/` | Local HTTP MCP server for arm status, control, and vision pick/place |
-| `mt4_vision/` | Overhead-camera vision: ArUco calibration, cube detection, pick/place |
-| `flash_jog.py` | Flash custom firmware |
-| `restore_stock.py` | Flash stock firmware backup |
-| `mt4_jog/` | Python joint map, kinematics, serial helpers |
-| `firmware/mt4_jog/` | Arduino firmware: `config`/`pins`/`gripper`/`dda`/`motion`/`homing`/`commands`/`kinematics` modules |
-| `backups/` | Stock flash/EEPROM images |
-| `docs/` | Hardware reference (`MT4_ARCHITECTURE.md`), sort occupancy requirements, printable ArUco sheet |
-
-## Vision pick-and-place
-
-An overhead USB camera watches the work surface, which carries ArUco markers
-(DICT_4X4_50; printable sheet in `docs/ArUco Markers A4 5x5cm.pdf`). The
-camera is auto-detected by scanning for the one that sees the markers
-(override with `MT4_CAMERA_INDEX` or `--camera`). Serial ports auto-detect
-the CH340 USB-UART when `--port` / `MT4_SERIAL_PORT` are omitted (COM numbers
-often change after a re-plug).
-
-One-time calibration maps camera pixels to robot-frame XY on the table plane
--- no camera intrinsics needed:
-
-```powershell
-python -m mt4_vision markers    # verify the markers are seen
-python calibrate_vision.py      # jog-to-marker interactive calibration
-python calibrate_height.py      # optional probe-fit for cube-top / pick height
-python -m mt4_vision scene      # sanity-check cube detections in robot coords
-python -m mt4_vision pick red   # hardware test: pick a cube by color
-python shuffle_blocks.py --camera 1   # live shuffle loop (Ctrl+C stop, H re-home)
-```
-
-`calibrate_vision.py` homes the arm, then drops into the jog controls from
-`jog_keyboard.py`. Jog the TCP onto any reachable marker (any order; markers
-the arm can't reach are simply skipped) and record it with its digit key, or
-with gamepad **A** -- which identifies the marker automatically as the one
-the arm is hiding from the camera. **G** records the pick height and gripper
-S while physically gripping a cube; **Enter**/**Start** fits and saves.
-Because digits and A are taken, drivers-off moves to **X** and home to
-gamepad **Y**. Three recorded markers give an affine fit (accurate within
-the marker triangle); four or more give a full perspective homography.
-
-If the **camera** moves but the arm base and markers do not, skip
-re-touching markers and instead:
-
-```powershell
-python recalibrate_camera.py --camera 1
-python calibrate_height.py    # refit cube-top map (cleared by recalibrate)
-```
-
-Calibration lands in `vision_calibration.json` (transform, pick/safe
-heights, gripper S values, HSV overrides -- tuning fields carry over when
-re-calibrating). Colored cubes are detected by HSV
-threshold inside the marker quadrilateral; detections outside it (the arm's
-orange body, off-desk clutter) are rejected.
-
-`shuffle_blocks.py` runs an interruptible detect→plan→pick/place loop that
-moves cubes between free markers and open-table slots. Sort-into-rows
-behavior (S key) is specified in `docs/SORT_OCCUPANCY_REQUIREMENTS.md` and is
-not implemented yet.
-
-Natural-language control comes via the MCP server: `mt4_scene` reports cube
-colors and robot-frame positions from a fresh frame, `mt4_pick_cube` grabs a
-cube by color, `mt4_place_at` sets it down at x/y. Connect Claude (or any MCP
-client) to the server and say "put the red cube next to the blue one".
-
-## Safety
-
-- Clear workspace before jogging or homing.
-- Drivers energize while a key is held.
-- After a stall/jerk, **power-cycle motor supply ~10 s** before retrying (TMC2209 latch).
-- Only J1 (I21) and J2 (I20) have hardware limit switches; J3/J4 have none (J3 is
-  homed indirectly via J2's switch; J4 is unreferenced and relies on power-on step
-  counters staying valid).
-
-## Pin map (custom firmware)
+### Pin map
 
 | Joint | G-code | Drive | DIR | Limit |
 |-------|--------|-------|-----|-------|
@@ -256,6 +183,141 @@ client) to the server and say "put the red cube next to the blue one".
 | J3 elbow | Z | D27 | D26 | — |
 | J4 wrist | A | D35 | D36 | — |
 
-Shared enable: **D40** (active low).
+Shared enable: **D40** (active low). Gripper PWM: **D7** (Timer4 OC4B);
+limits and sweep run on the MCU (S120–S285).
 
-Gripper PWM: **D7** (Timer4 OC4B). Limits and sweep run **on the MT4** (S120–S285). Client sends **`g o`** / **`g c`** on key down (resent while held), **`g stop`** on release. Manual: **`g <120-285>`** or query with **`g`**.
+Full hardware detail (board, drivers, flash path) is in
+`docs/MT4_ARCHITECTURE.md`.
+
+## Vision pick-and-place
+
+An overhead USB camera watches the work surface, which carries ArUco
+markers. A one-time calibration maps camera pixels to robot-frame XY on the
+table plane — no camera intrinsics needed.
+
+### Calibration
+
+```powershell
+python -m mt4_vision markers    # verify the markers are seen
+python calibrate_vision.py      # jog-to-marker interactive calibration
+python calibrate_height.py      # optional probe-fit for cube-top / pick height
+python -m mt4_vision scene      # sanity-check cube detections in robot coords
+```
+
+`calibrate_vision.py` homes the arm, then drops into the jog controls from
+`jog_keyboard.py`. Jog the TCP onto any reachable marker (any order;
+unreachable markers are simply skipped) and record it with its digit key —
+or with gamepad **A**, which identifies the marker automatically as the one
+the arm is hiding from the camera. **G** records the pick height and gripper
+S while physically gripping a cube; **Enter**/**Start** fits and saves.
+Because digits and A are taken, drivers-off moves to **X** and home to
+gamepad **Y**. Three recorded markers give an affine fit (accurate within
+the marker triangle); four or more give a full perspective homography.
+
+If the **camera** moves but the arm base and markers do not, skip
+re-touching markers:
+
+```powershell
+python recalibrate_camera.py
+python calibrate_height.py    # refit cube-top map (cleared by recalibrate)
+```
+
+Calibration lands in `vision_calibration.json` (transform, pick/safe
+heights, gripper S values, HSV overrides — tuning fields carry over when
+re-calibrating). Colored cubes are detected by HSV threshold inside the
+marker quadrilateral; detections outside it (the arm's orange body, off-desk
+clutter) are rejected.
+
+### CLI
+
+`python -m mt4_vision <subcommand>`:
+
+| Subcommand | Purpose |
+|------------|---------|
+| `markers` | Detect ArUco markers, save an annotated frame |
+| `scene` | Detect cubes, print robot-frame coordinates |
+| `pick <color>` | Pick a cube by color (moves the arm) |
+| `place <x> <y>` | Place the held cube at robot-frame x/y (moves the arm) |
+| `place-here` | Place the held cube at the current TCP xy (moves the arm) |
+| `goto-marker <id>` | Move the TCP to a marker — calibration accuracy check (`--touch` descends to table height) |
+| `shuffle` | Home, then shuffle cubes between markers and open table |
+
+### Shuffle loop
+
+`shuffle_blocks.py` runs an interruptible detect→plan→pick/place loop that
+moves cubes between free markers and open-table slots (Ctrl+C to stop, H to
+re-home). Sort-into-rows behavior (S key) is specified in
+`docs/SORT_OCCUPANCY_REQUIREMENTS.md` and is not implemented yet.
+
+## MCP server
+
+`mt4_mcp` exposes the arm to any MCP client over Streamable HTTP or stdio.
+Natural-language pick-and-place: connect an LLM and say "put the red cube
+next to the blue one".
+
+| Tool | Purpose |
+|------|---------|
+| `mt4_status` | Full arm status as JSON (homed flag, mode, joints, TCP, drivers, jog) |
+| `mt4_tcp` | Current TCP pose only |
+| `mt4_stop` | Stop jog / cancel any in-progress move |
+| `mt4_home` | On-device homing |
+| `mt4_move_to` | Absolute TCP move (requires homing this session) |
+| `mt4_move_relative` | Bounded relative per-joint move |
+| `mt4_gripper` | Open / close / stop / set the gripper |
+| `mt4_scene` | Detect cubes on a fresh camera frame; returns color + robot-frame x/y |
+| `mt4_pick_cube` | Pick a cube by color |
+| `mt4_place_at` | Place the held cube at robot-frame x/y |
+| `mt4_goto_marker` | Move the TCP to a calibration marker — accuracy check |
+
+Only one process can own the serial port — stop `jog_keyboard.py` (or any
+other client) before starting the server.
+
+### Local HTTP
+
+```powershell
+python -m mt4_mcp     # http://127.0.0.1:8787/mcp (Streamable HTTP)
+```
+
+Configuration via flags or environment (a `.env` file is loaded
+automatically — copy `.env.example` to get started): `MT4_SERIAL_PORT`,
+`MT4_BAUD`, `MT4_MCP_HOST`, `MT4_MCP_PORT`, `MT4_MCP_PATH`. Test with
+[MCP Inspector](https://github.com/modelcontextprotocol/inspector):
+connect to `http://127.0.0.1:8787/mcp`, transport **Streamable HTTP**.
+
+### Cursor (stdio)
+
+`.cursor/mcp.json` registers the server for this workspace; Cursor launches
+it as `python -m mt4_mcp --stdio`. Open **Cursor Settings → MCP**, enable
+the **MT4** server.
+
+### Public access (ChatGPT / remote clients)
+
+Set `MT4_MCP_PUBLIC=1` to bind publicly, tunnel with ngrok
+(`scripts/start_ngrok.ps1`), and enable the OAuth 2.1 flow (FastMCP's Google
+provider) for ChatGPT-compatible auth. Full setup: `docs/OAUTH_CHATGPT.md`.
+
+## Restoring stock firmware
+
+Original factory images are in `backups/`:
+
+```powershell
+python restore_stock.py --port COM6 --yes
+```
+
+Optional EEPROM restore:
+
+```powershell
+python restore_stock.py --port COM6 --yes --eeprom backups/mt4_eeprom_2026-07-02.hex
+# or directly:
+avrdude -p atmega2560 -c wiring -P COM6 -b 115200 -U eeprom:w:backups\mt4_eeprom_2026-07-02.hex:i
+```
+
+## Further docs
+
+| Doc | Contents |
+|-----|----------|
+| `docs/MT4_ARCHITECTURE.md` | Hardware and pin-map reference, ATmega2560 flash path |
+| `docs/OAUTH_CHATGPT.md` | OAuth 2.1 via Google + ngrok for public MCP access |
+| `docs/SORT_OCCUPANCY_REQUIREMENTS.md` | Spec for the (unimplemented) sort-into-rows shuffle behavior |
+| `docs/ArUco Markers A4 5x5cm.pdf` | Printable marker sheet (DICT_4X4_50) |
+| `firmware/mt4_jog/src/main.cpp` | Full serial protocol reference (header comment) |
