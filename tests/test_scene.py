@@ -310,3 +310,14 @@ def run() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(run())
+
+
+def test_marker_at_touched_reach_limit_is_placeable():
+    """Marker 1 lives at 322.5mm -- physically touched and reachable; the
+    reach filter must not veto it (regression: MAX_REACH_MM=320 did)."""
+    from mt4_vision.workspace import MarkerSlot, rebuild_workspace_state
+
+    m1 = MarkerSlot(1, 45.0, 319.3)
+    state = rebuild_workspace_state(None, [m1], [], visible_marker_ids={1})
+    s = Scene.from_workspace(state, pick_cubes=[], raw_cubes=[])
+    assert 1 in {m.marker_id for m in s.placeable_markers()}

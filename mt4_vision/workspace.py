@@ -32,8 +32,14 @@ MARKER_PAPER_CLEARANCE_MM = 40.0
 PICK_CLEARANCE_MM = 45.0
 # ArUco dictionary of the desk markers (same as calibrate_vision.py).
 MARKER_DICT = "4x4_50"
-# Conservative horizontal reach at pick height (mm).
-MAX_REACH_MM = 320.0
+# Conservative horizontal reach (mm). The measured IK envelope (sweep at
+# safe_z=185 / pick_z=154, 2026-07-18) is >=353mm at every angle, so 335
+# keeps ~18mm of margin from the true edge while covering marker 1 at
+# 322.5mm -- the old 320 rejected that marker (a physically-touched,
+# demonstrably reachable slot) and misclassified real cubes past 320 as
+# phantoms. Stay well below the envelope: near full stretch the arm is
+# close to singular and both accuracy and joint speeds degrade.
+MAX_REACH_MM = 335.0
 # Firmware `mp` rejects TCP targets inside this cylinder (J1 axis, any Z).
 KEEPOUT_RADIUS_MM = 170.0
 KEEPOUT_TARGET_MARGIN_MM = 0.5  # mirrors start_absolute_move in motion.cpp
