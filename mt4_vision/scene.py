@@ -125,8 +125,19 @@ class Scene:
         return [c for c in self.cubes if self.marker_for_cube(c) is None]
 
     def placeable_markers(self) -> list[MarkerSlot]:
-        """Tag visible, place-clearance free, reachable."""
-        return [m for m in self.free_markers if is_mp_reachable_xy(m.x, m.y)]
+        """Tag visible, place-clearance free, reachable at travel height.
+
+        Matches pick/slot filtering: keep-out cylinder *and* MAX_REACH_MM.
+        Keep-out alone is not enough -- a marker can be placeable at pick_z
+        but outside the two-link envelope at safe_z, where every transit goes
+        first (firmware ``err mp unreachable``).
+        """
+        return [
+            m
+            for m in self.free_markers
+            if is_mp_reachable_xy(m.x, m.y)
+            and math.hypot(m.x, m.y) <= MAX_REACH_MM
+        ]
 
     def occupied_pick_cubes(self) -> list[CubeDetection]:
         """Occupied-marker cubes that are also pick-quality (in Scene.cubes)."""

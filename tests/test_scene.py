@@ -4,6 +4,7 @@ Run: python tests/test_scene.py
 """
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -17,7 +18,8 @@ from mt4_vision.workspace import MarkerSlot, rebuild_workspace_state
 
 MARKERS = [
     MarkerSlot(0, 52.0, -258.6),
-    MarkerSlot(1, 39.0, 318.9),
+    # Inside MAX_REACH_MM (320); live marker 1 was ~354mm and failed at safe_z.
+    MarkerSlot(1, 40.0, 300.0),
     MarkerSlot(2, 188.4, -161.3),
     MarkerSlot(3, 177.2, 181.5),
 ]
@@ -64,6 +66,30 @@ def test_occupied_marker_not_placeable():
     )
     assert 3 not in {m.marker_id for m in s.placeable_markers()}
     assert any(m.marker_id == 3 for m, _ in s.occupied)
+
+
+def test_beyond_max_reach_marker_not_placeable():
+    """Markers past MAX_REACH_MM must not be place targets.
+
+    Keep-out alone is insufficient: live marker 1 (~354mm) is reachable at
+    pick_z but not at safe_z, so every transit failed with mp unreachable.
+    """
+    from mt4_vision.workspace import MAX_REACH_MM
+
+    far = MarkerSlot(9, 58.0, 349.0)
+    assert math.hypot(far.x, far.y) > MAX_REACH_MM
+    markers = list(MARKERS) + [far]
+    state = rebuild_workspace_state(
+        None, markers, [], visible_marker_ids={0, 1, 2, 3, 9}
+    )
+    s = Scene.from_workspace(state)
+    placeable_ids = {m.marker_id for m in s.placeable_markers()}
+    assert 9 not in placeable_ids
+    assert 9 in {m.marker_id for m in s.free_markers}
+    action = plan_shuffle(s)
+    # No cubes to move -- but if something planned a place, never onto 9.
+    if action.kind == "pick":
+        assert action.place_marker_id != 9
 
 
 def test_prefer_blocker_over_marker_cube():
