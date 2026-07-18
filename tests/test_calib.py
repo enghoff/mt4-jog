@@ -117,3 +117,24 @@ def test_top_face_centroid_unbiased_when_blob_is_all_top_face():
     det = detect_cubes(frame)[0]
     assert abs(det.px - 49.5) < 0.6
     assert abs(det.py - 39.5) < 0.6
+
+
+def test_cube_top_residual_layer():
+    """Correction applies near a probe point and decays to ~zero far away."""
+    c = make_calib(
+        cube_top_homography=IDENTITY,
+        cube_top_residual={
+            "points": [[100.0, 100.0]],
+            "deltas": [[8.0, -4.0]],
+            "sigma_mm": 60.0,
+            "reg": 0.25,
+        },
+    )
+    # at the probe point: most of the delta (shrunk slightly by reg)
+    x, y = c.pixel_to_robot(100.0, 100.0, on_cube_top=True)
+    assert 105.0 < x < 108.0
+    assert 96.0 < y < 97.5
+    # far away: correction ~0
+    x, y = c.pixel_to_robot(500.0, 500.0, on_cube_top=True)
+    assert abs(x - 500.0) < 0.1
+    assert abs(y - 500.0) < 0.1

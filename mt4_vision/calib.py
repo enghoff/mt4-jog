@@ -86,6 +86,15 @@ class Calibration:
     # arm-placed probe cubes -- the arm's commanded place position is the
     # ground truth. None if not yet calibrated.
     cube_top_homography: list[list[float]] | None = None
+    # Smooth residual layer over the cube-top map: the per-location mapping
+    # error is stable to ~1mm (measured 2026-07-18) but nonlinear in position
+    # -- beyond what the affine alignment can express -- so the probe
+    # residuals themselves are interpolated: Gaussian-weighted mean of
+    # `deltas` at `points` (robot frame, mm), with a regularizer that shrinks
+    # the correction to zero away from the probes (no extrapolation
+    # pathology). {"points": [[x,y],..], "deltas": [[dx,dy],..],
+    # "sigma_mm": 60.0, "reg": 0.25}
+    cube_top_residual: dict | None = None
     # Pixel -> metric-table-frame homography from the marker-corner bundle
     # (table_fit.py). Perspective comes from 20 subpixel corners, so this is
     # the trustworthy projective part; the maps above are (similarity .
@@ -124,7 +133,12 @@ class Calibration:
         if on_cube_top and self.cube_top_homography:
             h = np.array(self.cube_top_homography, dtype=np.float64)
             v = h @ np.array([px, py, 1.0])
-            return float(v[0] / v[2]), float(v[1] / v[2])
+            x, y = float(v[0] / v[2]), float(v[1] / v[2])
+            if self.cube_top_residual:
+                dx, dy = self._residual_correction(x, y)
+                x += dx
+                y += dy
+            return x, y
 
         h = np.array(self.homography, dtype=np.float64)
         v = h @ np.array([px, py, 1.0])
@@ -137,6 +151,19 @@ class Calibration:
         elif on_cube_top:
             _warn_no_cube_top_correction()
         return x, y
+
+    def _residual_correction(self, x: float, y: float) -> tuple[float, float]:
+        r = self.cube_top_residual
+        pts = np.array(r["points"], dtype=np.float64)
+        deltas = np.array(r["deltas"], dtype=np.float64)
+        two_s2 = 2.0 * float(r.get("sigma_mm", 60.0)) ** 2
+        reg = float(r.get("reg", 0.25))
+        w = np.exp(-((pts[:, 0] - x) ** 2 + (pts[:, 1] - y) ** 2) / two_s2)
+        denom = w.sum() + reg
+        return (
+            float((w * deltas[:, 0]).sum() / denom),
+            float((w * deltas[:, 1]).sum() / denom),
+        )
 
     def save(self, path: Path = DEFAULT_CALIB_PATH) -> None:
         path.write_text(json.dumps(self.__dict__, indent=2), encoding="utf-8")

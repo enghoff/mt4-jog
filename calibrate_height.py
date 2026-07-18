@@ -137,6 +137,30 @@ def main() -> int:
         help="skip grid targets within place clearance of this robot XY "
              "(e.g. a cube that must stay put); repeatable",
     )
+    parser.add_argument(
+        "--extra-target", type=float, nargs=2, action="append", default=[],
+        metavar=("X", "Y"),
+        help="additional probe target(s) beyond the built-in grid; repeatable",
+    )
+    parser.add_argument(
+        "--skip-grid", action="store_true",
+        help="probe only the --extra-target points (e.g. to densify a region "
+             "and --merge with an earlier same-color session)",
+    )
+    parser.add_argument(
+        "--merge", action="store_true",
+        help="include the calibration's stored probe_observations in the fit. "
+             "Only sound for same-color, same-camera-pose observations -- "
+             "cross-color merges are OFF by ~10px and are refused.",
+    )
+    parser.add_argument(
+        "--reps", type=int, default=1,
+        help="placements per grid target (default 1). Release drag moves the "
+             "cube 2-6mm per placement in a semi-random direction; extra reps "
+             "average it out. With reps > 1 use --holdout 0 (the holdout "
+             "split is by observation, so a held-out target would leak into "
+             "the fit via its other reps) and validate offline instead.",
+    )
     args = parser.parse_args()
 
     try:
@@ -159,7 +183,9 @@ def main() -> int:
         # RESET_SPEED_US) before the real moves below.
         client.move_to(status.tcp.x, status.tcp.y, status.tcp.z, speed_us=RESET_SPEED_US)
 
-        grid = [(x, y) for x, y in GRID_POINTS if math.hypot(x, y) <= MAX_REACH_MM]
+        base_grid = [] if args.skip_grid else list(GRID_POINTS)
+        base_grid += [(float(x), float(y)) for x, y in args.extra_target]
+        grid = [(x, y) for x, y in base_grid if math.hypot(x, y) <= MAX_REACH_MM]
         for ax, ay in args.avoid:
             dropped_targets = [
                 (x, y) for x, y in grid
@@ -169,8 +195,9 @@ def main() -> int:
                 print(f"Skipping target(s) {dropped_targets} -- within place "
                       f"clearance of avoided ({ax:.0f},{ay:.0f})")
             grid = [t for t in grid if t not in dropped_targets]
-        if len(grid) < 5:
-            print(f"Only {len(grid)} grid points within MAX_REACH_MM; need >=5", file=sys.stderr)
+        min_targets = 1 if args.merge else 5
+        if len(grid) < min_targets:
+            print(f"Only {len(grid)} usable grid points; need >={min_targets}", file=sys.stderr)
             return 1
 
         frame = capture_frame(**camera_kwargs)
@@ -361,6 +388,51 @@ def main() -> int:
             probe_xy = (gx, gy)
             known_xy = (gx, gy)
 
+            # Extra reps at the same target: re-grip (arm-known, exact) and
+            # re-place, photographing each landing -- averages out the 2-6mm
+            # release drag that a single placement bakes into the data.
+            for _rep in range(max(0, args.reps - 1)):
+                try:
+                    pick(client, calib, gx, gy)
+                    home_arm(client)
+                    place(client, calib, gx, gy)
+                    home_arm(client)
+                except Mt4ClientError as exc:
+                    print(f"  rep failed ({exc}); target stays single-sampled")
+                    break
+                time.sleep(HOME_SETTLE_S)
+                frame = capture_frame(**camera_kwargs)
+                found = find_probe(frame, probe_color, _inverse_guess(calib, gx, gy))
+                if found is None:
+                    print("  rep: probe not redetected; skipping rep")
+                    break
+                raw_x, raw_y = calib.pixel_to_robot(found.px, found.py)
+                if math.hypot(raw_x - gx, raw_y - gy) > PLACEMENT_SANITY_MM:
+                    print("  rep: sanity check failed; skipping rep")
+                    break
+                print(f"  rep: probe at pixel ({found.px:.1f},{found.py:.1f})")
+                pixel_pts.append((found.px, found.py))
+                robot_pts.append((gx, gy))
+                probe_colors.append(probe_color)
+
+        if args.merge and calib.probe_observations:
+            stored = calib.probe_observations
+            run_colors = set(probe_colors) or {probe_color}
+            stored_colors = {o.get("color") for o in stored}
+            if stored_colors - run_colors:
+                print(
+                    f"--merge refused: stored observations are {sorted(stored_colors)} "
+                    f"but this run probed {sorted(run_colors)} -- centroids of "
+                    "different colors are offset ~10px and would poison the fit",
+                    file=sys.stderr,
+                )
+                keep_probe_observations()
+                return 1
+            print(f"Merging {len(stored)} stored observation(s) into the fit")
+            pixel_pts = [tuple(o["pixel"]) for o in stored] + pixel_pts
+            robot_pts = [tuple(o["robot"]) for o in stored] + robot_pts
+            probe_colors = [o.get("color", probe_color) for o in stored] + probe_colors
+
         holdout = args.holdout if args.holdout > 0 else 0
         if len(pixel_pts) - holdout < 4:
             print(
@@ -411,9 +483,40 @@ def main() -> int:
             print("(This is the number that matters -- in-fit error is expected to look good regardless)")
 
         calib.cube_top_homography = matrix
+
+        # Residual layer: the per-location mapping error is stable to ~1mm
+        # but nonlinear in position -- store the per-target mean residual for
+        # smooth interpolation at read time (Calibration._residual_correction).
+        import numpy as np
+
+        hmat = np.array(matrix, dtype=np.float64)
+        by_target: dict[tuple[float, float], list[tuple[float, float]]] = {}
+        for (ppx, ppy), (rx, ry) in zip(fit_px, fit_rb):
+            v = hmat @ np.array([ppx, ppy, 1.0])
+            by_target.setdefault((rx, ry), []).append(
+                (rx - float(v[0] / v[2]), ry - float(v[1] / v[2]))
+            )
+        calib.cube_top_residual = {
+            "points": [[x, y] for (x, y) in by_target],
+            "deltas": [
+                [float(np.mean([d[0] for d in ds])), float(np.mean([d[1] for d in ds]))]
+                for ds in by_target.values()
+            ],
+            "sigma_mm": 60.0,
+            "reg": 0.25,
+        }
+        post = [
+            math.hypot(
+                calib.pixel_to_robot(ppx, ppy, on_cube_top=True)[0] - rx,
+                calib.pixel_to_robot(ppx, ppy, on_cube_top=True)[1] - ry,
+            )
+            for (ppx, ppy), (rx, ry) in zip(fit_px, fit_rb)
+        ]
+        print(f"With residual layer (mm): {[round(e, 2) for e in post]}")
+
         keep_probe_observations()
-        print(f"\nSaved cube_top_homography ({len(pixel_pts)} raw probe "
-              f"observations kept) to {args.calib}")
+        print(f"\nSaved cube_top_homography + residual layer ({len(pixel_pts)} "
+              f"raw probe observations kept) to {args.calib}")
         return 0
     except Mt4ClientError as exc:
         print(exc, file=sys.stderr)

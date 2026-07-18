@@ -127,8 +127,28 @@ def main() -> int:
             "especially for perspective."
         )
 
-    touch_px = {mid: (detected[mid].px, detected[mid].py) for mid in matched_ids}
-    touch_robot = {mid: old_robot[mid] for mid in matched_ids}
+    # Markers flagged exclude_from_fit keep their stored arm-frame robot XY
+    # as a *slot coordinate* but stay out of the map fit: marker 1's touch
+    # was recorded at the arm's reach limit where arm-frame and camera
+    # geometry disagree by ~30mm -- including it drags the whole similarity.
+    excluded = sorted(
+        mid for mid in matched_ids
+        if old_obs.get(str(mid), {}).get("exclude_from_fit")
+    )
+    fit_ids = [mid for mid in matched_ids if mid not in excluded]
+    if excluded:
+        print(f"Excluding marker(s) {excluded} from the fit (exclude_from_fit "
+              "set); their slots keep the stored arm-frame coordinates")
+    if len(fit_ids) < 3:
+        print(
+            f"error: only {len(fit_ids)} fit-eligible marker(s) after "
+            "exclusions -- need >=3",
+            file=sys.stderr,
+        )
+        return 1
+
+    touch_px = {mid: (detected[mid].px, detected[mid].py) for mid in fit_ids}
+    touch_robot = {mid: old_robot[mid] for mid in fit_ids}
     # Corners from EVERY visible marker, not just the matched ones -- the
     # bundle's perspective doesn't need robot XYs, only equal-size squares
     # (same superset behavior as calibrate_vision.py's ref_markers).
@@ -137,7 +157,7 @@ def main() -> int:
     }
 
     matrix, report = fit_table_map(marker_corners, touch_px, touch_robot)
-    print(f"\n{report.kind} fit from markers {matched_ids}")
+    print(f"\n{report.kind} fit from markers {fit_ids}")
     if report.corner_rms_px is not None:
         print(
             f"corner-bundle RMS: {report.corner_rms_px}px (~{report.corner_rms_mm}mm; "
@@ -205,9 +225,17 @@ def main() -> int:
         bundle_homography=report.bundle_h,
         raw_marker_observations={
             str(mid): {
-                "pixel": list(touch_px[mid]),
+                # Carry provenance/flags (exclude_from_fit, robot_source, ...)
+                # through the rebuild -- dropping them silently re-arms the
+                # marker-1 trap on the next refit.
+                **{
+                    k: v
+                    for k, v in old_obs.get(str(mid), {}).items()
+                    if k not in ("pixel", "corners", "robot")
+                },
+                "pixel": [detected[mid].px, detected[mid].py],
                 "corners": marker_corners.get(mid),
-                "robot": list(touch_robot[mid]),
+                "robot": list(old_robot[mid]),
             }
             for mid in matched_ids
         },
