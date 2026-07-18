@@ -28,7 +28,15 @@ from mt4_jog.joints import (
     JOG_SPEED_MAX_US,
     JOG_SPEED_MIN_US,
 )
-from mt4_jog.serial import FirmwareNotReadyError, await_firmware_alive, open_serial, read_lines, send
+from mt4_jog.console import format_firmware_line
+from mt4_jog.serial import (
+    FirmwareNotReadyError,
+    SerialGoneError,
+    await_firmware_alive,
+    open_serial,
+    read_lines,
+    send,
+)
 from mt4_jog.status import parse_tcp_line
 MOVE_TIMEOUT_S = 30.0
 # Matches jog_keyboard.py's HOME_WAIT_S -- the limit-switch seeks inside
@@ -58,7 +66,7 @@ def prompt_float(label: str, unit: str, default: float) -> float:
     try:
         return float(raw)
     except ValueError:
-        print(f"Not a number, using default {default:.1f}.", file=sys.stderr)
+        print(f"Not a number, using default {default:.1f}", file=sys.stderr)
         return default
 
 
@@ -69,7 +77,7 @@ def prompt_int(label: str, unit: str, default: int) -> int:
     try:
         return int(float(raw))
     except ValueError:
-        print(f"Not a number, using default {default}.", file=sys.stderr)
+        print(f"Not a number, using default {default}", file=sys.stderr)
         return default
 
 
@@ -80,12 +88,12 @@ def run_home(ser, j1: int, j2: int) -> bool:
     deadline = time.monotonic() + HOME_TIMEOUT_S
     while time.monotonic() < deadline:
         for line in read_lines(ser, 0.3):
-            print(line)
+            print(format_firmware_line(line))
             if line == "home ok":
                 return True
             if line.startswith("home fail"):
                 return False
-    print("Homing timed out.", file=sys.stderr)
+    print("Homing timed out", file=sys.stderr)
     return False
 
 
@@ -108,7 +116,7 @@ def send_move(
             print(line)
             if line.startswith("mp done") or line.startswith("err"):
                 return
-    print("Timed out waiting for the move to finish.", file=sys.stderr)
+    print("Timed out waiting for the move to finish", file=sys.stderr)
 
 
 def main() -> int:
@@ -132,7 +140,7 @@ def main() -> int:
     args = parser.parse_args()
     if args.speed != 0 and not JOG_SPEED_MIN_US <= args.speed <= JOG_SPEED_MAX_US:
         print(
-            f"--speed must be 0 or {JOG_SPEED_MIN_US}-{JOG_SPEED_MAX_US} us.",
+            f"--speed must be 0 or {JOG_SPEED_MIN_US}-{JOG_SPEED_MAX_US} us",
             file=sys.stderr,
         )
         return 2
@@ -140,34 +148,30 @@ def main() -> int:
     with open_serial(args.port, args.baud) as ser:
         try:
             await_firmware_alive(ser, port_label=args.port)
-        except FirmwareNotReadyError as exc:
-            print(exc, file=sys.stderr)
-            return 1
 
-        homed, tcp = query_status(ser)
-        if not homed:
-            print("Arm has not homed in this connection yet -- homing now.")
-            print("WARNING: homing drives J1/J2 to their limit switches -- clear the workspace.")
-            if not run_home(ser, args.j1_center, args.j2_pull):
-                print("Homing failed -- exiting.", file=sys.stderr)
+            homed, tcp = query_status(ser)
+            if not homed:
+                print("Arm has not homed in this connection yet -- homing now")
+                print("WARNING: homing drives J1/J2 to their limit switches -- clear the workspace")
+                if not run_home(ser, args.j1_center, args.j2_pull):
+                    print("Homing failed -- exiting", file=sys.stderr)
+                    return 1
+                homed, tcp = query_status(ser)
+            if not homed:
+                print("Still not homed after the home command -- exiting", file=sys.stderr)
                 return 1
-            homed, tcp = query_status(ser)
-        if not homed:
-            print("Still not homed after the home command -- exiting.", file=sys.stderr)
-            return 1
-        if tcp is None:
-            print("Could not read the arm's current position.", file=sys.stderr)
-            return 1
-        if args.speed > 0:
-            for line in send(ser, f"speed {args.speed}", wait=0.5):
-                print(line)
-            homed, tcp = query_status(ser)
             if tcp is None:
-                print("Could not read speed after --speed.", file=sys.stderr)
+                print("Could not read the arm's current position", file=sys.stderr)
                 return 1
+            if args.speed > 0:
+                for line in send(ser, f"speed {args.speed}", wait=0.5):
+                    print(line)
+                homed, tcp = query_status(ser)
+                if tcp is None:
+                    print("Could not read speed after --speed", file=sys.stderr)
+                    return 1
 
-        print("Enter blank to keep the current value. Ctrl-C to quit.\n")
-        try:
+            print("Enter blank to keep the current value. Ctrl-C to quit\n")
             while True:
                 print(
                     f"Current position: x={tcp['x']:.1f} y={tcp['y']:.1f} "
@@ -187,7 +191,7 @@ def main() -> int:
                 if speed != 0 and not JOG_SPEED_MIN_US <= speed <= JOG_SPEED_MAX_US:
                     speed = int(tcp["speed"])
                     print(
-                        f"Speed out of range, using current {speed}.",
+                        f"Speed out of range, using current {speed}",
                         file=sys.stderr,
                     )
                 print()
@@ -197,10 +201,16 @@ def main() -> int:
 
                 homed, tcp = query_status(ser)
                 if not homed or tcp is None:
-                    print("Lost homed/position state -- stopping.", file=sys.stderr)
+                    print("Lost homed/position state -- stopping", file=sys.stderr)
                     return 1
+        except SerialGoneError as exc:
+            print(exc, file=sys.stderr)
+            return 1
+        except FirmwareNotReadyError as exc:
+            print(exc, file=sys.stderr)
+            return 1
         except (KeyboardInterrupt, EOFError):
-            print("\nBye.")
+            print("\nBye")
 
     return 0
 

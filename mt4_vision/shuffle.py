@@ -144,13 +144,13 @@ class _VisionPrefetch:
 
 
 def _print_scene(scene: Scene) -> None:
-    print(f"scene: {scene.summary_line()}")
+    print(f"Scene: {scene.summary_line()}")
     for line in scene.cube_lines():
         print(line)
 
 
 def _print_action(action: Action) -> None:
-    print(f"action: {action.kind} -- {action.reason}")
+    print(f"Action: {action.kind} -- {action.reason}")
 
 
 def _action_targets(
@@ -231,7 +231,7 @@ def _plan_after_move(
             place_x=place_x,
             place_y=place_y,
         )
-    print(f"post-move check: {verdict} (after {attempts} recheck(s))")
+    print(f"Post-move check: {verdict} (after {attempts} recheck(s))")
     return scene, plan_shuffle(scene, avoid_xy=(place_x, place_y))
 
 
@@ -272,7 +272,7 @@ def _run_home(
     calib: Calibration,
     avoid_xy: tuple[float, float] | None = None,
 ) -> tuple[Scene, Action]:
-    print("homing (H)...")
+    print("Homing (H)...")
     client.clear_interrupt()
     try:
         client.stop()
@@ -280,7 +280,7 @@ def _run_home(
         pass
     prefetch.end_motion()
     home_arm(client)
-    print("home ok")
+    print("Home ok")
     return _plan_from_capture(prefetch, avoid_xy)
 
 
@@ -298,11 +298,11 @@ def run_shuffle_loop(
 ) -> None:
     """Home if needed, then shuffle cubes until interrupted."""
     if client.get_status().homed:
-        print("already homed")
+        print("Already homed")
     else:
-        print("homing...")
+        print("Homing...")
         home_arm(client)
-        print("home ok")
+        print("Home ok")
 
     watcher = _HomeKeyWatcher(client)
     watcher.start()
@@ -323,7 +323,7 @@ def run_shuffle_loop(
 
             targets = _action_targets(action)
             if targets is None:
-                print(f"waiting {retry_s:.0f}s for a clearer scene")
+                print(f"Waiting {retry_s:.0f}s for a clearer scene")
                 refreshed = _sleep_or_home(
                     retry_s, watcher, client, prefetch, calib, last_place
                 )
@@ -340,7 +340,7 @@ def run_shuffle_loop(
                 assert lookahead_targets is not None
                 moves.append(lookahead_targets)
                 print(
-                    f"lookahead: {lookahead.reason} -- also visible in this "
+                    f"Lookahead: {lookahead.reason} -- also visible in this "
                     f"capture, chaining it in (no capture in between)"
                 )
 
@@ -353,7 +353,7 @@ def run_shuffle_loop(
             prefetch.begin_motion()
             for mpick_x, mpick_y, mcolor, mplace_x, mplace_y in moves:
                 print(
-                    f"pick-and-place: {mcolor} ({mpick_x:.0f},{mpick_y:.0f}) "
+                    f"Pick-and-place: {mcolor} ({mpick_x:.0f},{mpick_y:.0f}) "
                     f"-> ({mplace_x:.0f},{mplace_y:.0f})"
                 )
                 try:
@@ -372,7 +372,7 @@ def run_shuffle_loop(
                 if _home_was_requested(watcher, failed_exc):
                     scene, action = _run_home(client, prefetch, calib, last_place)
                     continue
-                print(f"move failed: {failed_exc} -- retrying next cycle")
+                print(f"Move failed: {failed_exc} -- retrying next cycle")
                 refreshed = _sleep_or_home(
                     retry_s, watcher, client, prefetch, calib, last_place
                 )

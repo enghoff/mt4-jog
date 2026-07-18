@@ -28,7 +28,7 @@ from mt4_vision.workspace import (
 
 def _save_annotated(frame, path: str) -> None:
     cv2.imwrite(path, frame)
-    print(f"annotated frame saved to {path}")
+    print(f"Annotated frame saved to {path}")
 
 
 def cmd_markers(args: argparse.Namespace) -> int:
@@ -36,13 +36,13 @@ def cmd_markers(args: argparse.Namespace) -> int:
     if args.dict == "scan":
         hits = scan_marker_dicts(frame)
         if not hits:
-            print("no ArUco markers found with any known dictionary")
+            print("No ArUco markers found with any known dictionary")
             _save_annotated(frame, "markers_frame.jpg")
             return 1
         for name, count in sorted(hits.items(), key=lambda kv: -kv[1]):
             print(f"{name}: {count} markers")
         best = max(hits, key=hits.get)  # type: ignore[arg-type]
-        print(f"\nusing --dict {best} for detail:")
+        print(f"\nUsing --dict {best} for detail:")
         args.dict = best
     markers = detect_markers(frame, args.dict)
     for m in markers:
@@ -60,7 +60,7 @@ def cmd_scene(args: argparse.Namespace) -> int:
     try:
         calib = load_calibration(Path(args.calib))
     except Exception as exc:  # noqa: BLE001 -- scene is usable pre-calibration
-        print(f"(no calibration: {exc})")
+        print(f"(No calibration: {exc})")
         calib = None
     frame = capture_frame(args.camera)
     if calib is not None:
@@ -77,11 +77,11 @@ def cmd_scene(args: argparse.Namespace) -> int:
                 f"{cube.color}"
             )
         for marker in state.free_markers:
-            print(f"  marker {marker.marker_id} ({marker.x:.1f}, {marker.y:.1f}): empty")
+            print(f"  Marker {marker.marker_id} ({marker.x:.1f}, {marker.y:.1f}): empty")
     else:
         cubes = detect_cubes(frame, calib)
     if not cubes:
-        print("no cubes detected")
+        print("No cubes detected")
     for c in cubes:
         robot = f" robot ({c.x:.1f}, {c.y:.1f})" if c.x is not None else ""
         print(f"  {c.color}: pixel ({c.px:.0f}, {c.py:.0f}) area {c.area:.0f}px^2{robot}")
@@ -101,6 +101,7 @@ def _pick_place_client(args: argparse.Namespace):
 
 
 def cmd_pick(args: argparse.Namespace) -> int:
+    from mt4_jog.client import Mt4ClientError
     from mt4_vision.pickplace import pick
 
     calib = load_calibration(Path(args.calib))
@@ -109,56 +110,68 @@ def cmd_pick(args: argparse.Namespace) -> int:
         cubes_of_color(cubes_with_robot_coords(detect_cubes(frame, calib)), args.color)
     )
     if target is None:
-        print(f"no {args.color} cube in view")
+        print(f"No {args.color} cube in view")
         return 1
-    print(f"picking {args.color} at robot ({target.x:.1f}, {target.y:.1f})")
+    print(f"Picking {args.color} at robot ({target.x:.1f}, {target.y:.1f})")
     client = _pick_place_client(args)
     try:
         pick(client, calib, target.x, target.y)
+    except Mt4ClientError as exc:
+        print(exc, file=sys.stderr)
+        return 1
     finally:
         client.close()
-    print("done")
+    print("Done")
     return 0
 
 
 def cmd_place(args: argparse.Namespace) -> int:
+    from mt4_jog.client import Mt4ClientError
     from mt4_vision.pickplace import place
 
     calib = load_calibration(Path(args.calib))
     client = _pick_place_client(args)
     try:
         place(client, calib, args.x, args.y)
+    except Mt4ClientError as exc:
+        print(exc, file=sys.stderr)
+        return 1
     finally:
         client.close()
-    print("done")
+    print("Done")
     return 0
 
 
 def cmd_place_here(args: argparse.Namespace) -> int:
+    from mt4_jog.client import Mt4ClientError
     from mt4_vision.pickplace import place_here
 
     calib = load_calibration(Path(args.calib))
     client = _pick_place_client(args)
     try:
         tcp = client.get_tcp()
-        print(f"placing at current position ({tcp.x:.1f}, {tcp.y:.1f})")
+        print(f"Placing at current position ({tcp.x:.1f}, {tcp.y:.1f})")
         place_here(client, calib)
+    except Mt4ClientError as exc:
+        print(exc, file=sys.stderr)
+        return 1
     finally:
         client.close()
-    print("done")
+    print("Done")
     return 0
 
 
 def cmd_shuffle(args: argparse.Namespace) -> int:
     import time
 
+    from mt4_jog.client import Mt4ClientError
     from mt4_vision.shuffle import run_shuffle_loop
 
     calib = load_calibration(Path(args.calib))
     client = _pick_place_client(args)
     try:
         time.sleep(1.0)
-        print("shuffle loop started (Ctrl+C to stop, H to re-home)")
+        print("Shuffle loop started (Ctrl+C to stop, H in this terminal to re-home)")
         run_shuffle_loop(
             client,
             calib,
@@ -167,13 +180,17 @@ def cmd_shuffle(args: argparse.Namespace) -> int:
             retry_s=args.retry,
         )
     except KeyboardInterrupt:
-        print("\nstopped")
+        print("\nStopped")
+    except Mt4ClientError as exc:
+        print(exc, file=sys.stderr)
+        return 1
     finally:
         client.close()
     return 0
 
 
 def cmd_goto_marker(args: argparse.Namespace) -> int:
+    from mt4_jog.client import Mt4ClientError
     from mt4_vision.pickplace import goto_marker
 
     calib = load_calibration(Path(args.calib))
@@ -181,18 +198,21 @@ def cmd_goto_marker(args: argparse.Namespace) -> int:
     markers = detect_markers(frame, args.dict)
     match = next((m for m in markers if m.marker_id == args.marker_id), None)
     if match is None:
-        print(f"marker {args.marker_id} not in view (visible: "
+        print(f"Marker {args.marker_id} not in view (visible: "
               f"{sorted(m.marker_id for m in markers)})")
         return 1
     x, y = calib.pixel_to_robot(match.px, match.py)
-    print(f"marker {args.marker_id} at pixel ({match.px:.0f}, {match.py:.0f}) "
+    print(f"Marker {args.marker_id} at pixel ({match.px:.0f}, {match.py:.0f}) "
           f"-> robot ({x:.1f}, {y:.1f}){' -- touching table' if args.touch else ' -- hovering at safe_z'}")
     client = _pick_place_client(args)
     try:
         goto_marker(client, calib, x, y, touch=args.touch)
+    except Mt4ClientError as exc:
+        print(exc, file=sys.stderr)
+        return 1
     finally:
         client.close()
-    print("done")
+    print("Done")
     return 0
 
 

@@ -22,9 +22,11 @@ from mt4_jog.joints import (
     J2_HOME_PULLOFF_STEPS,
     LIMIT_JOINTS,
 )
+from mt4_jog.console import format_firmware_line, print_status
 from mt4_jog.ports import Mt4PortError, port_display, resolve_port
 from mt4_jog.serial import (
     FirmwareNotReadyError,
+    SerialGoneError,
     await_firmware_alive,
     drain_lines,
     open_serial,
@@ -123,18 +125,20 @@ def format_limit(line: str) -> str:
     joint = LIMIT_JOINTS.get(pin, "")
     label = f"{pin} {joint}" if joint else pin
     if parts[1] == "TRIG":
-        return f"{label} TRIGGERED (raw={raw})"
+        return f"{label} triggered (raw={raw})"
     return f"{label} released (raw={raw})"
 
 
 def drain_async(ser, buf: list[str], verbose: bool) -> None:
     for line in drain_lines(ser, buf):
         if line.startswith("lim "):
-            print(f"LIMIT: {format_limit(line[4:])}")
-        elif line.startswith("home ") or line.startswith("pos ") or line.startswith("ok speed "):
-            print(line)
+            print(f"Limit: {format_limit(line[4:])}")
+        elif line.startswith("home "):
+            print(format_firmware_line(line))
+        elif line.startswith("pos ") or line.startswith("ok speed "):
+            print(format_firmware_line(line))
         elif line.startswith("err cj"):
-            print(f"CART: {line}")
+            print(f"Cart: {line}")
         elif verbose:
             print(line, file=sys.stderr)
 
@@ -351,13 +355,13 @@ def run_home(ser, buf: list[str], j1: int, j2: int, verbose: bool) -> None:
         for line in drain_lines(ser, buf):
             if line.startswith("home ") or line.startswith("lim "):
                 if line.startswith("lim "):
-                    print(f"LIMIT: {format_limit(line[4:])}")
+                    print(f"Limit: {format_limit(line[4:])}")
                 else:
-                    print(line)
+                    print(format_firmware_line(line))
             if line == "home ok" or line.startswith("home fail"):
                 return
         time.sleep(0.02)
-    print("Homing timed out.", file=sys.stderr)
+    print("Homing timed out", file=sys.stderr)
 
 
 def gripper_sweep_open(ser) -> None:
@@ -414,14 +418,14 @@ def main() -> int:
     args = parser.parse_args()
 
     if sys.platform != "win32":
-        print("Requires Windows (GetAsyncKeyState / XInput).", file=sys.stderr)
+        print("Requires Windows (GetAsyncKeyState / XInput)", file=sys.stderr)
         return 1
 
     gamepad = None
     if not args.no_gamepad:
         gamepad = XboxGamepad(deadzone=args.gamepad_deadzone)
         if not gamepad.available:
-            print("XInput not available — keyboard only.", file=sys.stderr)
+            print("XInput not available — keyboard only", file=sys.stderr)
             gamepad = None
 
     try:
@@ -431,10 +435,10 @@ def main() -> int:
         return 1
 
     print_help(gamepad=gamepad is not None)
-    print(f"{port_display(port, baud=args.baud, explicit=args.port is not None)} — focus this window for keyboard.")
+    print(f"{port_display(port, baud=args.baud, explicit=args.port is not None)} — focus this window for keyboard")
     if gamepad is not None:
-        print("Xbox controller: plug in before start; sticks work without focus.")
-    print("WARNING: drivers energize while any jog key is held.")
+        print("Xbox controller: plug in before start; sticks work without focus")
+    print("WARNING: drivers energize while any jog key is held")
 
     poll_s = args.poll_ms / 1000.0
     buf: list[str] = [""]
@@ -452,14 +456,17 @@ def main() -> int:
     with open_serial(port, args.baud) as ser:
         try:
             await_firmware_alive(ser, port_label=port)
+            send(ser, "all f", wait=0.5)
+            send(ser, "orient off" if args.no_orient else "orient on", wait=0.3)
+            # Discard limit/status chatter from the handshake; SPACE still prints status.
+            drain_lines(ser, buf)
+            print("Ready")
         except FirmwareNotReadyError as exc:
             print(exc, file=sys.stderr)
             return 1
-        send(ser, "all f", wait=0.5)
-        send(ser, "orient off" if args.no_orient else "orient on", wait=0.3)
-        # Discard limit/status chatter from the handshake; SPACE still prints status.
-        drain_lines(ser, buf)
-        print("Ready")
+        except SerialGoneError as exc:
+            print(exc, file=sys.stderr)
+            return 1
 
         try:
             while True:
@@ -499,8 +506,7 @@ def main() -> int:
 
                 if key_down("space") or (pad is not None and pad.status):
                     active_cart, grip_state = clear_active_motion(ser)
-                    for line in send(ser, "?", wait=1.0):
-                        print(line)
+                    print_status(send(ser, "?", wait=1.0))
                     wait_until_released(
                         ser, buf, args.verbose, poll_s, gamepad=gamepad,
                         keyboard_keys=("space",), gamepad_mask=X,
@@ -567,15 +573,21 @@ def main() -> int:
                     last_grip_send = now
 
                 time.sleep(poll_s)
+        except SerialGoneError as exc:
+            print(exc, file=sys.stderr)
+            return 1
         except KeyboardInterrupt:
             print()
         finally:
-            stop_jog(ser)
-            gripper_sweep_stop(ser)
-            send(ser, "e0", wait=0.2)
-            send(ser, "all f", wait=0.3)
+            try:
+                stop_jog(ser)
+                gripper_sweep_stop(ser)
+                send(ser, "e0", wait=0.2)
+                send(ser, "all f", wait=0.3)
+            except SerialGoneError:
+                pass
 
-    print("Bye.")
+    print("Bye")
     return 0
 
 

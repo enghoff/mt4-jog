@@ -48,11 +48,11 @@ def main() -> int:
     print(f"This will flash STOCK firmware from:\n  {args.hex_path}")
     print(f"Target: {port_display(port, baud=args.baud, explicit=args.port is not None)} (avrdude -c wiring)")
     if not args.yes:
-        print("Press Enter to continue, Ctrl+C to abort.")
+        print("Press Enter to continue, Ctrl+C to abort")
         try:
             input()
         except KeyboardInterrupt:
-            print("\nAborted.")
+            print("\nAborted")
             return 1
 
     cmd = [

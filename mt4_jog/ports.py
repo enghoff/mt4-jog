@@ -137,7 +137,7 @@ def resolve_port(port: str | None, *, baud: int = DEFAULT_BAUD, probe: bool = Tr
     if found:
         return found
     raise Mt4PortError(
-        "Could not find an MT4 serial port. Plug in the arm or pass --port COMx."
+        "Could not find an MT4 serial port. Plug in the arm or pass --port COMx"
     )
 
 

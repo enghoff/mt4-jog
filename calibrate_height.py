@@ -131,7 +131,7 @@ def main() -> int:
         client.ensure_connected()
         status = client.get_status()
         if not status.homed:
-            print("homing first...")
+            print("Homing first...")
             home_arm(client)  # raises on failure instead of sailing on unhomed
             status = client.get_status()
         # No-op move at the current pose, purely to reset cruise speed (see
@@ -140,13 +140,13 @@ def main() -> int:
 
         grid = [(x, y) for x, y in GRID_POINTS if math.hypot(x, y) <= MAX_REACH_MM]
         if len(grid) < 5:
-            print(f"only {len(grid)} grid points within MAX_REACH_MM; need >=5", file=sys.stderr)
+            print(f"Only {len(grid)} grid points within MAX_REACH_MM; need >=5", file=sys.stderr)
             return 1
 
         frame = capture_frame(**camera_kwargs)
         cubes = [c for c in detect_cubes(frame, calib) if math.hypot(c.x, c.y) <= MAX_REACH_MM]
         if not cubes:
-            print("no reachable cube in view to use as a height probe", file=sys.stderr)
+            print("No reachable cube in view to use as a height probe", file=sys.stderr)
             return 1
         # Rotate through every reachable cube on repeated grasp failure --
         # the bootstrap map's error varies across the table, so a different
@@ -159,9 +159,9 @@ def main() -> int:
                 key=lambda e: math.hypot(e[1][0] - args.probe_at[0], e[1][1] - args.probe_at[1])
             )
         probe_color, probe_xy = probe_pool[0]
-        print(f"probe candidates: {[(c, (round(x), round(y))) for c, (x, y) in probe_pool]}")
-        print(f"using the {probe_color} cube at ({probe_xy[0]:.1f},{probe_xy[1]:.1f}) first")
-        print(f"sampling {len(grid)} points, holding out last {args.holdout} for validation")
+        print(f"Probe candidates: {[(c, (round(x), round(y))) for c, (x, y) in probe_pool]}")
+        print(f"Using the {probe_color} cube at ({probe_xy[0]:.1f},{probe_xy[1]:.1f}) first")
+        print(f"Sampling {len(grid)} points, holding out last {args.holdout} for validation")
 
         pixel_pts: list[tuple[float, float]] = []
         robot_pts: list[tuple[float, float]] = []
@@ -201,10 +201,10 @@ def main() -> int:
                     # Not visible but the arm knows where it left it -- e.g.
                     # the homed arm occludes that spot. Pick blind; the
                     # post-place check still validates the data point.
-                    print(f"\ntarget ({gx:.1f},{gy:.1f}): probe not visible, picking blind "
+                    print(f"\nTarget ({gx:.1f},{gy:.1f}): probe not visible, picking blind "
                           f"at arm-known ({known_xy[0]:.1f},{known_xy[1]:.1f})")
                 else:
-                    print(f"\ntarget ({gx:.1f},{gy:.1f}): lost track of the probe cube -- aborting", file=sys.stderr)
+                    print(f"\nTarget ({gx:.1f},{gy:.1f}): lost track of the probe cube -- aborting", file=sys.stderr)
                     return 1
             seen_xy = calib.pixel_to_robot(*pre_pick_px) if pre_pick_px else None
             if (
@@ -213,7 +213,7 @@ def main() -> int:
                 and math.hypot(seen_xy[0] - known_xy[0], seen_xy[1] - known_xy[1])
                 > PLACEMENT_SANITY_MM
             ):
-                print(f"  probe not where it was left (seen ~({seen_xy[0]:.0f},{seen_xy[1]:.0f}), "
+                print(f"  Probe not where it was left (seen ~({seen_xy[0]:.0f},{seen_xy[1]:.0f}), "
                       f"expected ({known_xy[0]:.0f},{known_xy[1]:.0f})) -- falling back to vision")
                 known_xy = None
             if known_xy is not None:
@@ -227,14 +227,14 @@ def main() -> int:
             else:
                 probe_xy = (seen_xy[0] + BOOTSTRAP_NUDGE_X_MM, seen_xy[1])
                 origin = "vision+nudge"
-            print(f"\ntarget ({gx:.1f},{gy:.1f}): probe at "
+            print(f"\nTarget ({gx:.1f},{gy:.1f}): probe at "
                   f"({probe_xy[0]:.1f},{probe_xy[1]:.1f}) [{origin}], picking...")
 
             try:
                 pick(client, calib, *probe_xy)
                 home_arm(client)
             except Mt4ClientError as exc:
-                print(f"  pick failed ({exc}), skipping this point")
+                print(f"  Pick failed ({exc}), skipping this point")
                 known_xy = None
                 continue
 
@@ -251,14 +251,14 @@ def main() -> int:
             ) < GRASP_FAIL_RADIUS_PX:
                 grasp_fails += 1
                 known_xy = None
-                print("  grasp likely failed (cube still at its start position), skipping")
+                print("  Grasp likely failed (cube still at its start position), skipping")
                 if grasp_fails >= 2 and len(probe_pool) > 1:
                     # The bootstrap map may be off where this cube sits --
                     # switch to a different cube in a better-mapped spot.
                     probe_pool.append(probe_pool.pop(0))
                     probe_color, probe_xy = probe_pool[0]
                     grasp_fails = 0
-                    print(f"  switching probe to the {probe_color} cube at "
+                    print(f"  Switching probe to the {probe_color} cube at "
                           f"({probe_xy[0]:.1f},{probe_xy[1]:.1f})")
                 continue
             grasp_fails = 0
@@ -269,7 +269,7 @@ def main() -> int:
                 place(client, calib, gx, gy)
                 home_arm(client)
             except Mt4ClientError as exc:
-                print(f"  place failed ({exc}), skipping this point")
+                print(f"  Place failed ({exc}), skipping this point")
                 known_xy = None
                 continue
             time.sleep(HOME_SETTLE_S)
@@ -281,19 +281,19 @@ def main() -> int:
             guess_px = _inverse_guess(calib, gx, gy)
             found = find_probe(frame, probe_color, guess_px)
             if found is None:
-                print(f"  could not find {probe_color} probe near ({gx:.1f},{gy:.1f}), skipping")
+                print(f"  Could not find {probe_color} probe near ({gx:.1f},{gy:.1f}), skipping")
                 known_xy = None
                 continue
 
             raw_x, raw_y = calib.pixel_to_robot(found.px, found.py)
             sanity_err = math.hypot(raw_x - gx, raw_y - gy)
             if sanity_err > PLACEMENT_SANITY_MM:
-                print(f"  detected position ({raw_x:.1f},{raw_y:.1f}) is {sanity_err:.0f}mm "
+                print(f"  Detected position ({raw_x:.1f},{raw_y:.1f}) is {sanity_err:.0f}mm "
                       f"from the target -- likely a bad placement, discarding")
                 known_xy = None
                 continue
 
-            print(f"  probe detected at pixel ({found.px:.1f},{found.py:.1f}), "
+            print(f"  Probe detected at pixel ({found.px:.1f},{found.py:.1f}), "
                   f"raw estimate ({raw_x:.1f},{raw_y:.1f}) [{sanity_err:.0f}mm off]")
             pixel_pts.append((found.px, found.py))
             robot_pts.append((gx, gy))
@@ -339,19 +339,22 @@ def main() -> int:
 
         errors = reprojection_errors(matrix, fit_px, fit_rb)
         print(f"\n{kind} fit from {len(fit_px)} point(s)")
-        print(f"in-fit reprojection error (mm): {[round(e, 2) for e in errors]}")
+        print(f"In-fit reprojection error (mm): {[round(e, 2) for e in errors]}")
 
         if holdout:
             held_px = pixel_pts[-holdout:]
             held_rb = robot_pts[-holdout:]
             held_errors = reprojection_errors(matrix, held_px, held_rb)
-            print(f"held-out validation error (mm): {[round(e, 2) for e in held_errors]}")
-            print("(this is the number that matters -- in-fit error is expected to look good regardless)")
+            print(f"Held-out validation error (mm): {[round(e, 2) for e in held_errors]}")
+            print("(This is the number that matters -- in-fit error is expected to look good regardless)")
 
         calib.cube_top_homography = matrix
         calib.save(Path(args.calib))
-        print(f"\nsaved cube_top_homography to {args.calib}")
+        print(f"\nSaved cube_top_homography to {args.calib}")
         return 0
+    except Mt4ClientError as exc:
+        print(exc, file=sys.stderr)
+        return 1
     finally:
         client.close()
 

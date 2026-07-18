@@ -45,10 +45,11 @@ from jog_keyboard import (
     CJ_RESEND_S,
     GRIP_RESEND_S,
 )
+from mt4_jog.console import print_status
 from mt4_jog.gamepad import A, B, BACK, START, X, Y, XboxGamepad
 from mt4_jog.joints import DEFAULT_BAUD, J1_HOME_CENTER_STEPS, J2_HOME_PULLOFF_STEPS
 from mt4_jog.ports import Mt4PortError, port_display, resolve_port
-from mt4_jog.serial import FirmwareNotReadyError, await_firmware_alive, open_serial, send, send_quick
+from mt4_jog.serial import FirmwareNotReadyError, SerialGoneError, await_firmware_alive, open_serial, send, send_quick
 from mt4_jog.status import Mt4Status, parse_status_lines
 
 # Calibration-only keys, merged into jog_keyboard's VK table.
@@ -114,7 +115,7 @@ def prompt_float(label: str, default: float) -> float:
         try:
             return float(raw)
         except ValueError:
-            print("  enter a number")
+            print("  Enter a number")
 
 
 def query_status(ser, buf: list[str], verbose: bool) -> Mt4Status:
@@ -132,10 +133,10 @@ def record_marker(
 ) -> None:
     status = query_status(ser, buf, verbose)
     if status.tcp is None:
-        print("record failed: no TCP pose in status reply, try again")
+        print("Record failed: no TCP pose in status reply, try again")
         return
     if not status.homed:
-        print("record failed: arm reports not homed -- press H to home first")
+        print("Record failed: arm reports not homed -- press H to home first")
         return
     tcp = status.tcp
     verb = "updated" if marker_id in recorded else "recorded"
@@ -158,10 +159,10 @@ def autodetect_touched_marker(cap, dict_name: str, ref_ids: set[int]) -> int | N
     if len(missing) == 1:
         return missing[0]
     if not missing:
-        print("record failed: all markers still visible -- is the TCP on one? "
+        print("Record failed: all markers still visible -- is the TCP on one? "
               "Use a digit key to record explicitly.")
     else:
-        print(f"record ambiguous: markers {missing} all hidden -- "
+        print(f"Record ambiguous: markers {missing} all hidden -- "
               "use a digit key to record explicitly.")
     return None
 
@@ -183,7 +184,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if sys.platform != "win32":
-        print("Requires Windows (GetAsyncKeyState / XInput).", file=sys.stderr)
+        print("Requires Windows (GetAsyncKeyState / XInput)", file=sys.stderr)
         return 1
 
     # Import late so a missing cv2 fails with a clear message, not at startup
@@ -203,7 +204,7 @@ def main() -> int:
     prev = None
     try:
         prev = load_calibration(output)
-        print(f"existing calibration at {output} -- grip/color settings carried over")
+        print(f"Existing calibration at {output} -- grip/color settings carried over")
     except Exception:  # noqa: BLE001 -- absent or unreadable both mean "fresh"
         pass
 
@@ -211,7 +212,7 @@ def main() -> int:
     if not args.no_gamepad:
         gamepad = XboxGamepad(deadzone=args.gamepad_deadzone)
         if not gamepad.available:
-            print("XInput not available — keyboard only.", file=sys.stderr)
+            print("XInput not available — keyboard only", file=sys.stderr)
             gamepad = None
 
     try:
@@ -227,8 +228,8 @@ def main() -> int:
         return 1
 
     print_help(gamepad=gamepad is not None)
-    print(f"{port_display(port, baud=args.baud, explicit=args.port is not None)} — focus this window for keyboard.")
-    print("WARNING: drivers energize while any jog key is held.")
+    print(f"{port_display(port, baud=args.baud, explicit=args.port is not None)} — focus this window for keyboard")
+    print("WARNING: drivers energize while any jog key is held")
     print()
 
     poll_s = args.poll_ms / 1000.0
@@ -240,14 +241,14 @@ def main() -> int:
     with open_serial(port, args.baud) as ser:
         try:
             await_firmware_alive(ser, port_label=port)
-        except FirmwareNotReadyError as exc:
+            send(ser, "all f", wait=0.5)
+            send(ser, "orient on", wait=0.3)
+
+            print("Homing first (clear the workspace)...")
+            run_home(ser, buf, args.j1_center, args.j2_pull, args.verbose)
+        except (FirmwareNotReadyError, SerialGoneError) as exc:
             print(exc, file=sys.stderr)
             return 1
-        send(ser, "all f", wait=0.5)
-        send(ser, "orient on", wait=0.3)
-
-        print("Homing first (clear the workspace)...")
-        run_home(ser, buf, args.j1_center, args.j2_pull, args.verbose)
 
         # Reference frame after homing: the arm sits clear of the table, so
         # every physically present marker should be visible here.
@@ -262,7 +263,7 @@ def main() -> int:
             return 1
         ref_ids = {m.marker_id for m in ref_markers}
         ref_px = {m.marker_id: (m.px, m.py) for m in ref_markers}
-        print(f"markers in view: {sorted(ref_ids)} -- record at least 3 reachable ones")
+        print(f"Markers in view: {sorted(ref_ids)} -- record at least 3 reachable ones")
         print()
 
         active_cart: tuple[tuple[int, int, int] | None, int] | None = None
@@ -306,7 +307,7 @@ def main() -> int:
                         marker_id = int(digit)
                         active_cart, grip_state = clear_active_motion(ser)
                         if marker_id not in ref_ids:
-                            print(f"marker {marker_id} is not in the camera's view "
+                            print(f"Marker {marker_id} is not in the camera's view "
                                   f"(visible: {sorted(ref_ids)})")
                         else:
                             record_marker(ser, buf, args.verbose, marker_id, recorded)
@@ -324,10 +325,10 @@ def main() -> int:
                     active_cart, grip_state = clear_active_motion(ser)
                     status = query_status(ser, buf, args.verbose)
                     if status.tcp is None:
-                        print("grip record failed: no TCP pose in status reply")
+                        print("Grip record failed: no TCP pose in status reply")
                     else:
                         grip_pose = (status.tcp.z, status.tcp.grip)
-                        print(f"grip pose recorded: pick_z {grip_pose[0]:.1f}, "
+                        print(f"Grip pose recorded: pick_z {grip_pose[0]:.1f}, "
                               f"gripper S {grip_pose[1]:.0f}")
                 g_was_down = g_down
 
@@ -342,8 +343,7 @@ def main() -> int:
 
                 if key_down("space") or pad_edges & X:
                     active_cart, grip_state = clear_active_motion(ser)
-                    for line in send(ser, "?", wait=1.0):
-                        print(line)
+                    print_status(send(ser, "?", wait=1.0))
                     wait_until_released(
                         ser, buf, args.verbose, poll_s, gamepad=gamepad,
                         keyboard_keys=("space",), gamepad_mask=X,
@@ -408,13 +408,19 @@ def main() -> int:
                     last_grip_send = now
 
                 time.sleep(poll_s)
+        except SerialGoneError as exc:
+            print(exc, file=sys.stderr)
+            return 1
         except KeyboardInterrupt:
             print()
         finally:
-            stop_jog(ser)
-            gripper_sweep_stop(ser)
-            send(ser, "e0", wait=0.2)
-            send(ser, "all f", wait=0.3)
+            try:
+                stop_jog(ser)
+                gripper_sweep_stop(ser)
+                send(ser, "e0", wait=0.2)
+                send(ser, "all f", wait=0.3)
+            except SerialGoneError:
+                pass
             cap.release()
 
     if finish and len(recorded) >= 3:
@@ -429,11 +435,11 @@ def main() -> int:
         matrix, report = fit_table_map(marker_corners, touch_px, touch_robot)
         print(f"\n{report.kind} fit from markers {sorted(recorded)}")
         if report.corner_rms_px is not None:
-            print(f"corner-bundle RMS: {report.corner_rms_px}px "
+            print(f"Corner-bundle RMS: {report.corner_rms_px}px "
                   f"(~{report.corner_rms_mm}mm; >1px suggests lens distortion)")
-        print(f"per-marker touch residual (mm): {report.touch_residuals_mm}")
+        print(f"Per-marker touch residual (mm): {report.touch_residuals_mm}")
         if report.touch_loo_mm:
-            print(f"per-marker leave-one-out error (mm): {report.touch_loo_mm}")
+            print(f"Per-marker leave-one-out error (mm): {report.touch_loo_mm}")
         for note in report.notes:
             print(f"NOTE: {note}")
         # A touch that disagrees with the camera's own geometry by this much
@@ -442,14 +448,14 @@ def main() -> int:
         # ids 2 and 3 swapped, once cost a full recalibration).
         suspects = [m for m, e in report.touch_residuals_mm.items() if e > 25.0]
         if suspects:
-            print(f"WARNING: markers {suspects} disagree with the camera geometry by >25mm.")
+            print(f"WARNING: markers {suspects} disagree with the camera geometry by >25mm")
             print("  Most likely the wrong digit was pressed at those markers --")
-            print("  re-jog to each and re-record before trusting this calibration.")
+            print("  Re-jog to each and re-record before trusting this calibration")
 
         # TCP Z while touching a marker IS the table height at that spot.
         table_z_default = round(statistics.median(z for _x, _y, z in recorded.values()), 1)
         cube_default = prev.cube_height_mm if prev else 30.0
-        print("\nHeights (robot-frame Z, mm) and gripper -- Enter accepts defaults.")
+        print("\nHeights (robot-frame Z, mm) and gripper -- Enter accepts defaults")
         table_z = prompt_float("table_z", table_z_default)
         cube = prompt_float("cube edge length", cube_default)
         pick_z_default = round(grip_pose[0], 1) if grip_pose else round(table_z + cube / 2, 1)
@@ -489,13 +495,13 @@ def main() -> int:
         )
         calib.save(output)
         saved = True
-        print(f"\nsaved to {output}")
+        print(f"\nSaved to {output}")
     elif finish:
-        print(f"\nonly {len(recorded)} marker(s) recorded; need >=3 -- nothing saved")
+        print(f"\nOnly {len(recorded)} marker(s) recorded; need >=3 -- nothing saved")
     elif recorded:
-        print(f"\nquit without saving ({len(recorded)} marker(s) had been recorded)")
+        print(f"\nQuit without saving ({len(recorded)} marker(s) had been recorded)")
 
-    print("Bye.")
+    print("Bye")
     return 0 if saved or not finish else 1
 
 

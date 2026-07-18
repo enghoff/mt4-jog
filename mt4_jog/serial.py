@@ -26,6 +26,32 @@ class FirmwareNotReadyError(Exception):
     """Raised when the port opens but application firmware never answers `?`."""
 
 
+class SerialGoneError(Exception):
+    """Serial port disappeared mid-session (unplug, power-off, access denied)."""
+
+
+def _port_label(ser: serial.Serial) -> str:
+    return str(getattr(ser, "port", None) or "serial port")
+
+
+def _raise_gone(ser: serial.Serial, exc: BaseException) -> None:
+    raise SerialGoneError(
+        f"Lost connection to {_port_label(ser)} "
+        "(unplugged, powered off, or another program took the port)"
+    ) from exc
+
+
+def close_quiet(ser: serial.Serial | None) -> None:
+    """Close without raising if the port is already gone."""
+    if ser is None:
+        return
+    try:
+        if ser.is_open:
+            ser.close()
+    except Exception:
+        pass
+
+
 def open_serial(port: str | None = None, baud: int = DEFAULT_BAUD) -> serial.Serial:
     port = resolve_port(port, baud=baud)
     ser = serial.Serial()
@@ -48,15 +74,18 @@ def read_lines(
     deadline = start + timeout
     cap = start + hard_limit if hard_limit is not None else None
     chunks: list[bytes] = []
-    while time.monotonic() < deadline:
-        waiting = ser.in_waiting
-        if waiting:
-            chunks.append(ser.read(waiting))
-            deadline = time.monotonic() + 0.1
-            if cap is not None:
-                deadline = min(deadline, cap)
-        else:
-            time.sleep(0.02)
+    try:
+        while time.monotonic() < deadline:
+            waiting = ser.in_waiting
+            if waiting:
+                chunks.append(ser.read(waiting))
+                deadline = time.monotonic() + 0.1
+                if cap is not None:
+                    deadline = min(deadline, cap)
+            else:
+                time.sleep(0.02)
+    except (serial.SerialException, OSError) as exc:
+        _raise_gone(ser, exc)
     text = b"".join(chunks).decode("utf-8", "replace")
     return [line.rstrip() for line in text.splitlines() if line.rstrip()]
 
@@ -68,22 +97,39 @@ def send(
     *,
     hard_limit: float | None = None,
 ) -> list[str]:
-    ser.write(f"{cmd}\n".encode("ascii"))
-    ser.flush()
+    try:
+        ser.write(f"{cmd}\n".encode("ascii"))
+        ser.flush()
+    except (serial.SerialException, OSError) as exc:
+        _raise_gone(ser, exc)
     time.sleep(0.05)
     return read_lines(ser, wait, hard_limit=hard_limit)
 
 
 def send_quick(ser: serial.Serial, cmd: str) -> None:
-    ser.write(f"{cmd}\n".encode("ascii"))
-    ser.flush()
+    try:
+        ser.write(f"{cmd}\n".encode("ascii"))
+        ser.flush()
+    except (serial.SerialException, OSError) as exc:
+        _raise_gone(ser, exc)
+
+
+def write_raw(ser: serial.Serial, data: bytes) -> None:
+    try:
+        ser.write(data)
+        ser.flush()
+    except (serial.SerialException, OSError) as exc:
+        _raise_gone(ser, exc)
 
 
 def drain_lines(ser: serial.Serial, buffer: list[str] | None = None) -> list[str]:
     if buffer is None:
         buffer = [""]
-    if ser.in_waiting:
-        buffer[0] += ser.read(ser.in_waiting).decode("utf-8", "replace")
+    try:
+        if ser.in_waiting:
+            buffer[0] += ser.read(ser.in_waiting).decode("utf-8", "replace")
+    except (serial.SerialException, OSError) as exc:
+        _raise_gone(ser, exc)
     lines: list[str] = []
     while "\n" in buffer[0]:
         line, buffer[0] = buffer[0].split("\n", 1)
@@ -138,5 +184,5 @@ def await_firmware_alive(
 
     raise FirmwareNotReadyError(
         f"{label} opened but the MT4 firmware never responded to `?` "
-        "(device stuck in bootloader or not an MT4?)"
+        "(device stuck in bootloader or not an MT4)"
     )

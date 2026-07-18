@@ -256,7 +256,7 @@ def control_consistency(client: Mt4Client, safe_z: float) -> dict:
     client.ensure_connected()
     st = client.get_status()
     if not st.homed:
-        print("homing arm...")
+        print("Homing arm...")
         client.home()
         time.sleep(0.5)
 
@@ -317,7 +317,7 @@ def main() -> int:
     calib = load_calibration(Path(args.calib))
     cam = args.camera if args.camera is not None else -1
 
-    print("capturing scene...")
+    print("Capturing scene...")
     frame = capture_frame(cam)
 
     report: dict = {
@@ -328,27 +328,27 @@ def main() -> int:
         "cube_height_mm": calib.cube_height_mm,
     }
 
-    print("1/5 table-plane calibration residuals...")
+    print("1/5 Table-plane calibration residuals...")
     report["1_table_plane_calibration"] = table_plane_residuals(calib)
     print("   ", report["1_table_plane_calibration"])
 
-    print("2/5 camera align / marker drift...")
+    print("2/5 Camera align / marker drift...")
     report["2_camera_align"] = camera_align_drift(calib, frame)
-    print("   drift:", report["2_camera_align"]["pixel_drift"])
-    print("   live map vs touch:", report["2_camera_align"]["live_map_vs_touch"])
+    print("   Drift:", report["2_camera_align"]["pixel_drift"])
+    print("   Live map vs touch:", report["2_camera_align"]["live_map_vs_touch"])
 
-    print("3/5 cube-top parallax gap...")
+    print("3/5 Cube-top parallax gap...")
     report["3_cube_top_parallax"] = cube_top_gap(
         calib, frame, Path(args.cubetop_backup)
     )
-    print("   live cube_top:", report["3_cube_top_parallax"]["live_cube_top_homography"])
+    print("   Live cube_top:", report["3_cube_top_parallax"]["live_cube_top_homography"])
     print(
-        "   est pick error:",
+        "   Est pick error:",
         report["3_cube_top_parallax"].get("estimated_pick_error_without_cubetop")
         or report["3_cube_top_parallax"].get("live_table_vs_cubetop"),
     )
 
-    print(f"4/5 visual detection noise ({args.noise_frames} frames)...")
+    print(f"4/5 Visual detection noise ({args.noise_frames} frames)...")
     report["4_visual_detection_noise"] = detection_noise(calib, cam, args.noise_frames)
     print("   ", report["4_visual_detection_noise"]["centroid_rms"])
 
@@ -407,7 +407,7 @@ def main() -> int:
     if p.get("live_cube_top_homography") == "NULL":
         print(
             "\nWARNING: live vision_calibration.json has cube_top_homography=null. "
-            "Cube picks currently use the table-plane map (typical 5–27mm parallax error)."
+            "Cube picks currently use the table-plane map (typical 5–27mm parallax error)"
         )
 
     out = {
@@ -416,7 +416,7 @@ def main() -> int:
     }
     if args.json:
         Path(args.json).write_text(json.dumps(out, indent=2), encoding="utf-8")
-        print(f"\nwrote {args.json}")
+        print(f"\nWrote {args.json}")
     else:
         # Always dump a compact json blob at the end for machine use
         print("\n--- JSON ---")
@@ -428,5 +428,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as exc:  # noqa: BLE001
-        print(f"diagnose failed: {exc}", file=sys.stderr)
+        print(f"Diagnose failed: {exc}", file=sys.stderr)
         raise

@@ -85,7 +85,7 @@ def main() -> int:
     try:
         prev = load_calibration(calib_path)
     except CalibrationError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"Error: {exc}", file=sys.stderr)
         return 1
 
     old_obs = prev.raw_marker_observations or {}
@@ -99,7 +99,7 @@ def main() -> int:
         )
         return 1
 
-    print(f"loaded {calib_path}: {len(old_robot)} marker(s) with known robot XY: {sorted(old_robot)}")
+    print(f"Loaded {calib_path}: {len(old_robot)} marker(s) with known robot XY: {sorted(old_robot)}")
 
     cap = open_camera(args.camera)
     try:
@@ -111,7 +111,7 @@ def main() -> int:
     matched_ids = sorted(set(old_robot) & set(detected))
     missing = sorted(set(old_robot) - set(detected))
     if missing:
-        print(f"note: marker(s) {missing} not visible in this frame (occluded/out of view?) -- skipped")
+        print(f"Note: marker(s) {missing} not visible in this frame (occluded/out of view?) -- skipped")
     if len(matched_ids) < 3:
         print(
             f"error: only {len(matched_ids)} marker(s) both visible now and in the "
@@ -143,9 +143,9 @@ def main() -> int:
             f"corner-bundle RMS: {report.corner_rms_px}px (~{report.corner_rms_mm}mm; "
             ">1px suggests lens distortion)"
         )
-    print(f"per-marker residual vs. stored robot XY (mm): {report.touch_residuals_mm}")
+    print(f"Per-marker residual vs. stored robot XY (mm): {report.touch_residuals_mm}")
     if report.touch_loo_mm:
-        print(f"per-marker leave-one-out error (mm): {report.touch_loo_mm}")
+        print(f"Per-marker leave-one-out error (mm): {report.touch_loo_mm}")
     for note in report.notes:
         print(f"NOTE: {note}")
 
@@ -156,7 +156,7 @@ def main() -> int:
     if suspects:
         print(
             f"\nWARNING: marker(s) {suspects} disagree with the new camera geometry "
-            f"by >{SUSPECT_RESIDUAL_MM}mm (worst of in-fit and leave-one-out error)."
+            f"by >{SUSPECT_RESIDUAL_MM}mm (worst of in-fit and leave-one-out error)"
         )
         print(
             "  This usually means that marker (or the robot) moved, or its stored "
@@ -166,21 +166,21 @@ def main() -> int:
         )
 
     if args.dry_run:
-        print("\n--dry-run: not writing anything.")
+        print("\n--dry-run: not writing anything")
         return 1 if suspects else 0
 
     if prev.cube_top_homography is not None:
         print(
-            "\ncube_top_homography cleared -- it was fit at the old camera pose "
+            "\nCube_top_homography cleared -- it was fit at the old camera pose "
             "and does not carry over. Run calibrate_height.py next (fully "
             "automatic, no touching required) before picking cubes; until then, "
-            "cube picks fall back to the less accurate table-plane map."
+            "cube picks fall back to the less accurate table-plane map"
         )
     if prev.cam_xy_robot is not None or prev.cam_height_mm is not None:
         print(
-            "cam_xy_robot/cam_height_mm cleared -- they encode the OLD camera's "
+            "Cam_xy_robot/cam_height_mm cleared -- they encode the OLD camera's "
             "position for the parallax fallback, which would misdirect cube "
-            "picks at the new pose."
+            "picks at the new pose"
         )
 
     backup_dir = calib_path.parent / "backups"
@@ -189,7 +189,7 @@ def main() -> int:
     backup_path = backup_dir / f"{calib_path.stem}_pre_recalibrate_{stamp}{calib_path.suffix}"
     if calib_path.exists():
         shutil.copy2(calib_path, backup_path)
-        print(f"\nbacked up previous calibration to {backup_path}")
+        print(f"\nBacked up previous calibration to {backup_path}")
 
     new_calib = Calibration(
         homography=matrix,
@@ -226,7 +226,7 @@ def main() -> int:
         ).reshape(-1, 2).tolist(),
     )
     new_calib.save(output_path)
-    print(f"saved refit calibration to {output_path}")
+    print(f"Saved refit calibration to {output_path}")
     return 0
 
 

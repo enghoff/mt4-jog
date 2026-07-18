@@ -19,10 +19,13 @@ from mt4_jog.joints import (
 from mt4_jog.serial import (
     FirmwareNotReadyError,
     STATUS_WAIT_S,
+    SerialGoneError,
     await_firmware_alive,
+    close_quiet,
     open_serial,
     read_lines,
     send,
+    write_raw,
 )
 from mt4_jog.status import Mt4Status, TcpPose, parse_status_lines, parse_tcp_line
 
@@ -96,19 +99,22 @@ class Mt4Client:
         try:
             await_firmware_alive(self._ser, port_label=self.port or "auto-detected port")
         except FirmwareNotReadyError as exc:
-            self._ser.close()
+            close_quiet(self._ser)
+            self._ser = None
+            raise Mt4ClientError(str(exc)) from exc
+        except SerialGoneError as exc:
+            close_quiet(self._ser)
             self._ser = None
             raise Mt4ClientError(str(exc)) from exc
         except Exception:
-            self._ser.close()
+            close_quiet(self._ser)
             self._ser = None
             raise
 
     def close(self) -> None:
         with self._lock:
-            if self._ser is not None:
-                self._ser.close()
-                self._ser = None
+            close_quiet(self._ser)
+            self._ser = None
 
     def _require_serial(self) -> serial_module.Serial:
         if not self.connected:
@@ -116,24 +122,37 @@ class Mt4Client:
         assert self._ser is not None
         return self._ser
 
+    def _mark_gone_unlocked(self, exc: SerialGoneError) -> None:
+        close_quiet(self._ser)
+        self._ser = None
+        raise Mt4ClientError(str(exc)) from exc
+
     def _send_and_collect(self, cmd: str, wait: float) -> list[str]:
         ser = self._require_serial()
-        return send(
-            ser,
-            cmd,
-            wait=wait,
-            hard_limit=wait + READ_HARD_LIMIT_S,
-        )
+        try:
+            return send(
+                ser,
+                cmd,
+                wait=wait,
+                hard_limit=wait + READ_HARD_LIMIT_S,
+            )
+        except SerialGoneError as exc:
+            self._mark_gone_unlocked(exc)
+            raise  # unreachable; keeps type-checkers happy
 
     def _drain_serial_unlocked(self) -> list[str]:
         """Discard any unread firmware lines (stale status, prior home ok, etc.)."""
         ser = self._require_serial()
         drained: list[str] = []
-        while True:
-            batch = read_lines(ser, 0.05, hard_limit=0.12)
-            if not batch:
-                break
-            drained.extend(batch)
+        try:
+            while True:
+                batch = read_lines(ser, 0.05, hard_limit=0.12)
+                if not batch:
+                    break
+                drained.extend(batch)
+        except SerialGoneError as exc:
+            self._mark_gone_unlocked(exc)
+            raise
         return drained
 
     def _get_status_unlocked(self, *, retries: int = 1) -> Mt4Status:
@@ -242,7 +261,13 @@ class Mt4Client:
             aborted = self._abort_if_interrupted_unlocked(collected)
             if aborted is not None:
                 return aborted
-            lines = read_lines(ser, POLL_WAIT_S, hard_limit=POLL_WAIT_S + READ_HARD_LIMIT_S)
+            try:
+                lines = read_lines(
+                    ser, POLL_WAIT_S, hard_limit=POLL_WAIT_S + READ_HARD_LIMIT_S
+                )
+            except SerialGoneError as exc:
+                self._mark_gone_unlocked(exc)
+                raise
             collected.extend(lines)
             result = scan(lines)
             if result is not None:
@@ -262,8 +287,11 @@ class Mt4Client:
             ser = self._require_serial()
             self._drain_serial_unlocked()
             cmd = f"home {j1_center} {j2_pull}\n".encode("ascii")
-            ser.write(cmd)
-            ser.flush()
+            try:
+                write_raw(ser, cmd)
+            except SerialGoneError as exc:
+                self._mark_gone_unlocked(exc)
+                raise
             collected: list[str] = []
             saw_home_start = False
             resent = False
@@ -278,10 +306,19 @@ class Mt4Client:
                     # No ack yet -- the command was likely swallowed (MCU
                     # reset since connect). Re-send once; if homing actually
                     # is running, the firmware discards this line unread.
-                    ser.write(cmd)
-                    ser.flush()
+                    try:
+                        write_raw(ser, cmd)
+                    except SerialGoneError as exc:
+                        self._mark_gone_unlocked(exc)
+                        raise
                     resent = True
-                lines = read_lines(ser, POLL_WAIT_S, hard_limit=POLL_WAIT_S + READ_HARD_LIMIT_S)
+                try:
+                    lines = read_lines(
+                        ser, POLL_WAIT_S, hard_limit=POLL_WAIT_S + READ_HARD_LIMIT_S
+                    )
+                except SerialGoneError as exc:
+                    self._mark_gone_unlocked(exc)
+                    raise
                 collected.extend(lines)
                 for line in lines:
                     if line == "home start":

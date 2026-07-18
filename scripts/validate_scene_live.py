@@ -42,11 +42,11 @@ def main() -> int:
             client = Mt4Client() if args.port is None else Mt4Client(port=args.port)
             time.sleep(0.5)
             status = client.get_status()
-            print(f"arm: homed={status.homed} tcp={status.tcp}")
+            print(f"Arm: homed={status.homed} tcp={status.tcp}")
             if not status.homed:
-                print("homing...")
+                print("Homing...")
                 home_arm(client)
-            print("retreating to camera park...")
+            print("Retreating to camera park...")
             retreat_for_camera(client, calib)
 
         for i in range(args.cycles):
@@ -56,18 +56,18 @@ def main() -> int:
             scene = capture_scene(calib, grab_frame(cap))
             action = plan_shuffle(scene)
             print(f"\n--- cycle {i} ---")
-            print(f"scene: {scene.summary_line()}")
+            print(f"Scene: {scene.summary_line()}")
             for line in scene.cube_lines():
                 print(line)
             print(
                 f"placeable markers: "
                 f"{sorted(m.marker_id for m in scene.placeable_markers())}"
             )
-            print(f"action: {action.kind} -- {action.reason}")
-        print("\nvalidation ok")
+            print(f"Action: {action.kind} -- {action.reason}")
+        print("\nValidation ok")
         return 0
     except Mt4ClientError as exc:
-        print(f"arm error: {exc}")
+        print(f"Arm error: {exc}")
         return 1
     finally:
         cap.release()

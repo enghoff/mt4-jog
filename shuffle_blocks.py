@@ -16,7 +16,7 @@ import argparse
 import sys
 import time
 
-from mt4_jog.client import Mt4Client
+from mt4_jog.client import Mt4Client, Mt4ClientError
 from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
 from mt4_vision.camera import DEFAULT_CAMERA_INDEX
 from mt4_vision.shuffle import run_shuffle_loop
@@ -46,7 +46,7 @@ def main() -> int:
     client = Mt4Client() if args.port is None else Mt4Client(port=args.port)
     try:
         time.sleep(1.0)
-        print("shuffle loop started (Ctrl+C to stop, H to re-home)")
+        print("Shuffle loop started (Ctrl+C to stop, H in this terminal to re-home)")
         run_shuffle_loop(
             client,
             calib,
@@ -55,10 +55,14 @@ def main() -> int:
             retry_s=args.retry,
         )
     except KeyboardInterrupt:
-        print("\nstopped")
+        print("\nStopped")
         return 0
+    except Mt4ClientError as exc:
+        print(exc, file=sys.stderr)
+        return 1
     finally:
         client.close()
+    return 0
 
 
 if __name__ == "__main__":
