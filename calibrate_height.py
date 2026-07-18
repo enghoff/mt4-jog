@@ -48,6 +48,7 @@ from mt4_vision.pickplace import home_arm, pick, place
 from mt4_vision.scene import filter_phantoms
 from mt4_vision.workspace import (
     MAX_REACH_MM,
+    PLACE_CLEARANCE_MM,
     PLACEMENT_SLOTS,
     marker_slots_from_calibration,
 )
@@ -61,7 +62,16 @@ from mt4_vision.workspace import (
 # end of the chain rather than resetting it at the start).
 # Note no point near (100, 0): the homed arm's gripper hangs over that
 # region in the camera view, so a cube placed there can't be re-detected.
-GRID_POINTS = PLACEMENT_SLOTS
+GRID_POINTS = PLACEMENT_SLOTS + [
+    # Probe-only densification of the +y quadrant: the 6-point 2026-07-18
+    # collection left 9-12mm similarity residuals there (slowly-varying
+    # centroid bias a 4-DOF similarity cannot absorb); >=8 usable points
+    # upgrade the fit to bundle+affine, which can. The last point doubles as
+    # the holdout, so the validation number measures the marker-3 region
+    # picks actually struggled in.
+    (140.0, 160.0),
+    (215.0, 205.0),
+]
 # How far (px) the placed cube's centroid may land from where it's expected
 # and still count as "the probe" -- generous given measured parallax shifts
 # were under 15px, but tight enough to reject the arm's own body (which
@@ -121,6 +131,12 @@ def main() -> int:
         help="exact robot XY of a cube the arm previously placed -- skips the "
              "less-accurate vision bootstrap for the first pick",
     )
+    parser.add_argument(
+        "--avoid", type=float, nargs=2, action="append", default=[],
+        metavar=("X", "Y"),
+        help="skip grid targets within place clearance of this robot XY "
+             "(e.g. a cube that must stay put); repeatable",
+    )
     args = parser.parse_args()
 
     try:
@@ -144,6 +160,15 @@ def main() -> int:
         client.move_to(status.tcp.x, status.tcp.y, status.tcp.z, speed_us=RESET_SPEED_US)
 
         grid = [(x, y) for x, y in GRID_POINTS if math.hypot(x, y) <= MAX_REACH_MM]
+        for ax, ay in args.avoid:
+            dropped_targets = [
+                (x, y) for x, y in grid
+                if math.hypot(x - ax, y - ay) < PLACE_CLEARANCE_MM
+            ]
+            if dropped_targets:
+                print(f"Skipping target(s) {dropped_targets} -- within place "
+                      f"clearance of avoided ({ax:.0f},{ay:.0f})")
+            grid = [t for t in grid if t not in dropped_targets]
         if len(grid) < 5:
             print(f"Only {len(grid)} grid points within MAX_REACH_MM; need >=5", file=sys.stderr)
             return 1
@@ -179,6 +204,23 @@ def main() -> int:
 
         pixel_pts: list[tuple[float, float]] = []
         robot_pts: list[tuple[float, float]] = []
+        probe_colors: list[str] = []
+
+        def keep_probe_observations() -> None:
+            """Persist raw (pixel, robot, color) observations -- on every exit path that
+            has any, not just success: a run aborted by a dropped cube already
+            paid the arm time for its points, and offline refits can merge
+            them with a later session's. Color matters: red- and blue-cube
+            centroids of the same physical position measured ~10px apart
+            (different HSV masks include different side faces), so
+            cross-color merges must model that or stay single-color."""
+            if not pixel_pts:
+                return
+            calib.probe_observations = [
+                {"pixel": [round(p[0], 2), round(p[1], 2)], "robot": list(r), "color": c}
+                for p, r, c in zip(pixel_pts, robot_pts, probe_colors)
+            ]
+            calib.save(Path(args.calib))
 
         def locate_probe(near_xy: tuple[float, float]) -> tuple[float, float] | None:
             """Re-detect the probe fresh (never trust a carried-over
@@ -219,6 +261,10 @@ def main() -> int:
                           f"at arm-known ({known_xy[0]:.1f},{known_xy[1]:.1f})")
                 else:
                     print(f"\nTarget ({gx:.1f},{gy:.1f}): lost track of the probe cube -- aborting", file=sys.stderr)
+                    keep_probe_observations()
+                    if pixel_pts:
+                        print(f"Kept {len(pixel_pts)} collected probe observation(s) "
+                              "in the calibration file (cube_top_homography unchanged)")
                     return 1
             seen_xy = calib.pixel_to_robot(*pre_pick_px) if pre_pick_px else None
             if (
@@ -311,6 +357,7 @@ def main() -> int:
                   f"raw estimate ({raw_x:.1f},{raw_y:.1f}) [{sanity_err:.0f}mm off]")
             pixel_pts.append((found.px, found.py))
             robot_pts.append((gx, gy))
+            probe_colors.append(probe_color)
             probe_xy = (gx, gy)
             known_xy = (gx, gy)
 
@@ -318,9 +365,10 @@ def main() -> int:
         if len(pixel_pts) - holdout < 4:
             print(
                 f"\nonly {len(pixel_pts)} usable point(s) ({holdout} held out); "
-                "need >=4 to fit with -- not saving",
+                "need >=4 to fit with -- not refitting",
                 file=sys.stderr,
             )
+            keep_probe_observations()
             return 1
 
         fit_px = pixel_pts[: len(pixel_pts) - holdout] if holdout else pixel_pts
@@ -363,8 +411,9 @@ def main() -> int:
             print("(This is the number that matters -- in-fit error is expected to look good regardless)")
 
         calib.cube_top_homography = matrix
-        calib.save(Path(args.calib))
-        print(f"\nSaved cube_top_homography to {args.calib}")
+        keep_probe_observations()
+        print(f"\nSaved cube_top_homography ({len(pixel_pts)} raw probe "
+              f"observations kept) to {args.calib}")
         return 0
     except Mt4ClientError as exc:
         print(exc, file=sys.stderr)

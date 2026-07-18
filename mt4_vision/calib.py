@@ -98,6 +98,10 @@ class Calibration:
     # session -- the fitted matrix alone is not invertible back to its data,
     # which cost us dearly once.
     raw_marker_observations: dict | None = None
+    # Raw cube-top probe observations from calibrate_height.py (list of
+    # {pixel, robot}), kept for the same reason: without them the cube-top
+    # fit can be neither refit offline nor outlier-checked.
+    probe_observations: list | None = None
     # Fallback parallax correction, used only when cube_top_homography is
     # unset: robot XY directly under the camera and the camera lens height
     # above the table (mm). None disables the correction entirely.
