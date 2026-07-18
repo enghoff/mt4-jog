@@ -248,19 +248,22 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             from mt4_vision.camera import capture_frame
             from mt4_vision.detect import detect_cubes
             from mt4_vision.pickplace import pick
+            from mt4_vision.scene import filter_phantoms
             from mt4_vision.workspace import (
                 cubes_of_color,
                 cubes_with_robot_coords,
+                marker_slots_from_calibration,
                 pick_largest_cube,
             )
 
             calib = load_calibration()
-            target = pick_largest_cube(
-                cubes_of_color(
-                    cubes_with_robot_coords(detect_cubes(capture_frame(), calib)),
-                    color,
-                )
+            # Phantom-filter so arm-base blobs (which can out-area a real
+            # cube of the same color) never win the largest-detection pick.
+            candidates = filter_phantoms(
+                cubes_with_robot_coords(detect_cubes(capture_frame(), calib)),
+                marker_slots_from_calibration(calib),
             )
+            target = pick_largest_cube(cubes_of_color(candidates, color))
             if target is None:
                 return {"ok": False, "error": f"no {color} cube in view"}
             result = pick(get_client(), calib, target.x, target.y)

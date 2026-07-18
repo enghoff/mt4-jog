@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -34,6 +35,28 @@ DEFAULT_CALIB_PATH = Path(
 
 class CalibrationError(Exception):
     """Raised when calibration data is missing, unloadable, or degenerate."""
+
+
+# One-shot per process: a table-plane recalibration clears
+# cube_top_homography (correctly -- it was fit at the old camera pose), and
+# nothing downstream failed when the refit was skipped; picks just silently
+# regained 15-30mm of parallax error. Warn at use time so every entry path
+# (recalibrate script, manual JSON edits, backup restores) is covered.
+_warned_no_cube_top_correction = False
+
+
+def _warn_no_cube_top_correction() -> None:
+    global _warned_no_cube_top_correction
+    if _warned_no_cube_top_correction:
+        return
+    _warned_no_cube_top_correction = True
+    print(
+        "WARNING: cube_top_homography is not set (no parallax fallback "
+        "either) -- cube positions come from the uncorrected table-plane "
+        "map, ~15-30mm of error. Run: python calibrate_height.py "
+        "(required again after every table-plane recalibration).",
+        file=sys.stderr,
+    )
 
 
 @dataclass
@@ -100,6 +123,8 @@ class Calibration:
             cx, cy = self.cam_xy_robot
             x = cx + (x - cx) * scale
             y = cy + (y - cy) * scale
+        elif on_cube_top:
+            _warn_no_cube_top_correction()
         return x, y
 
     def save(self, path: Path = DEFAULT_CALIB_PATH) -> None:
@@ -111,7 +136,7 @@ def load_calibration(path: Path = DEFAULT_CALIB_PATH) -> Calibration:
         raise CalibrationError(
             f"no calibration at {path} -- run: python calibrate_vision.py"
         )
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     return Calibration(**data)
 
 

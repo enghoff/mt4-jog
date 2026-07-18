@@ -45,7 +45,12 @@ from mt4_vision.calib import (
 from mt4_vision.camera import capture_frame
 from mt4_vision.detect import CubeDetection, detect_cubes
 from mt4_vision.pickplace import home_arm, pick, place
-from mt4_vision.workspace import MAX_REACH_MM, PLACEMENT_SLOTS
+from mt4_vision.scene import filter_phantoms
+from mt4_vision.workspace import (
+    MAX_REACH_MM,
+    PLACEMENT_SLOTS,
+    marker_slots_from_calibration,
+)
 
 # Grid of robot-frame (x, y) targets spread across the reachable workspace,
 # one quadrant/radius at a time -- ground truth is the arm's own positioning,
@@ -144,7 +149,16 @@ def main() -> int:
             return 1
 
         frame = capture_frame(**camera_kwargs)
-        cubes = [c for c in detect_cubes(frame, calib) if math.hypot(c.x, c.y) <= MAX_REACH_MM]
+        # Phantom-filter the probe pool (keep-out cylinder, area, hull, reach):
+        # the arm base's own hardware intermittently reads as small blue blobs
+        # inside the keep-out zone, and the grasp-failure rotation below would
+        # otherwise eventually send the gripper at one.
+        all_blobs = detect_cubes(frame, calib)
+        cubes = filter_phantoms(all_blobs, marker_slots_from_calibration(calib))
+        dropped = [c for c in all_blobs if c not in cubes]
+        if dropped:
+            print("Ignoring phantom blob(s): "
+                  + ", ".join(f"{c.color}({c.x:.0f},{c.y:.0f})" for c in dropped))
         if not cubes:
             print("No reachable cube in view to use as a height probe", file=sys.stderr)
             return 1

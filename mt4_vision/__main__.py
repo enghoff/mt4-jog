@@ -18,10 +18,12 @@ import cv2
 from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
 from mt4_vision.camera import DEFAULT_CAMERA_INDEX, capture_frame
 from mt4_vision.detect import detect_cubes, detect_markers, scan_marker_dicts
+from mt4_vision.scene import filter_phantoms, is_phantom_detection
 from mt4_vision.workspace import (
     analyze_workspace,
     cubes_of_color,
     cubes_with_robot_coords,
+    marker_slots_from_calibration,
     pick_largest_cube,
 )
 
@@ -82,9 +84,15 @@ def cmd_scene(args: argparse.Namespace) -> int:
         cubes = detect_cubes(frame, calib)
     if not cubes:
         print("No cubes detected")
+    slots = marker_slots_from_calibration(calib) if calib is not None else []
     for c in cubes:
         robot = f" robot ({c.x:.1f}, {c.y:.1f})" if c.x is not None else ""
-        print(f"  {c.color}: pixel ({c.px:.0f}, {c.py:.0f}) area {c.area:.0f}px^2{robot}")
+        phantom = (
+            " [phantom -- not a pick target]"
+            if calib is not None and is_phantom_detection(c, slots)
+            else ""
+        )
+        print(f"  {c.color}: pixel ({c.px:.0f}, {c.py:.0f}) area {c.area:.0f}px^2{robot}{phantom}")
         cv2.circle(frame, (int(c.px), int(c.py)), 8, (255, 255, 255), 2)
         cv2.putText(
             frame, c.color, (int(c.px) + 10, int(c.py)),
@@ -106,9 +114,11 @@ def cmd_pick(args: argparse.Namespace) -> int:
 
     calib = load_calibration(Path(args.calib))
     frame = capture_frame(args.camera)
-    target = pick_largest_cube(
-        cubes_of_color(cubes_with_robot_coords(detect_cubes(frame, calib)), args.color)
+    candidates = filter_phantoms(
+        cubes_with_robot_coords(detect_cubes(frame, calib)),
+        marker_slots_from_calibration(calib),
     )
+    target = pick_largest_cube(cubes_of_color(candidates, args.color))
     if target is None:
         print(f"No {args.color} cube in view")
         return 1
