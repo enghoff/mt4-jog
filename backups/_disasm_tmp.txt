@@ -1,3 +1,0 @@
-
-d:\mt4\backups\mt4_flash_2026-07-02.elf:     file format elf32-avr
-
