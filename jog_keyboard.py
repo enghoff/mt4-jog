@@ -435,10 +435,9 @@ def main() -> int:
         return 1
 
     print_help(gamepad=gamepad is not None)
-    print(f"{port_display(port, baud=args.baud, explicit=args.port is not None)} — focus this window for keyboard")
+    print(port_display(port, baud=args.baud, explicit=args.port is not None))
     if gamepad is not None:
-        print("Xbox controller: plug in before start; sticks work without focus")
-    print("WARNING: drivers energize while any jog key is held")
+        print("Xbox controller: plug in before start")
 
     poll_s = args.poll_ms / 1000.0
     buf: list[str] = [""]

@@ -228,8 +228,7 @@ def main() -> int:
         return 1
 
     print_help(gamepad=gamepad is not None)
-    print(f"{port_display(port, baud=args.baud, explicit=args.port is not None)} — focus this window for keyboard")
-    print("WARNING: drivers energize while any jog key is held")
+    print(port_display(port, baud=args.baud, explicit=args.port is not None))
     print()
 
     poll_s = args.poll_ms / 1000.0
