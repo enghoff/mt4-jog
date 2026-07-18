@@ -109,6 +109,13 @@ class Calibration:
     cam_height_mm: float | None = None
     # Per-color HSV overrides merged over detect.COLOR_RANGES defaults.
     color_ranges: dict = field(default_factory=dict)
+    # Per-color robot-frame XY correction (mm), added to cube-top-mapped
+    # detections. The blob centroid is not the top-face center: each color's
+    # HSV band admits a different mix of lit/shaded side faces, so the
+    # centroid bias is color-dependent -- a map calibrated with one probe
+    # color mis-locates the others by a constant few-to-15mm offset
+    # (measured 2026-07-18 by arm-placing different colors at one spot).
+    color_xy_offset_mm: dict = field(default_factory=dict)
     # Pixel-space convex hull of the marker centers. Detections outside it
     # are rejected (the arm's orange body and off-desk clutter live there).
     workspace_hull_px: list[list[float]] | None = None

@@ -53,3 +53,21 @@ def test_radial_fallback_no_warning(capsys, monkeypatch):
     c = make_calib(cam_xy_robot=[400.0, 0.0], cam_height_mm=600.0)
     c.pixel_to_robot(10.0, 10.0, on_cube_top=True)
     assert capsys.readouterr().err == ""
+
+
+def test_color_xy_offset_applied_to_cube_detections():
+    import cv2  # noqa: F401 -- ensures OpenCV present for detect_cubes
+    import numpy as np
+
+    from mt4_vision.detect import detect_cubes
+
+    frame = np.zeros((100, 100, 3), np.uint8)
+    frame[40:60, 30:50] = (0, 0, 255)  # red square, ~400px^2
+    base = make_calib(cube_top_homography=IDENTITY)
+    offset = make_calib(
+        cube_top_homography=IDENTITY, color_xy_offset_mm={"red": [5.0, -3.0]}
+    )
+    a = detect_cubes(frame, base)[0]
+    b = detect_cubes(frame, offset)[0]
+    assert abs(b.x - a.x - 5.0) < 1e-6
+    assert abs(b.y - a.y + 3.0) < 1e-6

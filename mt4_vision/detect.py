@@ -171,5 +171,9 @@ def detect_cubes(
             det = CubeDetection(color, px, py, area)
             if calibration is not None:
                 det.x, det.y = calibration.pixel_to_robot(px, py, on_cube_top=True)
+                off = calibration.color_xy_offset_mm.get(color)
+                if off:
+                    det.x += float(off[0])
+                    det.y += float(off[1])
             detections.append(det)
     return sorted(detections, key=lambda d: -d.area)
