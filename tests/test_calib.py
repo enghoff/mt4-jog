@@ -71,3 +71,49 @@ def test_color_xy_offset_applied_to_cube_detections():
     b = detect_cubes(frame, offset)[0]
     assert abs(b.x - a.x - 5.0) < 1e-6
     assert abs(b.y - a.y + 3.0) < 1e-6
+
+
+def test_top_face_centroid_ignores_darker_side_face():
+    """Red-like case: bright top face, darker side face below -- the
+    detection centroid must land on the top face, not the blob middle."""
+    import numpy as np
+
+    from mt4_vision.detect import detect_cubes
+
+    frame = np.zeros((100, 100, 3), np.uint8)
+    frame[30:50, 40:60] = (0, 0, 230)   # top face: bright red, center (49.5, 39.5)
+    frame[50:60, 40:60] = (0, 0, 120)   # side face below: darker red
+    det = detect_cubes(frame)[0]
+    # whole-blob centroid would sit at y ~= 44.5; top-face center is 39.5
+    assert abs(det.px - 49.5) < 1.0
+    assert abs(det.py - 39.5) < 1.5
+
+
+def test_top_face_centroid_ignores_brighter_side_face():
+    """Green-like case (observed live): the lit side face is BRIGHTER than
+    the top face. Brightness ranking would pick the side; geometry must
+    still pick the top."""
+    import numpy as np
+
+    from mt4_vision.detect import detect_cubes
+
+    frame = np.zeros((100, 100, 3), np.uint8)
+    frame[30:50, 40:60] = (0, 140, 0)   # top face: mid green, center (49.5, 39.5)
+    frame[50:60, 40:60] = (0, 235, 0)   # side face below: brightly lit green
+    det = detect_cubes(frame)[0]
+    assert abs(det.px - 49.5) < 1.0
+    assert abs(det.py - 39.5) < 1.5
+
+
+def test_top_face_centroid_unbiased_when_blob_is_all_top_face():
+    """Near the camera nadir only the top face is visible: the segmented
+    centroid must equal the plain blob centroid (no upward bias)."""
+    import numpy as np
+
+    from mt4_vision.detect import detect_cubes
+
+    frame = np.zeros((100, 100, 3), np.uint8)
+    frame[30:50, 40:60] = (0, 0, 200)   # uniform square, center (49.5, 39.5)
+    det = detect_cubes(frame)[0]
+    assert abs(det.px - 49.5) < 0.6
+    assert abs(det.py - 39.5) < 0.6

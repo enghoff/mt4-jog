@@ -36,6 +36,20 @@ MAX_BLOB_AREA = 900.0
 # Reject blobs whose bounding-box aspect is far from square (cubes are square
 # from above; this drops elongated glare streaks and desk-edge artifacts).
 MAX_ASPECT = 2.0
+# Top-face centroid: the whole-blob centroid includes however much side face
+# the oblique camera sees, which pulls it 4-6px (~4-7mm) off the top-face
+# center by an amount that varies across the desk -- measured 2026-07-18 as
+# the dominant residual in the cube-top map (marker-3 region ~10mm). The top
+# face cannot be identified by brightness alone (red's side faces are darker
+# than its top, but green's lit front face is BRIGHTER than its top --
+# observed live), so use geometry: with a downward-looking camera the blob's
+# topmost pixels always belong to the top face. Seed there, then keep the
+# connected region of similar V. A blob that is all top face (near the
+# camera nadir) is V-uniform, so the whole blob is kept and the centroid is
+# unchanged.
+TOP_FACE_SEED_FRACTION = 0.2  # top rows of the blob used as the seed
+TOP_FACE_V_TOL = 35.0  # faces differ by >=40-80 V; within-face spread ~15-25
+TOP_FACE_MIN_PIXELS = 20
 
 ARUCO_DICTS = {
     "4x4_50": cv2.aruco.DICT_4X4_50,
@@ -121,6 +135,45 @@ def scan_marker_dicts(frame: np.ndarray) -> dict[str, int]:
     return hits
 
 
+def _top_face_centroid(
+    hsv: np.ndarray,
+    contour: np.ndarray,
+    fallback: tuple[float, float],
+) -> tuple[float, float]:
+    """Centroid of the cube's top face within the blob.
+
+    Seeds from the blob's topmost rows (always top face), keeps the
+    connected region whose V matches the seed. Falls back to the whole-blob
+    centroid when the blob is too small to segment meaningfully.
+    """
+    bx, by, bw, bh = cv2.boundingRect(contour)
+    local = np.zeros((bh, bw), dtype=np.uint8)
+    cv2.drawContours(local, [contour - [bx, by]], -1, 255, -1)
+    blob = local > 0
+    if blob.sum() < TOP_FACE_MIN_PIXELS:
+        return fallback
+    v = hsv[by : by + bh, bx : bx + bw, 2].astype(np.float64)
+
+    rows = np.nonzero(blob.any(axis=1))[0]
+    seed_limit = rows[0] + max(2, int(round(bh * TOP_FACE_SEED_FRACTION)))
+    seed = blob & (np.arange(bh)[:, None] < seed_limit)
+    if seed.sum() < 4:
+        return fallback
+    med = float(np.median(v[seed]))
+
+    similar = blob & (np.abs(v - med) <= TOP_FACE_V_TOL)
+    n, labels = cv2.connectedComponents(similar.astype(np.uint8))
+    seed_labels = np.unique(labels[seed & similar])
+    seed_labels = seed_labels[seed_labels != 0]
+    if seed_labels.size == 0:
+        return fallback
+    sel = np.isin(labels, seed_labels)
+    ys, xs = np.nonzero(sel)
+    if xs.size < TOP_FACE_MIN_PIXELS:
+        return fallback
+    return bx + float(xs.mean()), by + float(ys.mean())
+
+
 def detect_cubes(
     frame: np.ndarray,
     calibration: Calibration | None = None,
@@ -159,7 +212,9 @@ def detect_cubes(
             m = cv2.moments(contour)
             if m["m00"] == 0:
                 continue
-            px, py = m["m10"] / m["m00"], m["m01"] / m["m00"]
+            px, py = _top_face_centroid(
+                hsv, contour, (m["m10"] / m["m00"], m["m01"] / m["m00"])
+            )
             # Workspace filter: off-desk clutter contributes stray blobs.
             # The margin is negative (allowing detections a bit OUTSIDE the
             # marker polygon) because the markers now sit inside the arm's
