@@ -28,7 +28,7 @@ from mt4_jog.joints import (
     JOG_SPEED_MAX_US,
     JOG_SPEED_MIN_US,
 )
-from mt4_jog.serial import open_serial, read_lines, send
+from mt4_jog.serial import FirmwareNotReadyError, await_firmware_alive, open_serial, read_lines, send
 from mt4_jog.status import parse_tcp_line
 MOVE_TIMEOUT_S = 30.0
 # Matches jog_keyboard.py's HOME_WAIT_S -- the limit-switch seeks inside
@@ -138,8 +138,11 @@ def main() -> int:
         return 2
 
     with open_serial(args.port, args.baud) as ser:
-        time.sleep(1.0)
-        read_lines(ser, 0.5)  # discard the boot banner
+        try:
+            await_firmware_alive(ser, port_label=args.port)
+        except FirmwareNotReadyError as exc:
+            print(exc, file=sys.stderr)
+            return 1
 
         homed, tcp = query_status(ser)
         if not homed:

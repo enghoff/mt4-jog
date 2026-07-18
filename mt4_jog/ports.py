@@ -103,12 +103,21 @@ def probe_port(port: str, baud: int = DEFAULT_BAUD, timeout: float = 1.5) -> boo
 
 
 def find_mt4_port(*, baud: int = DEFAULT_BAUD, probe: bool = True) -> str | None:
-    """Pick the most likely MT4 COM port, optionally confirming with `?`."""
+    """Pick the most likely MT4 COM port, optionally confirming with `?`.
+
+    When exactly one preferred USB-UART (e.g. CH340) is present, accept it
+    without probing. An active `?` probe right after power-on can trap the
+    MCU in its serial bootloader; confirmation happens at connect time via
+    await_firmware_alive() instead.
+    """
     candidates = list_port_candidates()
     if not candidates:
         return None
 
     viable = [row for row in candidates if row[0] > -1000] or candidates
+    preferred = [row for row in viable if row[0] >= 100]
+    if len(preferred) == 1:
+        return preferred[0][1]
 
     if probe:
         for _, device, _ in viable:

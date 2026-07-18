@@ -48,7 +48,7 @@ from jog_keyboard import (
 from mt4_jog.gamepad import A, B, BACK, START, X, Y, XboxGamepad
 from mt4_jog.joints import DEFAULT_BAUD, J1_HOME_CENTER_STEPS, J2_HOME_PULLOFF_STEPS
 from mt4_jog.ports import Mt4PortError, port_display, resolve_port
-from mt4_jog.serial import open_serial, send, send_quick
+from mt4_jog.serial import FirmwareNotReadyError, await_firmware_alive, open_serial, send, send_quick
 from mt4_jog.status import Mt4Status, parse_status_lines
 
 # Calibration-only keys, merged into jog_keyboard's VK table.
@@ -238,8 +238,11 @@ def main() -> int:
     saved = False
 
     with open_serial(port, args.baud) as ser:
-        time.sleep(1.0)
-        drain_async(ser, buf, args.verbose)
+        try:
+            await_firmware_alive(ser, port_label=port)
+        except FirmwareNotReadyError as exc:
+            print(exc, file=sys.stderr)
+            return 1
         send(ser, "all f", wait=0.5)
         send(ser, "orient on", wait=0.3)
 

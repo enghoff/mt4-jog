@@ -23,7 +23,14 @@ from mt4_jog.joints import (
     LIMIT_JOINTS,
 )
 from mt4_jog.ports import Mt4PortError, port_display, resolve_port
-from mt4_jog.serial import drain_lines, open_serial, read_lines, send, send_quick
+from mt4_jog.serial import (
+    FirmwareNotReadyError,
+    await_firmware_alive,
+    drain_lines,
+    open_serial,
+    send,
+    send_quick,
+)
 
 POLL_MS = 10
 HOME_WAIT_S = 180.0
@@ -443,24 +450,16 @@ def main() -> int:
     grave_was_down = False
 
     with open_serial(port, args.baud) as ser:
-        time.sleep(1.0)
-        if args.verbose:
-            for line in read_lines(ser, 1.0):
-                print(line, file=sys.stderr)
-        else:
-            drain_async(ser, buf, False)
+        try:
+            await_firmware_alive(ser, port_label=port)
+        except FirmwareNotReadyError as exc:
+            print(exc, file=sys.stderr)
+            return 1
         send(ser, "all f", wait=0.5)
         send(ser, "orient off" if args.no_orient else "orient on", wait=0.3)
-        status_lines = send(ser, "?", wait=1.5)
-        for line in status_lines:
-            if line.startswith("MODE=") or line.startswith("pos ") or line.startswith("EN="):
-                print(line)
-        if not any(line.startswith("MODE=") for line in status_lines):
-            print(
-                "WARNING: no firmware status reply — check USB cable/hub and "
-                "that custom jog firmware is flashed.",
-                file=sys.stderr,
-            )
+        # Discard limit/status chatter from the handshake; SPACE still prints status.
+        drain_lines(ser, buf)
+        print("Ready")
 
         try:
             while True:
