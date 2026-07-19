@@ -2,7 +2,7 @@
 
 A full replacement software stack for the WLKATA MT4 desktop robot arm
 (ATmega2560, 115200 baud serial): custom firmware with on-device Cartesian
-motion, interactive jog clients (keyboard + Xbox gamepad), overhead-camera
+motion, interactive jog (keyboard + Xbox gamepad), overhead-camera
 vision pick-and-place for colored cubes, and an MCP server that lets an LLM
 drive the arm — "put the red cube next to the blue one".
 
@@ -17,7 +17,8 @@ backed up and restorable, see [Restoring stock firmware](#restoring-stock-firmwa
 | `mt4_jog/` | Python client library: serial protocol, joint map, kinematics, gamepad |
 | `mt4_vision/` | Overhead-camera vision: ArUco calibration, cube detection, pick/place, shuffle |
 | `mt4_mcp/` | MCP server (HTTP or stdio) exposing status, motion, and vision pick/place tools |
-| `jog_keyboard.py` | Keyboard + Xbox gamepad jog client (Cartesian + J4 roll + gripper) |
+| `jog.py` | Keyboard + Xbox gamepad jog client (Cartesian + J4 roll + gripper) |
+| `map_envelope.py` | Jog and tag in/out-of-range poses into `envelope_samples.json` |
 | `goto_position.py` | Prompt-driven absolute-position client (firmware `mp`) |
 | `calibrate_vision.py` | Interactive jog-to-marker camera calibration |
 | `calibrate_height.py` | Auto probe-fit cube-top / pick-height correction after vision calibration |
@@ -52,7 +53,10 @@ pip install -r requirements.txt
 python flash_jog.py --port COM6
 
 # Jog interactively (focus the terminal, hold keys; gamepad works unfocused)
-python jog_keyboard.py
+python jog.py
+
+# Map operating envelope (D-pad Up/Down = in/out samples → envelope_samples.json)
+python map_envelope.py
 
 # One-shot absolute moves (prompts for x/y/z/j4/gripper; requires homing first)
 python goto_position.py
@@ -69,9 +73,9 @@ python shuffle_blocks.py            # live shuffle loop (Ctrl+C stop, H re-home)
 python -m mt4_mcp                   # HTTP at http://127.0.0.1:8787/mcp
 ```
 
-## Jog clients
+## Jog
 
-`jog_keyboard.py` drives the arm in world-frame Cartesian jog (the sole
+`jog.py` drives the arm in world-frame Cartesian jog (the sole
 motion mode — direct per-joint jog was dropped), plus J4 wrist roll and the
 gripper.
 
@@ -84,7 +88,7 @@ gripper.
 | A/D | World +X / -X |
 | J/L | J4 wrist roll (also while moving XYZ) |
 | Q/E | Gripper sweep open / close (S120–S285; release = stop) |
-| -/= | Jog speed slower / faster (live, repeats while held) |
+| -/= | Keyboard jog speed slower / faster (live; does not apply to stick throw) |
 | H | Home (on-device) |
 | SPACE | Status |
 | 0 | Stop, drivers off |
@@ -99,8 +103,9 @@ Player 1, via Windows XInput; works without terminal focus.
 | Left stick | World X / Y |
 | Right stick Y | World Z |
 | Right stick X | J4 wrist roll (also while moving XYZ) |
+| Stick throw | Jog speed from max active stick (full throw = 700 µs; ephemeral, not keyboard setting) |
 | LT / RT | Gripper open / close |
-| LB / RB or D-pad up/down | Jog speed faster / slower |
+| Y short / long (>500 ms) | Goto / store TCP x,y,z + J4 (max speed; gripper unchanged) |
 | A | Home |
 | B | Stop, drivers off |
 | X | Status |
@@ -120,6 +125,24 @@ deadzone (default 9000).
 - `goto_position.py` queries `pos` for the current TCP/J4/gripper state,
   prompts for each field (blank = keep current), then sends `mp` and prints
   the async completion line.
+
+### Envelope mapping
+
+`map_envelope.py` reuses jog controls and records tagged poses for expanding
+the allowed operating range (today's `MAX_REACH_MM` is conservative).
+
+| Control | Action |
+|---------|--------|
+| D-pad Up / `]` | Record **in-range** sample |
+| D-pad Down / `[` | Record **out-of-range** sample |
+| Backspace / LB | Undo last sample |
+| Enter / Start | Save JSON (keep jogging) |
+| ESC / Back | Save and quit |
+
+Each sample stores TCP `x/y/z/j4/grip` plus joint steps and degrees. The JSON
+`summary` tracks joint min/max over in-samples and Cartesian stats
+(`ground_z_mm`, `max_reach_xy_mm`, bbox). Default output:
+`envelope_samples.json`.
 
 ## Firmware
 
@@ -205,7 +228,7 @@ python -m mt4_vision scene      # sanity-check cube detections in robot coords
 ```
 
 `calibrate_vision.py` homes the arm, then drops into the jog controls from
-`jog_keyboard.py`. Jog the TCP onto any reachable marker (any order;
+`jog.py`. Jog the TCP onto any reachable marker (any order;
 unreachable markers are simply skipped) and record it with its digit key —
 or with gamepad **A**, which identifies the marker automatically as the one
 the arm is hiding from the camera. **G** records the pick height and gripper
@@ -269,7 +292,7 @@ next to the blue one".
 | `mt4_place_at` | Place the held cube at robot-frame x/y |
 | `mt4_goto_marker` | Move the TCP to a calibration marker — accuracy check |
 
-Only one process can own the serial port — stop `jog_keyboard.py` (or any
+Only one process can own the serial port — stop `jog.py` (or any
 other client) before starting the server.
 
 ### Local HTTP

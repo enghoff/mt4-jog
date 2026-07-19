@@ -6,6 +6,13 @@ import math
 from dataclasses import dataclass
 import numpy as np
 
+from mt4_jog.joints import (
+    GROUND_Z_MM,
+    J2_J3_SUM_MAX_STEPS,
+    J2_J3_SUM_MIN_STEPS,
+    JOINT_SOFT_MAX_STEPS,
+    JOINT_SOFT_MIN_STEPS,
+)
 from mt4_vision.calib import Calibration
 from mt4_vision.detect import CubeDetection, detect_cubes
 
@@ -32,14 +39,10 @@ MARKER_PAPER_CLEARANCE_MM = 40.0
 PICK_CLEARANCE_MM = 45.0
 # ArUco dictionary of the desk markers (same as calibrate_vision.py).
 MARKER_DICT = "4x4_50"
-# Conservative horizontal reach (mm). The measured IK envelope (sweep at
-# safe_z=185 / pick_z=154, 2026-07-18) is >=353mm at every angle, so 335
-# keeps ~18mm of margin from the true edge while covering marker 1 at
-# 322.5mm -- the old 320 rejected that marker (a physically-touched,
-# demonstrably reachable slot) and misclassified real cubes past 320 as
-# phantoms. Stay well below the envelope: near full stretch the arm is
-# close to singular and both accuracy and joint speeds degrade.
-MAX_REACH_MM = 335.0
+# Measured operating envelope (envelope_samples.json, 2026-07-19): in-range
+# max reach 352.1mm, out at 353.6mm. 350mm keeps a thin margin from the
+# singularity edge while covering the measured workspace (marker 1 ~322mm).
+MAX_REACH_MM = 350.0
 # Firmware `mp` rejects TCP targets inside this cylinder (J1 axis, any Z).
 KEEPOUT_RADIUS_MM = 170.0
 KEEPOUT_TARGET_MARGIN_MM = 0.5  # mirrors start_absolute_move in motion.cpp
@@ -89,6 +92,42 @@ def dist_mm(ax: float, ay: float, bx: float, by: float) -> float:
 def is_mp_reachable_xy(x: float, y: float) -> bool:
     """True when firmware ``mp`` will accept (x, y) as a horizontal target."""
     return math.hypot(x, y) >= KEEPOUT_RADIUS_MM - KEEPOUT_TARGET_MARGIN_MM
+
+
+def is_within_envelope(
+    x: float,
+    y: float,
+    z: float,
+    *,
+    ground_z: float = GROUND_Z_MM,
+    max_reach: float = MAX_REACH_MM,
+) -> bool:
+    """True when (x,y,z) clears keep-out, ground plane, and max reach."""
+    r = math.hypot(x, y)
+    if r < KEEPOUT_RADIUS_MM - KEEPOUT_TARGET_MARGIN_MM:
+        return False
+    if r > max_reach:
+        return False
+    if z < ground_z - 0.05:
+        return False
+    return True
+
+
+def joints_within_soft_limits(
+    steps: tuple[int, int, int, int] | list[int],
+    *,
+    lo: tuple[int, int, int, int] = JOINT_SOFT_MIN_STEPS,
+    hi: tuple[int, int, int, int] = JOINT_SOFT_MAX_STEPS,
+    sum23_lo: int = J2_J3_SUM_MIN_STEPS,
+    sum23_hi: int = J2_J3_SUM_MAX_STEPS,
+) -> bool:
+    """True when joint step counters sit inside the soft envelope."""
+    if len(steps) != 4:
+        return False
+    if not all(lo[i] <= int(steps[i]) <= hi[i] for i in range(4)):
+        return False
+    sum23 = int(steps[1]) + int(steps[2])
+    return sum23_lo <= sum23 <= sum23_hi
 
 
 def marker_slots_from_calibration(calib: Calibration) -> list[MarkerSlot]:

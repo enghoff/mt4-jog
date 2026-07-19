@@ -9,6 +9,18 @@ DEFAULT_BAUD = 115200
 
 J1_HOME_CENTER_STEPS = 4580
 J2_HOME_PULLOFF_STEPS = 1000
+J3_HOME_PULLOFF_STEPS = 500
+
+# Soft joint step limits + desk plane from envelope_samples.json (2026-07-19).
+# Mirror firmware config.h MT4_JOINT_SOFT_* / MT4_GROUND_Z_MM. J1/J2 mins are
+# replaced at home with -J1_HOME_CENTER_STEPS / -J2_HOME_PULLOFF_STEPS.
+GROUND_Z_MM = 136.0
+JOINT_SOFT_MIN_STEPS: tuple[int, int, int, int] = (-4800, -1000, -2050, -6600)
+JOINT_SOFT_MAX_STEPS: tuple[int, int, int, int] = (4580, 2950, 1150, 6350)
+# Coupled extension limit: j2_steps + j3_steps (see firmware MT4_J2_J3_SUM_*).
+# Equivalent to j2_deg - j3_deg >= ~15.2° at full stretch.
+J2_J3_SUM_MIN_STEPS = -1700
+J2_J3_SUM_MAX_STEPS = 2910
 
 # All four measured 2026-07-06 (J2-J4 with a phone clinometer against the
 # link; J1 by direct measurement of its yaw rotation), replacing the

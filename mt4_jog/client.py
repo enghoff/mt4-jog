@@ -11,6 +11,7 @@ from mt4_jog.joints import (
     DEFAULT_PORT,
     GRIPPER_S_CLOSED,
     GRIPPER_S_OPEN,
+    GROUND_Z_MM,
     J1_HOME_CENTER_STEPS,
     J2_HOME_PULLOFF_STEPS,
     JOG_SPEED_MAX_US,
@@ -42,7 +43,7 @@ GRIP_WAIT_S = 1.0
 # next move_to() starts while the grip hasn't closed (or opened) yet.
 GRIPPER_SETTLE_S = 0.8
 # Homing seeks limit switches with no position feedback beforehand, so it
-# needs the same generous ceiling as jog_keyboard.py's HOME_WAIT_S.
+# needs the same generous ceiling as jog.py's HOME_WAIT_S.
 HOME_TIMEOUT_S = 180.0
 # If firmware hasn't acked a `home` command (home start/fail/err) within
 # this long, assume the line was swallowed (e.g. an MCU reset between
@@ -361,6 +362,10 @@ class Mt4Client:
         if grip and not GRIPPER_S_OPEN <= grip <= GRIPPER_S_CLOSED:
             raise Mt4ClientError(
                 f"grip must be 0 (unchanged) or {GRIPPER_S_OPEN}-{GRIPPER_S_CLOSED}"
+            )
+        if z < GROUND_Z_MM - 0.05:
+            raise Mt4ClientError(
+                f"z={z:.1f} is below ground plane ({GROUND_Z_MM:.1f}mm)"
             )
 
         with self._lock:

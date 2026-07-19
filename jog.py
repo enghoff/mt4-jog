@@ -13,7 +13,7 @@ import argparse
 import sys
 import time
 
-from mt4_jog.gamepad import A, B, START, X, XboxGamepad
+from mt4_jog.gamepad import A, B, START, X, Y, XboxGamepad
 from mt4_jog.joints import (
     DEFAULT_BAUD,
     GRIPPER_S_CLOSED,
@@ -33,6 +33,7 @@ from mt4_jog.serial import (
     send,
     send_quick,
 )
+from mt4_jog.status import TcpPose, parse_status_lines
 
 POLL_MS = 10
 HOME_WAIT_S = 180.0
@@ -48,6 +49,7 @@ DEFAULT_SPEED_US = 1524
 # `speed <us>` is a plain idempotent set command (no start/stop state), so
 # holding -/= just re-sends it on a repeat timer -- no protocol change needed.
 SPEED_REPEAT_S = 0.08
+Y_LONG_PRESS_S = 0.5
 
 # World-frame TCP jog (mm/s direction; firmware normalizes).
 CART_BINDINGS: dict[str, tuple[int, int, int]] = {
@@ -88,7 +90,7 @@ def print_help(*, gamepad: bool) -> None:
     print("  S / W     world +Y / -Y")
     print("  A / D     world +X / -X")
     print("  J / L     J4 wrist roll (also while moving XYZ)")
-    print("  -  / =    nudge jog speed slower / faster (live)")
+    print("  -  / =    nudge keyboard jog speed slower / faster (live)")
     print("  H       home J1 + J2 (on-device)")
     print(
         f"  Q / E   gripper sweep open / close "
@@ -104,8 +106,12 @@ def print_help(*, gamepad: bool) -> None:
         print("  Left stick        world X / Y")
         print("  Right stick Y     world Z")
         print("  Right stick X     J4 wrist roll (also while moving XYZ)")
+        print(
+            "  Stick throw       jog speed (radial throw, max of sticks; "
+            f"full = {SPEED_MIN_US} µs; not saved for keyboard)"
+        )
         print("  LT / RT           gripper open / close")
-        print("  LB / RB or D-pad  jog speed slower / faster")
+        print("  Y short / long    goto / store TCP x,y,z + J4")
         print("  A                 home")
         print("  B                 stop, drivers off")
         print("  X                 status")
@@ -135,10 +141,17 @@ def drain_async(ser, buf: list[str], verbose: bool) -> None:
             print(f"Limit: {format_limit(line[4:])}")
         elif line.startswith("home "):
             print(format_firmware_line(line))
-        elif line.startswith("pos ") or line.startswith("ok speed "):
+        elif line.startswith("pos "):
             print(format_firmware_line(line))
-        elif line.startswith("err cj"):
-            print(f"Cart: {line}")
+        elif line.startswith("ok speed "):
+            # Stick throw streams many speed updates; only echo under -v.
+            # Keyboard -/= prints Speed itself when the setting changes.
+            if verbose:
+                print(format_firmware_line(line), file=sys.stderr)
+        elif line.startswith("mp done") or line.startswith("ok mp"):
+            print(line)
+        elif line.startswith("err "):
+            print(line)
         elif verbose:
             print(line, file=sys.stderr)
 
@@ -387,8 +400,36 @@ def gripper_key_state(gamepad_grip: str | None = None) -> str | None:
     return gamepad_grip
 
 
+def speed_us_from_stick_factor(factor: float) -> int:
+    """Map 0..1 stick factor to step period (1 = fastest / SPEED_MIN_US)."""
+    factor = max(0.0, min(1.0, factor))
+    return int(round(SPEED_MAX_US + factor * (SPEED_MIN_US - SPEED_MAX_US)))
+
+
+def query_tcp(ser, buf: list[str], verbose: bool) -> TcpPose | None:
+    """Stop is caller's job; read current TCP pose via `?`."""
+    lines = send(ser, "?", wait=1.0)
+    drain_async(ser, buf, verbose)
+    return parse_status_lines(lines).tcp
+
+
+def start_mp_restore(ser, pose: TcpPose, *, verbose: bool) -> None:
+    """Fire an absolute restore move; do not wait — jog/stop can preempt it."""
+    cmd = (
+        f"mp {pose.x:.3f} {pose.y:.3f} {pose.z:.3f} "
+        f"{pose.j4:.3f} 0 {SPEED_MIN_US}"
+    )
+    print(
+        f"Goto: x={pose.x:.1f} y={pose.y:.1f} z={pose.z:.1f} "
+        f"j4={pose.j4:.1f}  speed={SPEED_MIN_US}"
+    )
+    if verbose:
+        print(f">>> {cmd}", file=sys.stderr)
+    send_quick(ser, cmd)
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="MT4 keyboard jog")
+    parser = argparse.ArgumentParser(description="MT4 jog")
     parser.add_argument(
         "--port",
         default=None,
@@ -447,10 +488,16 @@ def main() -> int:
     grip_state: str | None = None
     last_cj_send = 0.0
     last_grip_send = 0.0
-    speed_us = DEFAULT_SPEED_US
+    # Keyboard -/= setting. Stick throw overrides firmware speed only while
+    # sticks are active and never writes back into this value.
+    keyboard_speed_us = DEFAULT_SPEED_US
+    applied_speed_us = keyboard_speed_us
     last_speed_adjust = 0.0
     invert_xy = False
     grave_was_down = False
+    stored_pose: TcpPose | None = None
+    y_press_start: float | None = None
+    y_long_fired = False
 
     with open_serial(port, args.baud) as ser:
         try:
@@ -531,18 +578,75 @@ def main() -> int:
                     )
                     continue
 
+                # Y: long-press stores TCP x/y/z + J4; short-press recalls
+                # at max speed (gripper unchanged).
+                y_down = pad is not None and pad.connected and bool(pad.buttons & Y)
+                if y_down:
+                    if y_press_start is None:
+                        y_press_start = now
+                        y_long_fired = False
+                    elif (
+                        not y_long_fired
+                        and now - y_press_start >= Y_LONG_PRESS_S
+                    ):
+                        y_long_fired = True
+                        active_cart, grip_state = clear_active_motion(ser)
+                        tcp = query_tcp(ser, buf, args.verbose)
+                        if tcp is None:
+                            print("Could not read TCP pose to store")
+                        else:
+                            stored_pose = tcp
+                            print(
+                                f"Stored: x={tcp.x:.1f} y={tcp.y:.1f} "
+                                f"z={tcp.z:.1f} j4={tcp.j4:.1f}"
+                            )
+                        wait_until_released(
+                            ser, buf, args.verbose, poll_s,
+                            gamepad=gamepad, gamepad_mask=Y,
+                        )
+                        y_press_start = None
+                        y_long_fired = False
+                        continue
+                elif y_press_start is not None:
+                    was_long = y_long_fired
+                    y_press_start = None
+                    y_long_fired = False
+                    if not was_long:
+                        if stored_pose is None:
+                            print("No stored pose (long-press Y to store)")
+                        else:
+                            active_cart, grip_state = clear_active_motion(ser)
+                            start_mp_restore(
+                                ser, stored_pose, verbose=args.verbose
+                            )
+                        continue
+
                 minus = key_down("minus")
                 plus = key_down("plus")
-                if pad is not None:
-                    minus = minus or pad.speed_down
-                    plus = plus or pad.speed_up
                 if (minus or plus) and now - last_speed_adjust >= SPEED_REPEAT_S:
-                    # Lower period = faster; "=" (plus) speeds up. Keeps
-                    # repeating for as long as the key is held.
-                    speed_us += -SPEED_STEP_US if plus else SPEED_STEP_US
-                    speed_us = max(SPEED_MIN_US, min(SPEED_MAX_US, speed_us))
-                    send_quick(ser, f"speed {speed_us}")
+                    # Lower period = faster; "=" (plus) speeds up. Keyboard
+                    # setting only — gamepad shoulders no longer nudge speed.
+                    keyboard_speed_us += -SPEED_STEP_US if plus else SPEED_STEP_US
+                    keyboard_speed_us = max(
+                        SPEED_MIN_US, min(SPEED_MAX_US, keyboard_speed_us)
+                    )
                     last_speed_adjust = now
+                    print(f"Speed: {keyboard_speed_us}")
+
+                stick_factor = (
+                    pad.speed_factor
+                    if pad is not None and pad.connected
+                    else None
+                )
+                if stick_factor is not None:
+                    # Ephemeral stick speed; leave keyboard_speed_us alone.
+                    stick_speed = speed_us_from_stick_factor(stick_factor)
+                    if stick_speed != applied_speed_us:
+                        send_quick(ser, f"speed {stick_speed}")
+                        applied_speed_us = stick_speed
+                elif applied_speed_us != keyboard_speed_us:
+                    send_quick(ser, f"speed {keyboard_speed_us}")
+                    applied_speed_us = keyboard_speed_us
 
                 # Unified jog: Cartesian direction and J4 roll are one `cj`
                 # command, so the wrist rotates while the TCP moves.

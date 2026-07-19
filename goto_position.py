@@ -39,7 +39,7 @@ from mt4_jog.serial import (
 )
 from mt4_jog.status import parse_tcp_line
 MOVE_TIMEOUT_S = 30.0
-# Matches jog_keyboard.py's HOME_WAIT_S -- the limit-switch seeks inside
+# Matches jog.py's HOME_WAIT_S -- the limit-switch seeks inside
 # do_home() can each run up to HOME_SEEK_MAX steps (~20s) if a limit isn't
 # found quickly, on top of the widen/backoff steps.
 HOME_TIMEOUT_S = 180.0

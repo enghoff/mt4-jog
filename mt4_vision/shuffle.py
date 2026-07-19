@@ -48,7 +48,7 @@ POST_MOVE_RECHECK_DELAY_S = 0.4
 
 
 class _HomeKeyWatcher:
-    """Detect a tap of H (same binding as jog_keyboard.py) without blocking.
+    """Detect a tap of H (same binding as jog.py) without blocking.
 
     Gated on this process's console having OS focus -- GetAsyncKeyState is
     global, so without that check an H press in any other window (browser,
@@ -80,7 +80,7 @@ class _HomeKeyWatcher:
         return False
 
     def _run(self) -> None:
-        from jog_keyboard import console_focused, key_down
+        from jog import console_focused, key_down
 
         while not self._stop.is_set():
             down = console_focused() and key_down("h")

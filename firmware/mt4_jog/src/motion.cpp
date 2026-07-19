@@ -9,6 +9,14 @@
 bool cart_orient_hold = true;
 bool mt4_homed = false;
 
+int32_t joint_soft_min[MT4_NUM_JOINTS] = {
+    MT4_JOINT_SOFT_MIN_DEFAULT[0], MT4_JOINT_SOFT_MIN_DEFAULT[1],
+    MT4_JOINT_SOFT_MIN_DEFAULT[2], MT4_JOINT_SOFT_MIN_DEFAULT[3]};
+int32_t joint_soft_max[MT4_NUM_JOINTS] = {
+    MT4_JOINT_SOFT_MAX_DEFAULT[0], MT4_JOINT_SOFT_MAX_DEFAULT[1],
+    MT4_JOINT_SOFT_MAX_DEFAULT[2], MT4_JOINT_SOFT_MAX_DEFAULT[3]};
+float mt4_ground_z_mm = MT4_GROUND_Z_MM;
+
 static bool cart_jog_mode = false;
 static Vec3 cart_dir_active = {0.0f, 0.0f, 0.0f};
 static bool cart_dir_active_valid = false;
@@ -45,6 +53,80 @@ static JointAnglesDeg angles_from_steps() {
 
 void motion_init() {
   dda_init();
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    joint_soft_min[i] = MT4_JOINT_SOFT_MIN_DEFAULT[i];
+    joint_soft_max[i] = MT4_JOINT_SOFT_MAX_DEFAULT[i];
+  }
+  mt4_ground_z_mm = MT4_GROUND_Z_MM;
+}
+
+void motion_apply_home_soft_limits(uint16_t j1_center, uint16_t j2_pull,
+                                   uint16_t j3_pull) {
+  (void)j3_pull;  // J3 interference is not a hard stop; envelope bounds apply.
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    joint_soft_min[i] = MT4_JOINT_SOFT_MIN_DEFAULT[i];
+    joint_soft_max[i] = MT4_JOINT_SOFT_MAX_DEFAULT[i];
+  }
+  // Home seek uses DIR high (negative step counts). Pull-off returns to
+  // steps=0, so the switch sits at -pull_steps.
+  joint_soft_min[0] = -static_cast<int32_t>(j1_center);
+  joint_soft_min[1] = -static_cast<int32_t>(j2_pull);
+
+  Serial.print(F("home limits J1="));
+  Serial.print(joint_soft_min[0]);
+  Serial.print(F(".."));
+  Serial.print(joint_soft_max[0]);
+  Serial.print(F(" J2="));
+  Serial.print(joint_soft_min[1]);
+  Serial.print(F(".."));
+  Serial.print(joint_soft_max[1]);
+  Serial.print(F(" J3="));
+  Serial.print(joint_soft_min[2]);
+  Serial.print(F(".."));
+  Serial.print(joint_soft_max[2]);
+  Serial.print(F(" J4="));
+  Serial.print(joint_soft_min[3]);
+  Serial.print(F(".."));
+  Serial.print(joint_soft_max[3]);
+  Serial.print(F(" J2+J3="));
+  Serial.print(MT4_J2_J3_SUM_MIN);
+  Serial.print(F(".."));
+  Serial.print(MT4_J2_J3_SUM_MAX);
+  Serial.print(F(" ground_z="));
+  Serial.println(mt4_ground_z_mm, 1);
+}
+
+bool motion_joints_within_soft_limits(const long steps[MT4_NUM_JOINTS]) {
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    if (steps[i] < joint_soft_min[i] || steps[i] > joint_soft_max[i]) {
+      return false;
+    }
+  }
+  const int32_t sum23 = steps[1] + steps[2];
+  if (sum23 > MT4_J2_J3_SUM_MAX || sum23 < MT4_J2_J3_SUM_MIN) {
+    return false;
+  }
+  return true;
+}
+
+bool motion_step_allowed(uint8_t joint, bool positive) {
+  if (joint >= MT4_NUM_JOINTS) {
+    return false;
+  }
+  const int32_t next = joint_steps[joint] + (positive ? 1 : -1);
+  if (next < joint_soft_min[joint] || next > joint_soft_max[joint]) {
+    return false;
+  }
+  /* Coupled extension/fold limit on J2+J3 step sum. */
+  if (joint == 1 || joint == 2) {
+    const int32_t s2 = (joint == 1) ? next : joint_steps[1];
+    const int32_t s3 = (joint == 2) ? next : joint_steps[2];
+    const int32_t sum23 = s2 + s3;
+    if (sum23 > MT4_J2_J3_SUM_MAX || sum23 < MT4_J2_J3_SUM_MIN) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void reset_joint_steps() {
@@ -379,6 +461,13 @@ static bool mp_execute_segment(uint16_t seg) {
   if (!mp_segment_target(seg, &near, &target)) {
     return false;
   }
+  {
+    long target_steps[MT4_NUM_JOINTS];
+    angles_to_joint_steps(&target, target_steps);
+    if (!motion_joints_within_soft_limits(target_steps)) {
+      return false;
+    }
+  }
 
   int32_t deltas[MT4_NUM_JOINTS];
   int32_t master = 0;
@@ -436,6 +525,30 @@ void print_status() {
   Serial.print(mt4_homed ? F("yes") : F("no"));
   Serial.print(F("  SPEED="));
   Serial.println(dda_get_speed_us());
+  Serial.print(F("GROUND_Z="));
+  Serial.print(mt4_ground_z_mm, 1);
+  Serial.print(F("  SOFT J1="));
+  Serial.print(joint_soft_min[0]);
+  Serial.print(F(".."));
+  Serial.print(joint_soft_max[0]);
+  Serial.print(F(" J2="));
+  Serial.print(joint_soft_min[1]);
+  Serial.print(F(".."));
+  Serial.print(joint_soft_max[1]);
+  Serial.print(F(" J3="));
+  Serial.print(joint_soft_min[2]);
+  Serial.print(F(".."));
+  Serial.print(joint_soft_max[2]);
+  Serial.print(F(" J4="));
+  Serial.print(joint_soft_min[3]);
+  Serial.print(F(".."));
+  Serial.println(joint_soft_max[3]);
+  Serial.print(F("J2+J3="));
+  Serial.print(MT4_J2_J3_SUM_MIN);
+  Serial.print(F(".."));
+  Serial.print(MT4_J2_J3_SUM_MAX);
+  Serial.print(F("  (extension couples J2/J3)"));
+  Serial.println();
   print_joint_pos();
   Serial.print(F("STEP="));
   if (dda_axis_mask == 0) {
@@ -544,6 +657,10 @@ static bool setup_cartesian_jog(const Vec3 *dir) {
         d.y -= inward * uy;
       }
     }
+    /* Ground plane: block downward jog once at/below the desk envelope. */
+    if (tcp.z <= mt4_ground_z_mm + 0.5f && d.z < 0.0f) {
+      d.z = 0.0f;
+    }
   }
 
   const bool has_dir = fabsf(d.x) + fabsf(d.y) + fabsf(d.z) > 1e-6f;
@@ -573,6 +690,22 @@ static bool setup_cartesian_jog(const Vec3 *dir) {
     }
     rates.j4 = j4;
   }
+
+  /* Soft joint limits: any axis that would step past the envelope aborts
+   * the whole Cartesian jog (do not keep sliding on the other axes). */
+  {
+    const int32_t rate_v[MT4_NUM_JOINTS] = {rates.j1, rates.j2, rates.j3,
+                                            rates.j4};
+    for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+      if (rate_v[i] == 0) {
+        continue;
+      }
+      if (!motion_step_allowed(i, rate_v[i] > 0)) {
+        return false;
+      }
+    }
+  }
+
   if (rates.j1 == 0 && rates.j2 == 0 && rates.j3 == 0 && rates.j4 == 0) {
     return false;
   }
@@ -600,7 +733,10 @@ void start_cartesian_jog(Vec3 dir, int8_t j4_roll) {
   }
 
   if (!setup_cartesian_jog(&dir)) {
-    Serial.println(F("err cj"));
+    // Soft-limit / keep-out / ground: refuse this direction without an
+    // error line (client resends cj while the stick is held).
+    dda_stop();
+    cart_dir_active_valid = false;
     return;
   }
 
@@ -622,8 +758,10 @@ void refresh_cartesian_jog_if_due() {
   }
   cart_refresh_ms = now;
   if (!setup_cartesian_jog(&cart_dir_active)) {
+    // Soft-limit / keep-out / ground: stop the jog quietly. Returning false
+    // here is expected at the envelope edge, not a solver failure.
     dda_stop();
-    Serial.println(F("err cj refresh"));
+    cart_dir_active_valid = false;
   } else {
     dda_refresh_pins();
   }
@@ -713,6 +851,11 @@ bool start_absolute_move(float x, float y, float z, float j4_deg, long g,
     Serial.println(F("err mp keepout"));
     return false;
   }
+  if (z < mt4_ground_z_mm - 0.05f) {
+    Serial.print(F("err mp ground z<"));
+    Serial.println(mt4_ground_z_mm, 1);
+    return false;
+  }
 
   const JointAnglesDeg near = angles_from_steps();
   const float ws_j4_now = mt4_ws_j4_deg(&near);
@@ -722,6 +865,15 @@ bool start_absolute_move(float x, float y, float z, float j4_deg, long g,
   if (!mt4_ik_position(&near, x, y, z, 0.0f, &target)) {
     Serial.println(F("err mp unreachable"));
     return false;
+  }
+  target.j4 = j4_deg - target.j1;
+  {
+    long target_steps[MT4_NUM_JOINTS];
+    angles_to_joint_steps(&target, target_steps);
+    if (!motion_joints_within_soft_limits(target_steps)) {
+      Serial.println(F("err mp joints"));
+      return false;
+    }
   }
 
   Vec3 start_tcp;

@@ -1,5 +1,6 @@
 #include "dda.h"
 
+#include "motion.h"
 #include "pins.h"
 
 volatile bool homing_active = false;
@@ -320,9 +321,21 @@ ISR(TIMER1_COMPA_vect) {
     if (!(step_mask & (1 << i))) {
       continue;
     }
-    *dda_pin_io[i].port |= dda_pin_io[i].mask;
     const bool high = digitalRead(J_DIR_PIN[i]) == HIGH;
     const bool positive = high == J_DIR_POS_HIGH[i];
+    if (!motion_step_allowed(i, positive)) {
+      // Soft joint limit: abort the entire jog/move, not just this axis.
+      for (uint8_t j = 0; j < MT4_NUM_JOINTS; ++j) {
+        dda_delta[j] = 0;
+      }
+      dda_axis_mask = 0;
+      step_mask = 0;
+      if (move_mode) {
+        move_done_pending = true;
+      }
+      return;
+    }
+    *dda_pin_io[i].port |= dda_pin_io[i].mask;
     joint_steps[i] += positive ? 1 : -1;
     if (move_mode && move_remaining[i] > 0 && --move_remaining[i] == 0) {
       dda_axis_mask &= static_cast<uint8_t>(~(1 << i));
