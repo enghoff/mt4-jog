@@ -39,21 +39,45 @@ from mt4_jog.kinematics import JointAnglesDeg, ik_position
 from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
 from mt4_vision.camera import capture_frame
 from mt4_vision.detect import COLOR_RANGES, _top_face_centroid
-from mt4_vision.pickplace import _approach, _travel, home_arm, pick
+from mt4_vision.pickplace import _approach, _travel, home_arm, pick, place
 from mt4_vision.scene import capture_scene
 
-STACK_XY = (0.0, 178.0)
+# Default site (200, 60): a calibrated probe point (2-4mm map accuracy),
+# r=209 -- inside the validated torque-safe envelope rather than at the
+# reach limit, where placement scattered 10-65mm. Max TCP Z here ~370mm:
+# 10 cube levels of headroom. (--x/--y override; the original max-height
+# brief pointed at x=0, whose every point has J1 at +-90deg and r pinned
+# to the keep-out boundary -- the arm's worst accuracy zone.)
+STACK_XY = (200.0, 60.0)
+# Fixed grip-inspection pose: after every pick the held cube is hovered
+# here and photographed. The first cube of each color defines that color's
+# reference pixel; later cubes' deviation from it is their differential
+# grip offset (picks land the cube off-center by several mm, and the
+# offset rides along to the placement) -- subtracted from the place
+# command. Fixed pose = arm repeatability is common mode; per-color
+# references = centroid color bias is common mode.
+INSPECT_POSE = (220.0, 66.0, 250.0)
+GRIP_CAP_MM = 8.0
+# Grip validation (Sigurd's policy): a measurably off-center grip is set
+# back down and re-gripped rather than compensated -- re-picking from the
+# arm-known set-down spot re-rolls the grip; only verified-good grips
+# build the stack. After GRIP_TRIES the best grip proceeds, compensated.
+GRIP_OK_MM = 3.5
+GRIP_TRIES = 3
 # Camera-clear pose for captures: high and folded, like the homed pose but
 # reached with a plain move -- no homing cycle (steps aren't lost in normal
 # operation), and unlike pickplace's camera park it doesn't lean over the
 # desk (the park pose shadows reads around (200, +-60)).
-CAPTURE_POSE = (175.0, 0.0, 340.0)
+CAPTURE_POSE = (172.0, 0.0, 370.0)
+# The lean of lower capture poses shadows reads around (200, +-60) -- never
+# park or read cubes there; (172,0,370) is nearly vertical (r pinned by the
+# keep-out cylinder).
 # Clearance climb above the current place height for every traverse near the
 # stack -- the gripper (with cube) must never cross the stack column lower.
 TRAVEL_ABOVE_MM = 35.0
 # Radial via point on the stack's bearing: approach the column from outside
 # along its own radius so no traverse arcs over the stack.
-VIA_RADIUS_MM = 250.0
+VIA_RADIUS_MM = 235.0  # outside the site radius, inside the torque-safe r<=245
 # Verification thresholds. Drift is measured PAIRWISE (level N's top vs
 # level N-1's observed top, one parallax step apart) -- measuring against
 # the model-chained ideal column accumulated anchor/model/color bias and
@@ -253,6 +277,9 @@ def main() -> int:
         return float(v[0] / v[2]), float(v[1] / v[2])
 
     model = ParallaxHeightModel(px_of(ht_inv, sx, sy), px_of(hc_inv, sx, sy), cube)
+    ix, iy, iz = INSPECT_POSE
+    h_ins = (iz - calib.pick_z) + cube  # held cube's top height at inspect
+    imodel = ParallaxHeightModel(px_of(ht_inv, ix, iy), px_of(hc_inv, ix, iy), cube)
     # Local scale for reporting lean in mm, and the table-plane
     # pixel->robot Jacobian for vision-servoed placement corrections.
     ht = np.array(calib.homography)
@@ -266,6 +293,12 @@ def main() -> int:
     jac = np.column_stack([
         robot_of(p_a[0] + 1.0, p_a[1]) - r0,
         robot_of(p_a[0], p_a[1] + 1.0) - r0,
+    ])
+    p_i = px_of(ht_inv, ix, iy)
+    r0_i = robot_of(*p_i)
+    jac_i = np.column_stack([
+        robot_of(p_i[0] + 1.0, p_i[1]) - r0_i,
+        robot_of(p_i[0], p_i[1] + 1.0) - r0_i,
     ])
     mm_per_px = float(np.linalg.norm(jac @ np.array([1.0, 0.0])))
 
@@ -325,12 +358,64 @@ def main() -> int:
         # subtracted. The winning correction carries forward as the next
         # level's prior.
         carry = np.zeros(2)
+        grip_ref: dict[str, tuple[float, float]] = {}
+
+        def grip_offset(color: str):
+            """Hover the held cube at the fixed inspect pose; returns
+            (offset_mm, reading_px) or None when no cube is visible (grasp
+            lost)."""
+            _approach(client, calib, ix, iy, iz, "inspect pose")
+            time.sleep(0.8)
+            frame = capture_frame(args.camera)
+            guess = grip_ref.get(color) or imodel.predict_px(h_ins)
+            g = find_top_face(frame, color, guess)
+            if g is None:
+                print("  grip inspection: cube not seen (grasp lost?)")
+                return None
+            if color not in grip_ref:
+                grip_ref[color] = g
+                print(f"  grip reference for {color}: ({g[0]:.1f},{g[1]:.1f})")
+                return (0.0, 0.0), g
+            ref = grip_ref[color]
+            off = ground_offset_mm(
+                (g[0] - ref[0], g[1] - ref[1]), jac_i, imodel.hc, h_ins,
+                cap_mm=GRIP_CAP_MM,
+            )
+            print(f"  grip offset vs {color} reference: ({off[0]:+.1f},{off[1]:+.1f})mm")
+            return off, g
+
+        def validated_grip(color: str, set_down_xy: tuple[float, float]):
+            """Reject off-center grips: set the cube down (arm-known) and
+            re-grip until the inspection reads centered, else best-of."""
+            best = None
+            for gtry in range(1, GRIP_TRIES + 1):
+                res = grip_offset(color)
+                if res is None:
+                    return None
+                off, reading = res
+                n = math.hypot(*off)
+                if best is None or n < math.hypot(*best[0]):
+                    best = (off, reading)
+                if n <= GRIP_OK_MM:
+                    return off, reading, True
+                if gtry < GRIP_TRIES:
+                    print(f"  grip {n:.1f}mm off -- setting down and re-gripping "
+                          f"({gtry}/{GRIP_TRIES})")
+                    place(client, calib, *set_down_xy)
+                    pick(client, calib, *set_down_xy)
+            off, reading = best
+            print(f"  proceeding with best grip ({math.hypot(*off):.1f}mm), compensated")
+            return off, reading, False
 
         def deliver(x: float, y: float, z_pl: float, z_tr: float) -> None:
+            # Whole delivery leg at the slow approach speed: fast cruise on
+            # loaded, high-z, extended moves stalls steppers (the documented
+            # r=315 lost-steps failure) -- landings scattered 10-60mm until
+            # this leg was slowed, while every freshly-homed pick was fine.
             tcp = client.get_tcp()
-            _travel(client, calib, tcp.x, tcp.y, z_tr, "climb with cube")
-            _travel(client, calib, via[0], via[1], z_tr, "via point")
-            _travel(client, calib, x, y, z_tr, "over stack")
+            _approach(client, calib, tcp.x, tcp.y, z_tr, "climb with cube")
+            _approach(client, calib, via[0], via[1], z_tr, "via point")
+            _approach(client, calib, x, y, z_tr, "over stack")
             _approach(client, calib, x, y, z_pl, "lower onto stack")
             client.gripper(calib.grip_open_s)
             _approach(client, calib, x, y, z_tr, "clear stack")
@@ -370,11 +455,10 @@ def main() -> int:
                 print(f"level {level}: pick {color} at ({target.x:.1f},{target.y:.1f}) "
                       f"(attempt {attempt})")
                 pick(client, calib, target.x, target.y)
-                # Clear the view BEFORE the grasp check: at safe_z over the
-                # pick spot the held cube itself images near the pick pixel
-                # and reads as a false "still there". A camera-park retreat
-                # suffices -- no homing cycle needed (steps aren't lost in
-                # normal operation).
+                # Clear the camera view for the grasp check -- plain move,
+                # no homing cycle (per Sigurd: steps aren't lost in normal
+                # operation; the earlier scatter was the fast loaded
+                # delivery legs, fixed by slowing them).
                 _travel(client, calib, *CAPTURE_POSE, "capture pose")
                 frame = snap(0)
                 still = find_top_face(frame, color, (target.px, target.py))
@@ -399,8 +483,14 @@ def main() -> int:
             cmd = (np.array([sx, sy]) + carry
                    + np.array(args.shift_per_level) * (level - 1))
             level_ok = False
+            grip = validated_grip(color, (target.x, target.y))
+            if grip is None:
+                print(f"level {level}: lost the cube during grip validation -- stopping")
+                break
+            goff, grip_reading, grip_good = grip
             for fix in range(FIX_ATTEMPTS + 1):
-                deliver(float(cmd[0]), float(cmd[1]), z_place, z_travel)
+                deliver(float(cmd[0] - goff[0]), float(cmd[1] - goff[1]),
+                        z_place, z_travel)
                 frame = snap(level)
                 p_pred = (model.predict_px(h_expect) if level == 1
                           else model.predict_px_rel(h_expect))
@@ -436,7 +526,31 @@ def main() -> int:
                       f"height {h_est:.0f}mm (expect {h_expect:.0f})  "
                       f"pair-drift ({off[0]:+.1f},{off[1]:+.1f})mm  "
                       f"cam-height est {model.hc:.0f}mm")
-                perched = drift > DRIFT_REPICK_MM and abs(h_err) > HEIGHT_TOL_MM
+                # A reading ABOVE the expected height is physically
+                # impossible (nothing lifts a cube above its release) -- it
+                # is the height/distance ambiguity: the cube missed and lies
+                # on the TABLE beyond the column, imaging "high".
+                missed_low = h_err > HEIGHT_TOL_MM
+                perched = (not missed_low and drift > DRIFT_REPICK_MM
+                           and abs(h_err) > HEIGHT_TOL_MM)
+                if missed_low and fix < FIX_ATTEMPTS:
+                    dp_t = (found[0] - model.anchor[0], found[1] - model.anchor[1])
+                    off_t = ground_offset_mm(dp_t, jac, model.hc, cube)
+                    cube_xy = (sx + off_t[0], sy + off_t[1])
+                    print(f"  correction {fix + 1}: missed the stack, cube on "
+                          f"the table at ({cube_xy[0]:.1f},{cube_xy[1]:.1f}) -- "
+                          f"re-picking at table height")
+                    try:
+                        pick(client, calib, cube_xy[0], cube_xy[1])
+                    except Mt4ClientError as exc:
+                        print(f"  recovery pick failed ({exc}) -- stopping")
+                        break
+                    err = np.array(off_t)
+                    n = float(np.linalg.norm(err))
+                    if n > 2 * SERVO_CAP_MM:
+                        err *= 2 * SERVO_CAP_MM / n
+                    cmd = cmd - err
+                    continue
                 if not perched and drift <= DRIFT_FIXABLE_MM:
                     # Seated (possibly imperfectly). Moderate drift readings
                     # without a height anomaly are as likely measurement bias
@@ -465,7 +579,11 @@ def main() -> int:
                 print(f"  correction {fix + 1}: perched -- re-pick at "
                       f"({cube_xy[0]:.1f},{cube_xy[1]:.1f}) h~{h_est:.0f}mm, "
                       f"re-place shifted ({-off[0]:+.1f},{-off[1]:+.1f})mm")
-                grab_off_stack(cube_xy[0], cube_xy[1], max(h_est, cube), z_travel)
+                try:
+                    grab_off_stack(cube_xy[0], cube_xy[1], max(h_est, cube), z_travel)
+                except Mt4ClientError as exc:
+                    print(f"  recovery grab failed ({exc}) -- stopping")
+                    break
                 err = np.array(off)
                 n = float(np.linalg.norm(err))
                 if n > 2 * SERVO_CAP_MM:
@@ -473,6 +591,11 @@ def main() -> int:
                 cmd = cmd - err
             if not level_ok:
                 break
+            if grip_good:
+                # A grip that measured centered AND produced a verified
+                # level becomes the color's new reference -- de-circularizes
+                # a possibly-off first reference.
+                grip_ref[color] = grip_reading
             # Nudges/corrections persist via carry; the per-level
             # feed-forward term must not compound into it.
             carry = (cmd - np.array([sx, sy])
