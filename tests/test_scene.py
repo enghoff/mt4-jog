@@ -314,7 +314,8 @@ if __name__ == "__main__":
 
 def test_marker_at_touched_reach_limit_is_placeable():
     """Marker 1 lives at 322.5mm -- physically touched and reachable; the
-    reach filter must not veto it (regression: MAX_REACH_MM=320 did)."""
+    reach filter must not veto it (regression: MAX_REACH_MM=320 did;
+    current envelope allows 350mm)."""
     from mt4_vision.workspace import MarkerSlot, rebuild_workspace_state
 
     m1 = MarkerSlot(1, 45.0, 319.3)

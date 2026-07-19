@@ -42,6 +42,14 @@ class StickSpeedFactorTests(unittest.TestCase):
         assert factor is not None
         self.assertLess(factor, 0.01)
 
+    def test_diagonal_full_throw_matches_cardinal(self) -> None:
+        # Circular stick at 45°: each axis ≈ MAX/√2, radial ≈ MAX.
+        diag = int(THUMB_AXIS_MAX / (2**0.5))
+        cardinal = stick_speed_factor(THUMB_AXIS_MAX, 0, 0, 0, deadzone=9000)
+        diagonal = stick_speed_factor(diag, diag, 0, 0, deadzone=9000)
+        self.assertAlmostEqual(cardinal, 1.0)
+        self.assertAlmostEqual(diagonal, 1.0, places=2)
+
 
 class SpeedUsFromFactorTests(unittest.TestCase):
     def test_endpoints(self) -> None:

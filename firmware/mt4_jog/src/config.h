@@ -41,6 +41,26 @@ static const uint16_t MP_MAX_SEGMENTS = 250;
  * velocity component at the boundary so jogging slides along the cylinder
  * instead of driving into the base. */
 static const float MT4_KEEPOUT_RADIUS_MM = 170.0f;
+/* Desk / ground plane: TCP Z below this is rejected (`mp`) and Cartesian jog
+ * clamps downward velocity. From envelope_samples.json in-range min Z
+ * 135.7mm (2026-07-19); rounded up slightly for clearance. */
+static const float MT4_GROUND_Z_MM = 136.0f;
+/* Soft joint step limits (counters after home = 0). Switch-side ends for
+ * J1/J2 are overwritten at the end of do_home() from the pull-off distance
+ * (limit switch = -pull_steps). Opposite ends and J3/J4 both ends come from
+ * the measured envelope (in-range samples, 2026-07-19). */
+static const int32_t MT4_JOINT_SOFT_MIN_DEFAULT[MT4_NUM_JOINTS] = {
+    -4800L, -1000L, -2050L, -6600L};
+static const int32_t MT4_JOINT_SOFT_MAX_DEFAULT[MT4_NUM_JOINTS] = {
+    4580L, 2950L, 1150L, 6350L};
+/* Coupled J2+J3 extension limit (step counters). Because J2 and J3 have
+ * opposite step signs, j2_deg - j3_deg = const - (j2_steps + j3_steps)/spd,
+ * so a *minimum* link-angle difference at full stretch is a *maximum* on
+ * j2_steps + j3_steps. In-sample max sum was 2910 (r≈352mm, j2−j3≈15.2°);
+ * over-extension outs sit at 2961–3108. Soft min on the sum is loose —
+ * the folded extreme is gated by J3 min + ground Z. */
+static const int32_t MT4_J2_J3_SUM_MAX = 2910L;
+static const int32_t MT4_J2_J3_SUM_MIN = -1700L;
 /* Max path pieces for a routed `mp` move: radial escape (when starting
  * inside the cylinder) + entry tangent + arc + exit tangent. */
 static const uint8_t MP_MAX_PIECES = 4;

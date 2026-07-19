@@ -27,6 +27,8 @@
  * targets inside the cylinder ("err mp keepout") and automatically routes
  * paths that would cross it around the boundary (entry tangent, shortest
  * arc, exit tangent); a start inside the cylinder first escapes radially.
+ * Soft joint limits (envelope + home limit-switch pull-offs) and ground
+ * plane MT4_GROUND_Z_MM also reject/clamp out-of-range jog and `mp`.
  * Joint-space moves (`m`, homing) are NOT covered -- they command raw steps.
  *   orient on|off          J4 wrist unwind when J1 moves (default on, 1:1)
  *   pos                      print joint step counters (since last home),

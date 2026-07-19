@@ -107,7 +107,7 @@ def print_help(*, gamepad: bool) -> None:
         print("  Right stick Y     world Z")
         print("  Right stick X     J4 wrist roll (also while moving XYZ)")
         print(
-            "  Stick throw       jog speed (max of active sticks; "
+            "  Stick throw       jog speed (radial throw, max of sticks; "
             f"full = {SPEED_MIN_US} µs; not saved for keyboard)"
         )
         print("  LT / RT           gripper open / close")

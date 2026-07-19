@@ -15,10 +15,25 @@ extern bool cart_orient_hold;
 // except by a power cycle/reflash. Gates the `mp` absolute-position command.
 extern bool mt4_homed;
 
+// Soft joint step limits (post-home counters) and ground plane. Defaults from
+// config.h; J1/J2 switch-side mins are refreshed at the end of do_home().
+extern int32_t joint_soft_min[MT4_NUM_JOINTS];
+extern int32_t joint_soft_max[MT4_NUM_JOINTS];
+extern float mt4_ground_z_mm;
+
 void motion_init();
 void reset_joint_steps();
 /* setpos command: directly overwrite the joint step counters (no motion). */
 void motion_set_joint_steps(const long steps[MT4_NUM_JOINTS]);
+
+/* Install defaults, then (after home) set J1/J2 switch-side limits from the
+ * pull-off distances used. Prints `home limits ...`. */
+void motion_apply_home_soft_limits(uint16_t j1_center, uint16_t j2_pull,
+                                   uint16_t j3_pull);
+/* True when every joint step counter is inside [soft_min, soft_max]. */
+bool motion_joints_within_soft_limits(const long steps[MT4_NUM_JOINTS]);
+/* True when a single step in `positive` direction on `joint` stays inside. */
+bool motion_step_allowed(uint8_t joint, bool positive);
 
 void stop_jog();
 /* "!"/"stop" command: stop_jog() plus canceling any in-progress `m` move

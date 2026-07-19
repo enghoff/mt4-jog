@@ -11,6 +11,7 @@ from mt4_jog.joints import (
     DEFAULT_PORT,
     GRIPPER_S_CLOSED,
     GRIPPER_S_OPEN,
+    GROUND_Z_MM,
     J1_HOME_CENTER_STEPS,
     J2_HOME_PULLOFF_STEPS,
     JOG_SPEED_MAX_US,
@@ -361,6 +362,10 @@ class Mt4Client:
         if grip and not GRIPPER_S_OPEN <= grip <= GRIPPER_S_CLOSED:
             raise Mt4ClientError(
                 f"grip must be 0 (unchanged) or {GRIPPER_S_OPEN}-{GRIPPER_S_CLOSED}"
+            )
+        if z < GROUND_Z_MM - 0.05:
+            raise Mt4ClientError(
+                f"z={z:.1f} is below ground plane ({GROUND_Z_MM:.1f}mm)"
             )
 
         with self._lock:

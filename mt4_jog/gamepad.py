@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 from dataclasses import dataclass
 
@@ -67,16 +68,18 @@ def stick_speed_factor(
 ) -> float | None:
     """Map stick throw to a 0..1 speed factor.
 
-    Each stick's deflection is ``max(|x|, |y|)``. Sticks inside the deadzone
-    are ignored; among sticks past the deadzone, the maximum normalized throw
-    wins. Full throw (past deadzone to axis max) returns 1.0.
+    Each stick's deflection is the radial distance ``hypot(x, y)`` so a
+    diagonal full throw matches a cardinal one (circular stick gate). Sticks
+    inside the deadzone are ignored; among sticks past the deadzone, the
+    maximum normalized throw wins. Full throw returns 1.0 (square-corner
+    readings above axis max are clamped).
     """
     if deadzone >= THUMB_AXIS_MAX:
         return None
     span = THUMB_AXIS_MAX - deadzone
     factors: list[float] = []
     for ax, ay in ((lx, ly), (rx, ry)):
-        mag = max(abs(ax), abs(ay))
+        mag = math.hypot(ax, ay)
         if mag <= deadzone:
             continue
         factors.append(min(1.0, (mag - deadzone) / span))
