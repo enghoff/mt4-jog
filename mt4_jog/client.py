@@ -42,7 +42,7 @@ GRIP_WAIT_S = 1.0
 # next move_to() starts while the grip hasn't closed (or opened) yet.
 GRIPPER_SETTLE_S = 0.8
 # Homing seeks limit switches with no position feedback beforehand, so it
-# needs the same generous ceiling as jog_keyboard.py's HOME_WAIT_S.
+# needs the same generous ceiling as jog.py's HOME_WAIT_S.
 HOME_TIMEOUT_S = 180.0
 # If firmware hasn't acked a `home` command (home start/fail/err) within
 # this long, assume the line was swallowed (e.g. an MCU reset between

@@ -3,12 +3,12 @@
 ArUco marker and record it. Writes vision_calibration.json for mt4_vision.
 
 Flow: home the arm, capture a reference frame of the markers, then jog with
-the same controls as jog_keyboard.py. Touch the TCP to a marker center and
+the same controls as jog.py. Touch the TCP to a marker center and
 record it -- markers can be visited in any order, and unreachable ones are
 simply skipped. 3 recorded markers give an affine fit (accurate inside the
 marker triangle, no perspective correction); 4+ give a full homography.
 
-Remaps vs jog_keyboard.py: digit keys record markers (so drivers-off moves
+Remaps vs jog.py: digit keys record markers (so drivers-off moves
 0 -> X key), gamepad A records a marker (home moves A -> Y), and Start
 finishes the session (XY invert stays on the ` key only).
 """
@@ -21,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 
-from jog_keyboard import (
+from jog import (
     DEFAULT_SPEED_US,
     POLL_MS,
     SPEED_MAX_US,
@@ -52,7 +52,7 @@ from mt4_jog.ports import Mt4PortError, port_display, resolve_port
 from mt4_jog.serial import FirmwareNotReadyError, SerialGoneError, await_firmware_alive, open_serial, send, send_quick
 from mt4_jog.status import Mt4Status, parse_status_lines
 
-# Calibration-only keys, merged into jog_keyboard's VK table.
+# Calibration-only keys, merged into jog's VK table.
 VK.update(
     {
         "1": 0x31, "2": 0x32, "3": 0x33, "4": 0x34, "5": 0x35,
@@ -70,7 +70,7 @@ STATUS_WAIT_S = 1.5
 def print_help(*, gamepad: bool) -> None:
     print("MT4 vision calibration — jog the TCP onto each reachable marker")
     print()
-    print("Jog (as jog_keyboard.py):")
+    print("Jog (as jog.py):")
     print("  I/K  A/D  S/W   world Z / X / Y      J / L   J4 roll")
     print("  Q / E           gripper open / close  - / =  speed")
     print("  `               toggle invert world X + Y")
@@ -86,7 +86,7 @@ def print_help(*, gamepad: bool) -> None:
     if gamepad:
         print()
         print("Xbox controller:")
-        print("  Sticks / triggers / LB RB   jog, gripper, speed (as jog_keyboard.py)")
+        print("  Sticks / triggers           jog, gripper (as jog.py)")
         print("  A       record marker (auto-identified: the one the arm hides)")
         print("  Y       home")
         print("  B       stop, drivers off")
@@ -370,14 +370,12 @@ def main() -> int:
 
                 minus = key_down("minus")
                 plus = key_down("plus")
-                if pad is not None:
-                    minus = minus or pad.speed_down
-                    plus = plus or pad.speed_up
                 if (minus or plus) and now - last_speed_adjust >= SPEED_REPEAT_S:
                     speed_us += -SPEED_STEP_US if plus else SPEED_STEP_US
                     speed_us = max(SPEED_MIN_US, min(SPEED_MAX_US, speed_us))
                     send_quick(ser, f"speed {speed_us}")
                     last_speed_adjust = now
+                    print(f"Speed: {speed_us}")
 
                 # Unified jog: Cartesian direction and J4 roll are one `cj`
                 # command, so the wrist rotates while the TCP moves.

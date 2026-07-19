@@ -79,7 +79,7 @@ root — requesting the root path returns 404 by design (RFC 9728).
 
 - OAuth applies to the **HTTP** server only. Cursor's stdio MCP (`--stdio`) stays
   local and does not use these settings.
-- Only one process can hold `COM6`. Stop `jog_keyboard.py` and Cursor's MT4 MCP
+- Only one process can hold `COM6`. Stop `jog.py` and Cursor's MT4 MCP
   before running the public HTTP server.
 - Free ngrok URLs rotate on restart — update `.env`, Google redirect URI, and the
   ChatGPT connector when that happens.

@@ -1,6 +1,6 @@
-"""Unit tests for jog_keyboard's focus-detection helper (no hardware).
+"""Unit tests for jog's focus-detection helper (no hardware).
 
-Run: python tests/test_jog_keyboard.py
+Run: python tests/test_jog.py
 """
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from jog_keyboard import _pid_shares_ancestry
+from jog import _pid_shares_ancestry
 
 
 def test_target_is_this_process():

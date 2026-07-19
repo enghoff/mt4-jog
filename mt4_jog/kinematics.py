@@ -48,7 +48,7 @@ J_STEP_SIGN: tuple[float, float, float, float] = (1.0, -1.0, 1.0, 1.0)
 
 DLS_LAMBDA = 0.05
 
-# Positive joint angle => DIR pin low (matches jog_keyboard.py "q" direction).
+# Positive joint angle => DIR pin low (matches jog.py "q" direction).
 DIR_POS_HIGH: tuple[bool, bool, bool, bool] = (False, False, False, False)
 
 

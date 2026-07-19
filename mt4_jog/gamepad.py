@@ -22,6 +22,8 @@ X = 0x4000
 Y = 0x8000
 
 ERROR_DEVICE_NOT_CONNECTED = 1167
+# XInput thumb axes report roughly ±32767 at full throw.
+THUMB_AXIS_MAX = 32767
 
 
 @dataclass
@@ -35,8 +37,10 @@ class GamepadSnapshot:
     stop_all: bool = False
     status: bool = False
     quit: bool = False
-    speed_up: bool = False
-    speed_down: bool = False
+    # 0..1 from stick throw past deadzone (None when both sticks idle).
+    # Max of active sticks; mapped by jog clients to step period (1 = 700 µs).
+    # Ephemeral for stick jog only — does not change the keyboard speed setting.
+    speed_factor: float | None = None
     toggle_invert_xy: bool = False
     connected: bool = False
     # Raw button state for callers that remap buttons (e.g. calibration):
@@ -51,6 +55,34 @@ def _axis_sign(value: int, deadzone: int) -> int:
     if value < -deadzone:
         return -1
     return 0
+
+
+def stick_speed_factor(
+    lx: int,
+    ly: int,
+    rx: int,
+    ry: int,
+    *,
+    deadzone: int,
+) -> float | None:
+    """Map stick throw to a 0..1 speed factor.
+
+    Each stick's deflection is ``max(|x|, |y|)``. Sticks inside the deadzone
+    are ignored; among sticks past the deadzone, the maximum normalized throw
+    wins. Full throw (past deadzone to axis max) returns 1.0.
+    """
+    if deadzone >= THUMB_AXIS_MAX:
+        return None
+    span = THUMB_AXIS_MAX - deadzone
+    factors: list[float] = []
+    for ax, ay in ((lx, ly), (rx, ry)):
+        mag = max(abs(ax), abs(ay))
+        if mag <= deadzone:
+            continue
+        factors.append(min(1.0, (mag - deadzone) / span))
+    if not factors:
+        return None
+    return max(factors)
 
 
 class XboxGamepad:
@@ -127,9 +159,13 @@ class XboxGamepad:
 
         # Left stick: world X/Y (both axes inverted). Right stick Y: world Z;
         # right stick X: J4 roll.
-        x = _axis_sign(-int(pad.sThumbLX), dz)
-        y = _axis_sign(-int(pad.sThumbLY), dz)
-        z = _axis_sign(int(pad.sThumbRY), dz)
+        lx = int(pad.sThumbLX)
+        ly = int(pad.sThumbLY)
+        rx = int(pad.sThumbRX)
+        ry = int(pad.sThumbRY)
+        x = _axis_sign(-lx, dz)
+        y = _axis_sign(-ly, dz)
+        z = _axis_sign(ry, dz)
         cart = None
         if (x, y, z) != (0, 0, 0):
             cart = (x, y, z)
@@ -138,10 +174,10 @@ class XboxGamepad:
         # layers the roll onto the Cartesian jog (`cj dx dy dz [j4]`), so the
         # wrist can rotate while the TCP moves.
         j4: bool | None = None
-        rx = _axis_sign(int(pad.sThumbRX), dz)
-        if rx < 0:
+        rx_sign = _axis_sign(rx, dz)
+        if rx_sign < 0:
             j4 = False
-        elif rx > 0:
+        elif rx_sign > 0:
             j4 = True
 
         lt = int(pad.bLeftTrigger)
@@ -162,10 +198,7 @@ class XboxGamepad:
             stop_all=self._button_edge(buttons, B),
             status=self._button_edge(buttons, X),
             quit=self._button_edge(buttons, BACK),
-            speed_down=self._button_edge(buttons, LEFT_SHOULDER)
-            or self._button_edge(buttons, DPAD_DOWN),
-            speed_up=self._button_edge(buttons, RIGHT_SHOULDER)
-            or self._button_edge(buttons, DPAD_UP),
+            speed_factor=stick_speed_factor(lx, ly, rx, ry, deadzone=dz),
             toggle_invert_xy=self._button_edge(buttons, START),
             connected=True,
         )
