@@ -19,7 +19,6 @@ backed up and restorable, see [Restoring stock firmware](#restoring-stock-firmwa
 | `mt4_mcp/` | MCP server (HTTP or stdio) exposing status, motion, and vision pick/place tools |
 | `jog.py` | Keyboard + Xbox gamepad jog client (Cartesian + J4 roll + gripper) |
 | `map_envelope.py` | Jog and tag in/out-of-range poses into `envelope_samples.json` |
-| `docs/ENVELOPE_HANDOVER.md` | Envelope mapping results, soft limits, firmware/Python sync |
 | `goto_position.py` | Prompt-driven absolute-position client (firmware `mp`) |
 | `calibrate_vision.py` | Interactive jog-to-marker camera calibration |
 | `calibrate_height.py` | Auto probe-fit cube-top / pick-height correction after vision calibration |
