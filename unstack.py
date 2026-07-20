@@ -96,9 +96,12 @@ def main() -> int:
         around the column line, read a height close to a whole level,
         and imply a small XY offset -- otherwise it is not a stack.
         """
-        best: tuple[int, str, float, float] | None = None
+        best: tuple[int, str, tuple[float, float]] | None = None
         seen = set()
-        for n in range(args.max_levels, 0, -1):
+        for n in range(args.max_levels, 1, -1):
+            # n stops at 2: a "level 1 stack" is just a table cube -- the
+            # stack script's site-clearing handles those; treating one as
+            # a stack here caused 20mm-high air grabs.
             pred = model.predict_px(n * cube)
             for color in COLOR_RANGES:
                 g = find_top_face(frame, color, pred)
@@ -108,25 +111,32 @@ def main() -> int:
                 along, perp = model.components(*g)
                 h_est = model.h_of_s(along)
                 n_est = round(h_est / cube)
-                if n_est < 1 or n_est > args.max_levels:
+                if n_est < 2 or n_est > args.max_levels:
                     continue
                 if abs(perp) > 14.0:
                     continue  # off the column line laterally
                 if abs(h_est - n_est * cube) > 10.0:
                     continue  # not a whole level: coupling artefact
-                p_n = model.predict_px(n_est * cube)
-                off = ground_offset_mm(
-                    (g[0] - p_n[0], g[1] - p_n[1]), jac, model.hc,
-                    n_est * cube,
-                )
+                off = xy_offset_for(g, n_est)
                 if math.hypot(*off) > 20.0:
                     continue  # too far from the site to be this stack
                 if best is None or n_est > best[0]:
-                    best = (n_est, color, sx + off[0], sy + off[1])
+                    best = (n_est, color, g)
         if best is None:
             return None
-        n_est, color, tx, ty = best
-        return color, tx, ty, n_est
+        n_est, color, g = best
+        return color, g, n_est
+
+    def xy_offset_for(g: tuple[float, float], n: int) -> tuple[float, float]:
+        """Robot XY offset from the column implied by blob g IF it is the
+        top of an n-level stack. The height hypothesis and the XY are one
+        joint interpretation -- retrying a grab one level lower MUST also
+        recompute the XY (the parallax scaling differs per level; reusing
+        the level-3 XY for a level-1 grab missed by ~10mm)."""
+        p_n = model.predict_px(n * cube)
+        return ground_offset_mm(
+            (g[0] - p_n[0], g[1] - p_n[1]), jac, model.hc, n * cube,
+        )
 
     client = Mt4Client() if not args.port else Mt4Client(port=args.port)
     cam = FrameStream(args.camera)
@@ -189,26 +199,34 @@ def main() -> int:
             if top is None:
                 print("no stack top found -- site clear")
                 break
-            color, tx, ty, n = top
-            print(f"top: {color} level {n} at ({tx:.1f},{ty:.1f})")
+            color, g, n = top
             if (prev_top_px is not None
-                    and math.hypot(tx - prev_top_px[0],
-                                   ty - prev_top_px[1]) < 4.0):
+                    and math.hypot(g[0] - prev_top_px[0],
+                                   g[1] - prev_top_px[1]) < 4.0):
                 print("stack top did not change after a removal pass -- "
                       "stopping (would loop forever)", file=sys.stderr)
                 break
-            prev_top_px = (tx, ty)
+            prev_top_px = g
             # The monocular height estimate couples with XY offset (an
             # offset top face fakes extra height), so a grab can close on
             # air ABOVE the real top. Aim at the estimate, verify a cube
-            # is actually held, and step DOWN one level per miss -- never
-            # below level 1, and never park thin air (the first version
-            # "removed" the same phantom four times).
+            # is actually held, and step DOWN one level per miss (with the
+            # XY recomputed for EACH height hypothesis) -- and never park
+            # thin air (the first version "removed" the same phantom four
+            # times).
             got = None
-            for try_n in range(n, max(0, n - 3), -1):
-                if try_n != n:
+            for try_n in range(n, max(1, n - 3), -1):
+                off = xy_offset_for(g, try_n)
+                tx, ty = sx + off[0], sy + off[1]
+                if try_n == n:
+                    print(f"top: {color} level {n} at ({tx:.1f},{ty:.1f})")
+                else:
                     print(f"  grab missed -- retrying one level lower "
-                          f"({try_n})")
+                          f"({try_n}) at ({tx:.1f},{ty:.1f})")
+                if math.hypot(*off) > 35.0:
+                    print(f"  implied position {math.hypot(*off):.0f}mm off "
+                          f"the column for level {try_n} -- not this stack")
+                    continue
                 grab_at(tx, ty, try_n)
                 got = holding()
                 if got is not None:

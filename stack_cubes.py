@@ -113,7 +113,10 @@ DRIFT_FIXABLE_MM = 45.0   # beyond this the cube is somewhere unexpected: abort
 # what remains is release drag (2-6mm, semi-random). Falls back to the
 # open-loop dead-reckoned place when the held cube isn't visible.
 SERVO_HOVER_TOL_MM = 2.0     # accept hover position below this
-SERVO_HOVER_ITERS = 4        # measure/correct rounds at hover
+SERVO_HOVER_ITERS = 5        # measure/correct rounds at hover
+# Hover corrections in x respond with ~2x the commanded change (attempt-6:
+# +9.9 -> -9.2 -> +9.1 oscillation); damping keeps the loop gain under 1.
+SERVO_HOVER_GAIN = 0.55
 SERVO_RELEASE_TOL_MM = 3.0   # max pre-release offset; else raise + retry
 SERVO_RELEASE_RETRIES = 2
 # Small reversing corrections at place height showed ~2-3x apparent gain
@@ -285,7 +288,10 @@ def classify_level(h_err: float, drift: float, cube: float) -> str:
         return "misplaced"
     if drift <= DRIFT_OK_MM and h_err < -cube - HEIGHT_TOL_MM:
         return "abort"
-    if drift <= DRIFT_OK_MM and h_err < -HEIGHT_TOL_MM:
+    if drift <= DRIFT_OK_MM and abs(h_err) > HEIGHT_TOL_MM:
+        # On-column with a height anomaly: LOW = hanging off an edge;
+        # HIGH = tilted / corner-perched (attempt-6: level 2 read +11mm at
+        # 4mm drift and the next cube slid off it). Both need a re-seat.
         return "perched"
     return "seated"
 
@@ -309,6 +315,10 @@ def park_spot_for_clear(
         if near_camera_park(x, y):
             return False
         if not is_mp_reachable_xy(x, y):
+            return False
+        if ik_position(x, y, 185.0, near=JointAnglesDeg(0, 0, 0, 0)) is None:
+            # A spot the arm cannot actually reach at safe height crashes
+            # the run mid-place with `err mp joints` (attempt-9).
             return False
         return all(
             math.hypot(x - px, y - py) >= SITE_KEEP_CLEAR_MM for px, py in shadow
@@ -409,6 +419,14 @@ def main() -> int:
     )
 
     # Parallax model from the two calibrated planes at the stack site.
+    if not calib.cube_top_homography:
+        print(
+            "cube_top_homography missing -- stacking needs the cube-top "
+            "parallax map (cleared by recalibrate_camera / table-plane "
+            "refits). Run: python calibrate_height.py --camera 1",
+            file=sys.stderr,
+        )
+        return 1
     ht_inv = np.linalg.inv(np.array(calib.homography))
     hc_inv = np.linalg.inv(np.array(calib.cube_top_homography))
 
@@ -540,6 +558,11 @@ def main() -> int:
         # level's prior.
         carry = np.zeros(2)
         grip_ref: dict[str, tuple[float, float]] = {}
+        # SESSION-scoped avoid list: park spots of rejected cubes and
+        # grasp-hostile positions. Per-level scoping let the same bad
+        # cube/spot be revisited level after level (attempt-8 looped on
+        # one green six times across two runs).
+        avoid_xys: list[tuple[float, float]] = []
 
         def choose_park(held_color: str) -> tuple[float, float, str] | None:
             """Capture pose + free marker/slot away from the stack site."""
@@ -591,8 +614,38 @@ def main() -> int:
                 print("  grip inspection: cube not seen (grasp lost?)")
                 return None
             if color not in grip_ref:
+                # Motion-verify before trusting a FIRST reference: the wide
+                # first-search can match a parked desk cube (attempt-6
+                # anchored green's reference on one 75px off, poisoning
+                # every later green check and blinding the servo). The held
+                # cube must follow a small arm shift; static blobs don't.
+                dv = (6.0, 0.0)
+                inv_jac_i = np.linalg.inv(jac_i)
+                dpx = inv_jac_i @ np.array(dv) * imodel.hc / (imodel.hc - h_ins)
+                _approach(client, calib, ix + dv[0], iy + dv[1], iz,
+                          "reference motion check")
+                time.sleep(0.6)
+                exp = np.array(g) + dpx
+                g2 = find_top_face(cam.fresh(), color,
+                                   (float(exp[0]), float(exp[1])),
+                                   radius=TRACK_RADIUS_PX, exclude=excl)
+                _approach(client, calib, ix, iy, iz, "inspect pose")
+                moved_ok = False
+                if g2 is not None:
+                    moved = math.hypot(g2[0] - g[0], g2[1] - g[1])
+                    moved_ok = moved >= 0.4 * float(np.linalg.norm(dpx))
+                if not moved_ok:
+                    print("  grip inspection: blob failed the motion check "
+                          "(static desk cube, not the held one)")
+                    return None
+                time.sleep(0.6)
+                g3 = find_top_face(cam.fresh(), color, g,
+                                   radius=TRACK_RADIUS_PX, exclude=excl)
+                if g3 is not None:
+                    g = g3
                 grip_ref[color] = g
-                print(f"  grip reference for {color}: ({g[0]:.1f},{g[1]:.1f})")
+                print(f"  grip reference for {color}: ({g[0]:.1f},{g[1]:.1f})"
+                      f" (motion-verified)")
                 return (0.0, 0.0), g
             ref = grip_ref[color]
             raw = ground_offset_mm(
@@ -765,7 +818,7 @@ def main() -> int:
                     trusted, tracked = True, gpx
                     if math.hypot(*off) <= SERVO_HOVER_TOL_MM:
                         break
-                    step = _clamp(np.array(off), 12.0)
+                    step = _clamp(SERVO_HOVER_GAIN * np.array(off), 12.0)
                     ax -= float(step[0])
                     ay -= float(step[1])
                     seat_xy(ax, ay, z_tr, "servo hover correct")
@@ -840,6 +893,12 @@ def main() -> int:
                     break
                 print("  servo: still badly positioned -- full re-approach")
                 _approach(client, calib, ax, ay, z_tr, "raise for re-approach")
+            # Release happens at z_pl already 3mm under the nominal seat
+            # (light contact; verified by the 2026-07-20 contact probe).
+            # NO extra press before opening: releasing under a deliberate
+            # 2mm press let the unloading fingers FLICK the cube 28mm
+            # (attempt-10), while the plain contact release only drags
+            # the usual few mm.
             client.gripper(calib.grip_open_s)
             # Rise DEAD VERTICAL from the exact release XY: the arm sits at
             # (ax - descent_comp), and clearing toward any other XY drags
@@ -859,10 +918,14 @@ def main() -> int:
             _approach(client, calib, x, y, z_tr, "lift cube")
 
         for level, color in enumerate(seq, start=1):
-            # +1mm, not the table-place +3mm: a 3mm drop onto a slightly
-            # misaligned cube edge BOUNCES it off the stack (observed 30-40mm
-            # scatter); setting it down in near-contact cannot.
-            z_place = calib.pick_z + (level - 1) * cube + 1.0
+            # Level 1 releases +1mm over the flat table (drops don't bounce
+            # there). Level 2+ releases 3mm BELOW nominal seat: the arm's
+            # true z runs a few mm high at the site, so "+1mm" was really a
+            # several-mm drop onto the cube below -- which randomly bounces
+            # 30-60mm (attempts 5-7 lost servo-perfect landings this way).
+            # A light press is safe (the arm is springy); a drop is not.
+            z_place = (calib.pick_z + (level - 1) * cube
+                       + (1.0 if level == 1 else -3.0))
             z_travel = z_place + TRAVEL_ABOVE_MM
             if ik_position(sx, sy, z_travel, near=home_q) is None:
                 print(f"level {level}: travel height {z_travel:.0f}mm not solvable -- stopping")
@@ -870,10 +933,7 @@ def main() -> int:
 
             # Fresh scene each level: pick the planned color, verified grasp.
             # A cube that fails grip validation is parked on a free spot and
-            # another candidate is tried (up to GRIP_CUBE_ATTEMPTS). Every
-            # park spot this level is remembered -- with max(area) selection
-            # a cube rejected on try 1 would otherwise be re-picked on try 3.
-            avoid_xys: list[tuple[float, float]] = []
+            # another candidate is tried (up to GRIP_CUBE_ATTEMPTS).
             goff = (0.0, 0.0)
             grip_reading = (0.0, 0.0)
             grip_good = False
@@ -904,6 +964,19 @@ def main() -> int:
                         default=1e9,
                     )
 
+                # Skip spots the arm cannot solve at safe height -- the
+                # move would die mid-pick with `err mp joints` (attempt-9
+                # crashed on a green at (120,-224)). Hard filter: an
+                # unreachable cube is not a candidate at all.
+                cands = [
+                    c for c in cands
+                    if ik_position(float(c.x), float(c.y), calib.safe_z,
+                                   near=home_q) is not None
+                ]
+                if not cands:
+                    print(f"level {level}: no reachable {color} cube left "
+                          f"-- stopping")
+                    break
                 # Near-miss picks shove neighbours: take the biggest cube
                 # with clear space around it; if none is clear, the most
                 # isolated one.
@@ -934,10 +1007,21 @@ def main() -> int:
                         # Neither at the pick spot nor seen in the gripper:
                         # it may be held but occluded -- run a place cycle
                         # at a free spot before rescanning, never risk
-                        # opening over thin air on a later pick.
+                        # opening over thin air on a later pick. This
+                        # cube/spot is hostile (attempt-8 looped on one
+                        # green six times): avoid it for the whole session.
                         print("  cube neither at pick spot nor seen in "
                               "gripper -- safety park, then rescanning")
-                        park_held("safety park", color)
+                        avoid_xys.append((float(target.x), float(target.y)))
+                        if park_held("safety park", color) is None:
+                            # NEVER proceed possibly-holding: the next
+                            # pick opens the gripper at height (attempt-9
+                            # risked a 340mm drop this way). Arm-known
+                            # place at the original pick spot instead.
+                            print("  no park spot -- placing back at the "
+                                  "pick XY")
+                            place(client, calib,
+                                  float(target.x), float(target.y))
                     continue
                 if isinstance(grip, tuple) and grip and grip[0] == "parked":
                     avoid_xys.append(grip[1])

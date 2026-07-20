@@ -96,7 +96,10 @@ def test_classify_perched_only_when_on_column():
     # Height trusted only when drift <= DRIFT_OK (6mm).
     assert classify_level(-12.0, 5.0, 20.0) == "perched"
     assert classify_level(-12.0, 10.0, 20.0) == "seated"  # off-column: ignore h
-    assert classify_level(+12.0, 5.0, 20.0) == "seated"   # high never perched
+    # On-column HIGH = tilted/corner-perched (attempt-6: +11mm at 4mm
+    # drift, next cube slid off) -- also a re-seat case now.
+    assert classify_level(+12.0, 5.0, 20.0) == "perched"
+    assert classify_level(+5.0, 5.0, 20.0) == "seated"
 
 
 def test_classify_abort_on_huge_drift():

@@ -29,13 +29,14 @@ COLOR_RANGES: dict[str, list[tuple[tuple[int, int, int], tuple[int, int, int]]]]
 # ~2000-3000px^2; the old far-mount range was ~150-650.
 MIN_BLOB_AREA = 120.0
 # Reject blobs larger than this -- the arm's own orange/red body still reads
-# as "red", but after moving the camera closer a real on-pad cube is ~2790px^2
-# (measured 2026-07-20) while the old MAX of 900 dropped it as "too big" and
-# left only arm-paint flecks. Arm-scale blobs that survive are still rejected
-# downstream by keep-out / marker-hull / reach (scene.is_phantom_detection).
-# detect_cubes sorts largest-first, so this cap still matters when an
-# uncapped wall/arm smear would otherwise outrank every cube.
-MAX_BLOB_AREA = 4000.0
+# as "red", but after moving the camera closer a real on-pad cube is
+# ~2800-3600px^2 (measured 2026-07-20) while the old MAX of 900 dropped
+# it as "too big" and left only arm-paint flecks. Arm-scale blobs that
+# survive are still rejected downstream by keep-out / marker-hull / reach
+# (scene.is_phantom_detection). detect_cubes sorts largest-first, so this
+# cap still matters when an uncapped wall/arm smear would otherwise
+# outrank every cube.
+MAX_BLOB_AREA = 6000.0
 # Reject blobs whose bounding-box aspect is far from square (cubes are square
 # from above; this drops elongated glare streaks and desk-edge artifacts).
 MAX_ASPECT = 2.0
