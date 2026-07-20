@@ -68,9 +68,12 @@ GRIP_TRIES = 3
 # reached with a plain move -- no homing cycle (steps aren't lost in normal
 # operation), and unlike pickplace's camera park it doesn't lean over the
 # desk (the park pose shadows reads around (200, +-60)).
-CAPTURE_POSE = (172.0, 0.0, 370.0)
+# z capped by soft J3 max (1150): (172,0,370) needs J3~1578 and `mp` rejects
+# it with `err mp joints`. 340mm is the highest keep-out-pinned pose with
+# ~60 steps of J3 headroom under the 2026-07-19 envelope limits.
+CAPTURE_POSE = (172.0, 0.0, 340.0)
 # The lean of lower capture poses shadows reads around (200, +-60) -- never
-# park or read cubes there; (172,0,370) is nearly vertical (r pinned by the
+# park or read cubes there; (172,0,340) is nearly vertical (r pinned by the
 # keep-out cylinder).
 # Clearance climb above the current place height for every traverse near the
 # stack -- the gripper (with cube) must never cross the stack column lower.
