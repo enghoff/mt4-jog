@@ -207,15 +207,16 @@ def pick(
 
     When ``yaw_deg`` is set (robot-frame cube-edge angle from detection) and
     face-align is enabled, world-frame J4 is commanded so the jaws meet a
-    face rather than a corner. Face-align defaults off until
+    face rather than a corner. Face-align defaults on now that
     ``Calibration.face_align_picks`` / ``j4_face_offset_deg`` are validated
-    on hardware -- a wrong offset is worse than a fixed yaw. Callers with a
+    on hardware -- a wrong offset is worse than a fixed yaw, so don't flip
+    this back off without a re-measured offset. Callers with a
     ``CubeDetection`` should prefer ``pick_cube``.
     """
     ensure_homed(client)
     _require_mp_reachable(x, y, "pick target")
     if face_align is None:
-        face_align = bool(getattr(calib, "face_align_picks", False))
+        face_align = bool(getattr(calib, "face_align_picks", True))
     j4 = resolve_pick_j4(client, calib, yaw_deg, face_align=face_align)
     client.gripper(calib.grip_open_s)
     _travel(client, calib, x, y, calib.safe_z, "move to safe height", j4=j4)

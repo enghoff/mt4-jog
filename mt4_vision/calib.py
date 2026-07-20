@@ -129,10 +129,12 @@ class Calibration:
     # face-aligned picks (pickplace.j4_for_face_align). Mount-specific:
     # jaws vs j4=0; leave 0 until measured on hardware.
     j4_face_offset_deg: float = 0.0
-    # When True, vision picks command J4 from CubeDetection.yaw_deg. Off by
-    # default until j4_face_offset_deg is validated -- a wrong offset makes
-    # corner grips more common than a fixed wrist yaw.
-    face_align_picks: bool = False
+    # When True, vision picks command J4 from CubeDetection.yaw_deg. On by
+    # default now that j4_face_offset_deg (33.0, calibrate_j4.py) is
+    # validated on hardware -- a wrong offset would make corner grips more
+    # common than a fixed wrist yaw, so this must stay in sync with a real
+    # measured offset.
+    face_align_picks: bool = True
     # Pixel-space convex hull of the marker centers. Detections outside it
     # are rejected (the arm's orange body and off-desk clutter live there).
     workspace_hull_px: list[list[float]] | None = None
