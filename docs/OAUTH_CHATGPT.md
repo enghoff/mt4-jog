@@ -77,6 +77,10 @@ root — requesting the root path returns 404 by design (RFC 9728).
 
 ## Notes
 
+- `mt4_mcp/auth.py` allowlists ChatGPT, Claude.ai/Claude.com hosted callbacks,
+  Cursor web/deeplink callbacks, and local loopback
+  (`http://localhost:*/callback` for Claude Code / Cursor desktop). Missing a
+  client pattern surfaces as `Redirect URI '…' does not match allowed patterns`.
 - OAuth applies to the **HTTP** server only. Cursor's stdio MCP (`--stdio`) stays
   local and does not use these settings.
 - Only one process can hold `COM6`. Stop `jog.py` and Cursor's MT4 MCP

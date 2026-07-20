@@ -20,12 +20,19 @@ from fastmcp.server.auth.providers.google import GoogleProvider
 
 
 
-CHATGPT_REDIRECT_PATTERNS = [
-
+# MCP clients register their own callback URLs during DCR / authorize.
+# ChatGPT / Claude.ai / Cursor each use fixed hosted callbacks; Claude Code
+# and Cursor desktop use loopback (any port). FastMCP matches with wildcards
+# (see fastmcp.server.auth.redirect_validation).
+ALLOWED_CLIENT_REDIRECT_PATTERNS = [
     "https://chatgpt.com/connector/oauth/*",
-
     "https://chatgpt.com/connector_platform_oauth_redirect",
-
+    "https://claude.ai/api/mcp/auth_callback",
+    "https://claude.com/api/mcp/auth_callback",
+    "http://localhost:*/callback",
+    "http://127.0.0.1:*/callback",
+    "https://www.cursor.com/agents/mcp/oauth/callback",
+    "cursor://anysphere.cursor-mcp/oauth/callback",
 ]
 
 
@@ -201,7 +208,7 @@ def build_auth_provider() -> GoogleProvider | None:
 
         required_scopes=MT4_OAUTH_SCOPES,
 
-        allowed_client_redirect_uris=CHATGPT_REDIRECT_PATTERNS,
+        allowed_client_redirect_uris=ALLOWED_CLIENT_REDIRECT_PATTERNS,
 
         jwt_signing_key=jwt_key,
 
