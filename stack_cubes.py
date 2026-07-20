@@ -46,6 +46,7 @@ from mt4_vision.pickplace import (
     near_camera_park,
     pick,
     place,
+    resolve_place_j4,
 )
 from mt4_vision.scene import Scene, capture_scene, is_phantom_detection
 from mt4_vision.workspace import is_mp_reachable_xy
@@ -793,6 +794,14 @@ def main() -> int:
             _approach(client, calib, tcp.x, tcp.y, z_tr, "climb with cube")
             _approach(client, calib, via[0], via[1], z_tr, "via point")
             seat_xy(x, y, z_tr, "over stack")
+            # Square the held cube to the X/Y axes BEFORE the hover servo:
+            # the rotation shifts the cube's XY by its grip offset, and the
+            # servo then measures and cancels that shift like any other.
+            # Later mm-scale servo moves barely change J1, so the world yaw
+            # set here survives the wrist-preserving moves below.
+            j4_sq = resolve_place_j4(client, calib)
+            if j4_sq is not None:
+                _approach(client, calib, x, y, z_tr, "square wrist", j4=j4_sq)
             ax, ay = x, y
             h_hover = (z_tr - calib.pick_z) + cube
             h_rel = (z_pl - calib.pick_z) + cube

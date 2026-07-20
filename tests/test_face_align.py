@@ -7,11 +7,33 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from mt4_vision.calib import Calibration
 from mt4_vision.pickplace import (
     fold_square_yaw_deg,
     j4_for_face_align,
     j4_preserve_wrist,
+    resolve_place_j4,
 )
+
+
+class _Tcp:
+    def __init__(self, j4):
+        self.j4 = j4
+
+
+class _StubClient:
+    def __init__(self, tcp=None):
+        self._tcp = tcp
+
+    def get_tcp(self):
+        return self._tcp
+
+
+def _calib(**kw) -> Calibration:
+    return Calibration(
+        homography=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+        table_z=0.0, pick_z=10.0, safe_z=80.0, **kw,
+    )
 
 
 def test_fold_square_yaw_period_90():
@@ -46,10 +68,27 @@ def test_j4_preserve_wrist_holds_joint_across_j1_swing():
     assert abs(j4 - (-1.367)) < 0.05
 
 
+def test_resolve_place_j4_off_skips_hardware():
+    # Explicitly disabled: no squaring, and no hardware access either.
+    calib = _calib(j4_face_offset_deg=33.0)
+    assert resolve_place_j4(None, calib, axis_align=False) is None
+
+
+def test_resolve_place_j4_squares_to_offset_nearest_current():
+    calib = _calib(j4_face_offset_deg=33.0)
+    # Default is on; no TCP reading: folded offset.
+    assert abs(resolve_place_j4(_StubClient(), calib) - 33.0) < 1e-9
+    # Wrist at 95°: nearest 90°-equivalent of 33° is 123°.
+    j4 = resolve_place_j4(_StubClient(_Tcp(95.0)), calib)
+    assert abs(j4 - 123.0) < 1e-9
+
+
 if __name__ == "__main__":
     test_fold_square_yaw_period_90()
     test_j4_face_align_folds_without_current()
     test_j4_face_align_picks_nearest_90_to_current()
     test_j4_face_align_applies_offset()
     test_j4_preserve_wrist_holds_joint_across_j1_swing()
+    test_resolve_place_j4_off_skips_hardware()
+    test_resolve_place_j4_squares_to_offset_nearest_current()
     print("ok")

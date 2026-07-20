@@ -194,6 +194,29 @@ def resolve_pick_j4(
     return j4_for_face_align(yaw_deg, current_j4_deg=current, offset_deg=offset)
 
 
+def resolve_place_j4(
+    client: Mt4Client,
+    calib: Calibration,
+    *,
+    axis_align: bool = True,
+) -> float | None:
+    """World-frame J4 that lands the held cube square to the X/Y axes.
+
+    A gripped cube's orientation relative to the jaws is fixed at pick time,
+    so driving J4 to ``j4_face_offset_deg`` (mod 90°, closest to the current
+    wrist to minimize travel) squares whatever face is held to the world
+    axes -- the same calibrated offset ``resolve_pick_j4`` uses, just with
+    the target edge angle fixed at 0° instead of a detected cube yaw.
+
+    Defaults on unconditionally (validated safe on hardware): even for a
+    pick that wasn't face-aligned, squaring the wrist costs nothing worse
+    than the unaligned yaw it would otherwise land at.
+    """
+    if not axis_align:
+        return None
+    return resolve_pick_j4(client, calib, 0.0, face_align=True)
+
+
 def pick(
     client: Mt4Client,
     calib: Calibration,
@@ -264,17 +287,22 @@ def place(
     y: float,
     *,
     on_released: Callable[[], None] | None = None,
+    axis_align: bool = True,
 ) -> dict[str, object]:
     """Release the held cube at robot-frame (x, y).
 
     Releases slightly above pick height so the cube drops the last couple of
-    mm instead of being pressed into the table.
+    mm instead of being pressed into the table. By default world-frame J4 is
+    driven square to the X/Y axes during the approach (calibrated
+    ``j4_face_offset_deg``) so the released cube lands aligned rather than
+    at whatever orientation it happened to be picked in.
     """
     ensure_homed(client)
     _require_mp_reachable(x, y, "place target")
+    j4 = resolve_place_j4(client, calib, axis_align=axis_align)
     release_z = calib.pick_z + 3.0
-    _travel(client, calib, x, y, calib.safe_z, "move to safe height")
-    _approach(client, calib, x, y, release_z, "descend to release height")
+    _travel(client, calib, x, y, calib.safe_z, "move to safe height", j4=j4)
+    _approach(client, calib, x, y, release_z, "descend to release height", j4=j4)
     client.gripper(calib.grip_open_s)
     if on_released is not None:
         on_released()
