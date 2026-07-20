@@ -243,14 +243,18 @@ def main() -> int:
             send(ser, "all f", wait=0.5)
             send(ser, "orient on", wait=0.3)
 
-            print("Homing first (clear the workspace)...")
-            run_home(ser, buf, args.j1_center, args.j2_pull, args.verbose)
+            status = query_status(ser, buf, args.verbose)
+            if status.homed:
+                print("Already homed (press H anytime to re-home and clear the view)")
+            else:
+                print("Homing first (clear the workspace)...")
+                run_home(ser, buf, args.j1_center, args.j2_pull, args.verbose)
         except (FirmwareNotReadyError, SerialGoneError) as exc:
             print(exc, file=sys.stderr)
             return 1
 
-        # Reference frame after homing: the arm sits clear of the table, so
-        # every physically present marker should be visible here.
+        # Reference frame: prefer a clear view of every marker. If we skipped
+        # home, the arm may still be over the pad -- H rehomes if needed.
         frame = grab_frame(cap)
         ref_markers = detect_markers(frame, args.dict)
         if len(ref_markers) < 3:

@@ -44,7 +44,7 @@ from mt4_vision.calib import (
 )
 from mt4_vision.camera import capture_frame
 from mt4_vision.detect import CubeDetection, detect_cubes
-from mt4_vision.pickplace import home_arm, pick, place
+from mt4_vision.pickplace import home_arm, pick, place, retreat_for_camera
 from mt4_vision.scene import filter_phantoms
 from mt4_vision.workspace import (
     MAX_REACH_MM,
@@ -175,7 +175,9 @@ def main() -> int:
     try:
         client.ensure_connected()
         status = client.get_status()
-        if not status.homed:
+        if status.homed:
+            print("Already homed")
+        else:
             print("Homing first...")
             home_arm(client)  # raises on failure instead of sailing on unhomed
             status = client.get_status()
@@ -319,7 +321,7 @@ def main() -> int:
 
             try:
                 pick(client, calib, *probe_xy)
-                home_arm(client)
+                retreat_for_camera(client, calib)
             except Mt4ClientError as exc:
                 print(f"  Pick failed ({exc}), skipping this point")
                 known_xy = None
@@ -354,7 +356,7 @@ def main() -> int:
                 # base avoidance is the firmware's job now: mp routes around
                 # the keep-out cylinder on its own
                 place(client, calib, gx, gy)
-                home_arm(client)
+                retreat_for_camera(client, calib)
             except Mt4ClientError as exc:
                 print(f"  Place failed ({exc}), skipping this point")
                 known_xy = None
@@ -394,9 +396,9 @@ def main() -> int:
             for _rep in range(max(0, args.reps - 1)):
                 try:
                     pick(client, calib, gx, gy)
-                    home_arm(client)
+                    retreat_for_camera(client, calib)
                     place(client, calib, gx, gy)
-                    home_arm(client)
+                    retreat_for_camera(client, calib)
                 except Mt4ClientError as exc:
                     print(f"  rep failed ({exc}); target stays single-sampled")
                     break
