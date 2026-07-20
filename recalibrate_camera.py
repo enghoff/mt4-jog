@@ -245,6 +245,14 @@ def main() -> int:
         cam_xy_robot=None,
         cam_height_mm=None,
         color_ranges=prev.color_ranges,
+        # NOT carried over: color_xy_offset_mm. Those offsets compensate the
+        # color-dependent centroid bias (which side faces each HSV mask
+        # admits) -- a function of the viewing geometry, so a camera move
+        # invalidates them just like the parallax fallback below. Re-measure
+        # at the new pose if needed.
+        color_xy_offset_mm={},
+        j4_face_offset_deg=prev.j4_face_offset_deg,
+        face_align_picks=prev.face_align_picks,
         # Hull from every visible marker (matched or not), like
         # calibrate_vision.py -- a hull of only the matched markers would
         # silently exclude an occluded marker's corner of the desk from cube

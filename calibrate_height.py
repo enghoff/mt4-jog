@@ -29,6 +29,7 @@ No human interaction needed -- the arm places its own calibration probe.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 import time
@@ -235,20 +236,33 @@ def main() -> int:
         robot_pts: list[tuple[float, float]] = []
         probe_colors: list[str] = []
 
-        def keep_probe_observations() -> None:
+        def keep_probe_observations(*, replace: bool = False) -> None:
             """Persist raw (pixel, robot, color) observations -- on every exit path that
             has any, not just success: a run aborted by a dropped cube already
             paid the arm time for its points, and offline refits can merge
             them with a later session's. Color matters: red- and blue-cube
             centroids of the same physical position measured ~10px apart
             (different HSV masks include different side faces), so
-            cross-color merges must model that or stay single-color."""
+            cross-color merges must model that or stay single-color.
+
+            Failure paths APPEND to the stored archive (replace=False): a
+            2-point aborted run must not destroy a prior full collection
+            (2026-07-20: an aborted run overwrote 10 good observations with
+            2 phantom ones). Only a successful refit replaces the archive
+            -- and when --merge was used, pixel_pts already contains the
+            stored points, so nothing is lost there either."""
             if not pixel_pts:
                 return
-            calib.probe_observations = [
+            new = [
                 {"pixel": [round(p[0], 2), round(p[1], 2)], "robot": list(r), "color": c}
                 for p, r, c in zip(pixel_pts, robot_pts, probe_colors)
             ]
+            if not replace and calib.probe_observations:
+                seen = {json.dumps(o, sort_keys=True) for o in calib.probe_observations}
+                new = calib.probe_observations + [
+                    o for o in new if json.dumps(o, sort_keys=True) not in seen
+                ]
+            calib.probe_observations = new
             calib.save(Path(args.calib))
 
         def locate_probe(near_xy: tuple[float, float]) -> tuple[float, float] | None:
@@ -516,7 +530,7 @@ def main() -> int:
         ]
         print(f"With residual layer (mm): {[round(e, 2) for e in post]}")
 
-        keep_probe_observations()
+        keep_probe_observations(replace=True)
         print(f"\nSaved cube_top_homography + residual layer ({len(pixel_pts)} "
               f"raw probe observations kept) to {args.calib}")
         return 0

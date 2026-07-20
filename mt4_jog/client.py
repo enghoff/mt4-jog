@@ -381,9 +381,17 @@ class Mt4Client:
                     )
                 j4 = status.tcp.j4
 
-            cmd = f"mp {x} {y} {z} {j4} {grip}"
+            # Firmware line_buf is 64 bytes; full Python float repr of
+            # detection XY + j4 + speed easily overflows and truncates mid-
+            # token (parse fails with the usage string). Match the firmware's
+            # own 0.1mm / 0.1deg reporting precision.
+            cmd = f"mp {x:.2f} {y:.2f} {z:.2f} {j4:.2f} {int(grip)}"
             if speed_us:
-                cmd += f" {speed_us}"
+                cmd += f" {int(speed_us)}"
+            if len(cmd) >= 64:
+                raise Mt4ClientError(
+                    f"mp command exceeds 64-byte firmware line buffer: {cmd!r}"
+                )
             collected = self._send_and_collect(cmd, wait=1.0)
             return self._await_completion(
                 done_prefix="mp done", timeout=timeout, collected=collected

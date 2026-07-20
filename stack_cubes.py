@@ -989,7 +989,10 @@ def main() -> int:
                       f"({target.x:.1f},{target.y:.1f}) "
                       f"clearance {clearance(target):.0f}mm "
                       f"(cube {cube_try}/{GRIP_CUBE_ATTEMPTS})")
-                pick(client, calib, target.x, target.y)
+                pick(
+                    client, calib, target.x, target.y,
+                    yaw_deg=target.yaw_deg,
+                )
                 # Straight to grip inspection: seeing the cube in the
                 # gripper at the inspect pose proves the grasp AND measures
                 # it -- the old separate capture-pose grasp check cost a

@@ -191,7 +191,7 @@ class Scene:
         cy = sum(m.y for m in self.markers) / max(len(self.markers), 1)
         out.sort(
             key=lambda c: (
-                abs(c.area - 400.0),
+                abs(c.area - 2500.0),  # closer mount: real tops ~2–4k px²
                 dist_mm(float(c.x), float(c.y), cx, cy),
             )
         )

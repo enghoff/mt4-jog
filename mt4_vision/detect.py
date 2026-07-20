@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import cv2
@@ -26,8 +27,12 @@ COLOR_RANGES: dict[str, list[tuple[tuple[int, int, int], tuple[int, int, int]]]]
 }
 # Reject blobs smaller than this (px^2) -- noise, shadows, cable ties.
 # At the closer overhead mount (post-2026-07-20), real cube blobs are
-# ~2000-3000px^2; the old far-mount range was ~150-650.
-MIN_BLOB_AREA = 120.0
+# ~1600-3600px^2 (the old far-mount range was ~150-650, hence the old 120
+# floor). Keep a 2x margin below the smallest real cube: sub-cube blobs are
+# never cubes here, and 120 let a 263px^2 specular glare on a laminated
+# marker (reflecting the wall) pass as a blue cube -- calibrate_height then
+# "picked" and "placed" that phantom and recorded its pixels as probe data.
+MIN_BLOB_AREA = 800.0
 # Reject blobs larger than this -- the arm's own orange/red body still reads
 # as "red", but after moving the camera closer a real on-pad cube is
 # ~2800-3600px^2 (measured 2026-07-20) while the old MAX of 900 dropped
@@ -88,6 +93,10 @@ class CubeDetection:
     area: float  # px^2
     x: float | None = None  # robot frame (mm), None when uncalibrated
     y: float | None = None
+    # Robot-frame yaw (deg) of one top-face edge: atan2 of an edge mapped
+    # through the cube-top (or table) homography. Squares are 90°-periodic;
+    # None when the blob is too small / uncalibrated. Used for J4 face-align.
+    yaw_deg: float | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -96,6 +105,7 @@ class CubeDetection:
             "area_px": round(self.area),
             "x": None if self.x is None else round(self.x, 1),
             "y": None if self.y is None else round(self.y, 1),
+            "yaw_deg": None if self.yaw_deg is None else round(self.yaw_deg, 1),
         }
 
 
@@ -178,6 +188,36 @@ def _top_face_centroid(
     return bx + float(xs.mean()), by + float(ys.mean())
 
 
+def _robot_edge_yaw_deg(
+    contour: np.ndarray,
+    calibration: Calibration,
+) -> float | None:
+    """Yaw (deg) of a cube face edge in robot XY from minAreaRect corners.
+
+    Maps two adjacent box corners through the cube-top (preferred) or table
+    map and returns atan2(dy, dx). Squares are 90°-periodic -- either edge
+    is a valid face direction. Returns None when the contour is degenerate.
+    """
+    if len(contour) < 3:
+        return None
+    rect = cv2.minAreaRect(contour.astype(np.float32))
+    box = cv2.boxPoints(rect)
+    e01 = box[1] - box[0]
+    e12 = box[2] - box[1]
+    if float(np.linalg.norm(e01)) >= float(np.linalg.norm(e12)):
+        p0, p1 = box[0], box[1]
+    else:
+        p0, p1 = box[1], box[2]
+    if float(np.hypot(p1[0] - p0[0], p1[1] - p0[1])) < 2.0:
+        return None
+    x0, y0 = calibration.pixel_to_robot(float(p0[0]), float(p0[1]), on_cube_top=True)
+    x1, y1 = calibration.pixel_to_robot(float(p1[0]), float(p1[1]), on_cube_top=True)
+    dx, dy = x1 - x0, y1 - y0
+    if math.hypot(dx, dy) < 1e-3:
+        return None
+    return math.degrees(math.atan2(dy, dx))
+
+
 def detect_cubes(
     frame: np.ndarray,
     calibration: Calibration | None = None,
@@ -234,5 +274,6 @@ def detect_cubes(
                 if off:
                     det.x += float(off[0])
                     det.y += float(off[1])
+                det.yaw_deg = _robot_edge_yaw_deg(contour, calibration)
             detections.append(det)
     return sorted(detections, key=lambda d: -d.area)

@@ -118,6 +118,20 @@ def test_marker_to_slot_when_full():
     assert action.place_marker_id is None
 
 
+def test_blocker_to_slot_when_no_free_markers():
+    """Open-table cubes must still park onto free slots when every marker is
+    unknown (typical: arm over the pad, ArUco tags occluded)."""
+    s = scene([cube("red", 240.0, 100.0)], visible=set())
+    assert s.free_markers == []
+    assert s.blockers()
+    assert s.free_slots
+    action = plan_shuffle(s)
+    assert action.kind == "pick", action
+    assert action.place_kind == "to_slot", action
+    assert action.cube is not None
+    assert action.cube.color == "red"
+
+
 def test_marker_cube_to_free_marker_when_no_blocker():
     # Free markers 0,1,2; cube only on marker 3 -- relocate onto a free marker.
     s = scene(
