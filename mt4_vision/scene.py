@@ -39,11 +39,13 @@ from mt4_vision.workspace import (
     rebuild_workspace_state,
 )
 
-# Real cube top faces under this camera land ~280-650px^2. Tighter than
-# detect.py's floor so low-area glare/arm flecks are not pick targets while
-# still counting toward marker occupancy via the raw detection list.
-PICK_MIN_AREA = 280.0
-PICK_MAX_AREA = 650.0
+# Real cube blobs under the closer overhead mount land ~2000-3000px^2
+# (on-pad red measured 2790 on 2026-07-20). Tighter than detect.py's floor
+# so low-area glare/arm flecks are not pick targets while still counting
+# toward marker occupancy via the raw detection list. Old far-mount pick
+# band was 280-650 -- that rejected every real cube after the camera move.
+PICK_MIN_AREA = 400.0
+PICK_MAX_AREA = 3500.0
 # Allow cubes a bit outside the marker convex hull (markers aren't at the
 # desk edge). Measured phantoms run 60-90mm outside; real near-pad cubes
 # sit within ~15mm -- but measured live 2026-07-14, several genuine

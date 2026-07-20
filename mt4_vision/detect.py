@@ -25,14 +25,17 @@ COLOR_RANGES: dict[str, list[tuple[tuple[int, int, int], tuple[int, int, int]]]]
     "blue": [((90, 100, 60), (128, 255, 255))],
 }
 # Reject blobs smaller than this (px^2) -- noise, shadows, cable ties.
-# Cube top faces are only ~150-600px^2 at this camera distance.
+# At the closer overhead mount (post-2026-07-20), real cube blobs are
+# ~2000-3000px^2; the old far-mount range was ~150-650.
 MIN_BLOB_AREA = 120.0
-# Reject blobs larger than this -- the arm's own orange/red forearm reads as
-# "red" and its blob (~1600px^2+) is much bigger than any real cube (topped
-# out ~650px^2 across testing). Confirmed picking the wrong "cube" this way:
-# detect_cubes sorts largest-first, so an uncapped arm-body blob outranks the
-# real cube and gets treated as it by any caller taking the first result.
-MAX_BLOB_AREA = 900.0
+# Reject blobs larger than this -- the arm's own orange/red body still reads
+# as "red", but after moving the camera closer a real on-pad cube is ~2790px^2
+# (measured 2026-07-20) while the old MAX of 900 dropped it as "too big" and
+# left only arm-paint flecks. Arm-scale blobs that survive are still rejected
+# downstream by keep-out / marker-hull / reach (scene.is_phantom_detection).
+# detect_cubes sorts largest-first, so this cap still matters when an
+# uncapped wall/arm smear would otherwise outrank every cube.
+MAX_BLOB_AREA = 4000.0
 # Reject blobs whose bounding-box aspect is far from square (cubes are square
 # from above; this drops elongated glare streaks and desk-edge artifacts).
 MAX_ASPECT = 2.0
