@@ -130,6 +130,31 @@ def find_probe(frame, color: str, near_px: tuple[float, float]) -> CubeDetection
     return best
 
 
+def _needs_pose_recovery(client: Mt4Client, calib) -> tuple[bool, str]:
+    """True when the arm should home/retreat before the next pick/place leg."""
+    status = client.get_status()
+    j4_steps = status.joints.get("j4", 0)
+    if (
+        j4_steps >= JOINT_SOFT_MAX_STEPS[3] - J4_SOFT_MARGIN_STEPS
+        or j4_steps <= JOINT_SOFT_MIN_STEPS[3] + J4_SOFT_MARGIN_STEPS
+    ):
+        return True, f"J4 near soft limit ({j4_steps} steps)"
+    tcp = status.tcp
+    if tcp is not None and (
+        tcp.z < calib.safe_z - 5.0
+        or tcp.z < CAMERA_PARK_Z - 10.0
+        or not near_camera_park(tcp.x, tcp.y)
+    ):
+        return True, f"TCP stranded at ({tcp.x:.0f},{tcp.y:.0f},{tcp.z:.0f})"
+    return False, ""
+
+
+def _recover_pose(client: Mt4Client, calib, reason: str) -> None:
+    print(f"{reason}, re-homing...")
+    home_arm(client)
+    retreat_for_camera(client, calib)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Calibrate cube-top-height parallax")
     parser.add_argument("--port", default=None)
@@ -193,26 +218,10 @@ def main() -> int:
         else:
             print("Homing first...")
             home_arm(client)  # raises on failure instead of sailing on unhomed
-            status = client.get_status()
-        j4_steps = status.joints.get("j4", 0)
-        tcp = status.tcp
-        if (
-            j4_steps >= JOINT_SOFT_MAX_STEPS[3] - J4_SOFT_MARGIN_STEPS
-            or j4_steps <= JOINT_SOFT_MIN_STEPS[3] + J4_SOFT_MARGIN_STEPS
-        ):
-            print(f"J4 near soft limit ({j4_steps} steps), re-homing...")
-            home_arm(client)
-            status = client.get_status()
-            tcp = status.tcp
-        if tcp is not None and (
-            tcp.z < calib.safe_z - 5.0
-            or tcp.z < CAMERA_PARK_Z - 10.0
-            or not near_camera_park(tcp.x, tcp.y)
-        ):
-            print(f"Retreating to camera park from "
-                  f"({tcp.x:.0f},{tcp.y:.0f},{tcp.z:.0f})...")
-            retreat_for_camera(client, calib)
-            status = client.get_status()
+        needs_recovery, reason = _needs_pose_recovery(client, calib)
+        if needs_recovery:
+            _recover_pose(client, calib, reason)
+        status = client.get_status()
         # No-op move at the current pose, purely to reset cruise speed (see
         # RESET_SPEED_US) before the real moves below.
         client.move_to(status.tcp.x, status.tcp.y, status.tcp.z, speed_us=RESET_SPEED_US)
@@ -234,13 +243,14 @@ def main() -> int:
             print(f"Only {len(grid)} usable grid points; need >={min_targets}", file=sys.stderr)
             return 1
 
+        markers = marker_slots_from_calibration(calib)
         frame = capture_frame(**camera_kwargs)
         # Phantom-filter the probe pool (keep-out cylinder, area, hull, reach):
         # the arm base's own hardware intermittently reads as small blue blobs
         # inside the keep-out zone, and the grasp-failure rotation below would
         # otherwise eventually send the gripper at one.
         all_blobs = detect_cubes(frame, calib)
-        cubes = filter_phantoms(all_blobs, marker_slots_from_calibration(calib))
+        cubes = filter_phantoms(all_blobs, markers)
         dropped = [c for c in all_blobs if c not in cubes]
         if dropped:
             print("Ignoring phantom blob(s): "
@@ -310,7 +320,7 @@ def main() -> int:
             if found is not None:
                 return found
             candidates = [
-                c for c in detect_cubes(frame, calib)
+                c for c in filter_phantoms(detect_cubes(frame, calib), markers)
                 if c.color == probe_color and math.hypot(c.x, c.y) <= MAX_REACH_MM
             ]
             if not candidates:
@@ -328,6 +338,9 @@ def main() -> int:
         known_xy: tuple[float, float] | None = args.probe_at
         first_center = True
         for gx, gy in grid:
+            needs_recovery, reason = _needs_pose_recovery(client, calib)
+            if needs_recovery:
+                _recover_pose(client, calib, reason)
             pre_pick = locate_probe(known_xy or probe_xy)
             if pre_pick is None:
                 if known_xy is not None:
@@ -372,8 +385,10 @@ def main() -> int:
             print(f"\nTarget ({gx:.1f},{gy:.1f}): probe at "
                   f"({probe_xy[0]:.1f},{probe_xy[1]:.1f}) [{origin}], picking...")
 
+            holding_probe = False
             try:
                 pick(client, calib, probe_xy[0], probe_xy[1], yaw_deg=pick_yaw)
+                holding_probe = True
                 retreat_for_camera(client, calib)
             except Mt4ClientError as exc:
                 print(f"  Pick failed ({exc}), skipping this point")
@@ -409,6 +424,7 @@ def main() -> int:
                 # base avoidance is the firmware's job now: mp routes around
                 # the keep-out cylinder on its own
                 place(client, calib, gx, gy, lift_after=False)
+                holding_probe = False
                 center_placed_cube(
                     client, calib, gx, gy, lift_before_rotate=first_center,
                 )
@@ -416,6 +432,18 @@ def main() -> int:
                 retreat_for_camera(client, calib)
             except Mt4ClientError as exc:
                 print(f"  Place/center failed ({exc}), skipping this point")
+                if holding_probe and known_xy is not None:
+                    try:
+                        print(f"  Recovering by re-homing and replacing probe at "
+                              f"({known_xy[0]:.1f},{known_xy[1]:.1f})")
+                        _recover_pose(client, calib, "  Placement failed while holding probe")
+                        place(client, calib, known_xy[0], known_xy[1])
+                        holding_probe = False
+                        retreat_for_camera(client, calib)
+                        probe_xy = known_xy
+                        continue
+                    except Mt4ClientError as recovery_exc:
+                        print(f"  Recovery place failed ({recovery_exc})")
                 known_xy = None
                 continue
             time.sleep(HOME_SETTLE_S)

@@ -24,7 +24,7 @@ Tasks involving the arm, camera, serial, or physical outcomes are **live-debuggi
 | `err mp keepout` | XY inside J1 keep-out cylinder |
 | `err mp unreachable` | IK failed for target |
 
-J4 soft limits: about **-6600 .. 6350** steps. At limit, nearly every `mp` move fails.
+J4 soft limits: about **-8100 .. 8100** steps. At limit, nearly every `mp` move fails.
 
 ## Recovery playbook
 

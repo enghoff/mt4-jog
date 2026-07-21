@@ -103,7 +103,7 @@ def main() -> int:
     parser.add_argument("--range", type=float, default=100.0,
                         help="sweep +-range degrees (default 100 covers the "
                              "full 180-degree silhouette period with "
-                             "margin; the wrist soft limit is ~141)")
+                             "margin; the wrist soft limit is now ~180)")
     parser.add_argument("--stepped", action="store_true",
                         help="fallback: move-settle-capture at --step "
                              "increments instead of the continuous sweep")
