@@ -61,8 +61,8 @@ def test_color_xy_offset_applied_to_cube_detections():
 
     from mt4_vision.detect import detect_cubes
 
-    frame = np.zeros((100, 100, 3), np.uint8)
-    frame[40:60, 30:50] = (0, 0, 255)  # red square, ~400px^2
+    frame = np.zeros((200, 200, 3), np.uint8)
+    frame[80:130, 60:110] = (0, 0, 255)  # red square, ~2500px^2 (closer-mount scale)
     base = make_calib(cube_top_homography=IDENTITY)
     offset = make_calib(
         cube_top_homography=IDENTITY, color_xy_offset_mm={"red": [5.0, -3.0]}
@@ -80,13 +80,13 @@ def test_top_face_centroid_ignores_darker_side_face():
 
     from mt4_vision.detect import detect_cubes
 
-    frame = np.zeros((100, 100, 3), np.uint8)
-    frame[30:50, 40:60] = (0, 0, 230)   # top face: bright red, center (49.5, 39.5)
-    frame[50:60, 40:60] = (0, 0, 120)   # side face below: darker red
+    frame = np.zeros((200, 200, 3), np.uint8)
+    frame[60:110, 80:130] = (0, 0, 230)   # top face: bright red, center (104.5, 84.5)
+    frame[110:135, 80:130] = (0, 0, 120)  # side face below: darker red
     det = detect_cubes(frame)[0]
-    # whole-blob centroid would sit at y ~= 44.5; top-face center is 39.5
-    assert abs(det.px - 49.5) < 1.0
-    assert abs(det.py - 39.5) < 1.5
+    # whole-blob centroid would sit at y ~= 97; top-face center is 84.5
+    assert abs(det.px - 104.5) < 1.0
+    assert abs(det.py - 84.5) < 2.0
 
 
 def test_top_face_centroid_ignores_brighter_side_face():
@@ -97,12 +97,12 @@ def test_top_face_centroid_ignores_brighter_side_face():
 
     from mt4_vision.detect import detect_cubes
 
-    frame = np.zeros((100, 100, 3), np.uint8)
-    frame[30:50, 40:60] = (0, 140, 0)   # top face: mid green, center (49.5, 39.5)
-    frame[50:60, 40:60] = (0, 235, 0)   # side face below: brightly lit green
+    frame = np.zeros((200, 200, 3), np.uint8)
+    frame[60:110, 80:130] = (0, 140, 0)   # top face: mid green, center (104.5, 84.5)
+    frame[110:135, 80:130] = (0, 235, 0)  # side face below: brightly lit green
     det = detect_cubes(frame)[0]
-    assert abs(det.px - 49.5) < 1.0
-    assert abs(det.py - 39.5) < 1.5
+    assert abs(det.px - 104.5) < 1.0
+    assert abs(det.py - 84.5) < 2.0
 
 
 def test_top_face_centroid_unbiased_when_blob_is_all_top_face():
@@ -112,11 +112,11 @@ def test_top_face_centroid_unbiased_when_blob_is_all_top_face():
 
     from mt4_vision.detect import detect_cubes
 
-    frame = np.zeros((100, 100, 3), np.uint8)
-    frame[30:50, 40:60] = (0, 0, 200)   # uniform square, center (49.5, 39.5)
+    frame = np.zeros((200, 200, 3), np.uint8)
+    frame[60:110, 80:130] = (0, 0, 200)   # uniform square, center (104.5, 84.5)
     det = detect_cubes(frame)[0]
-    assert abs(det.px - 49.5) < 0.6
-    assert abs(det.py - 39.5) < 0.6
+    assert abs(det.px - 104.5) < 0.6
+    assert abs(det.py - 84.5) < 0.6
 
 
 def test_cube_top_residual_layer():

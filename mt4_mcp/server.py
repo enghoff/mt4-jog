@@ -247,7 +247,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             from mt4_vision.calib import load_calibration
             from mt4_vision.camera import capture_frame
             from mt4_vision.detect import detect_cubes
-            from mt4_vision.pickplace import pick
+            from mt4_vision.pickplace import pick_cube
             from mt4_vision.scene import filter_phantoms
             from mt4_vision.workspace import (
                 cubes_of_color,
@@ -266,9 +266,7 @@ def create_mcp(*, auth: Any | None = None) -> FastMCP:
             target = pick_largest_cube(cubes_of_color(candidates, color))
             if target is None:
                 return {"ok": False, "error": f"no {color} cube in view"}
-            result = pick(get_client(), calib, target.x, target.y)
-            result["color"] = color
-            return result
+            return pick_cube(get_client(), calib, target)
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)}
 

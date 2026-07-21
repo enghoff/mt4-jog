@@ -50,9 +50,9 @@ static const float MT4_GROUND_Z_MM = 136.0f;
  * (limit switch = -pull_steps). Opposite ends and J3/J4 both ends come from
  * the measured envelope (in-range samples, 2026-07-19). */
 static const int32_t MT4_JOINT_SOFT_MIN_DEFAULT[MT4_NUM_JOINTS] = {
-    -4800L, -1000L, -2050L, -6600L};
+    -4800L, -1000L, -2050L, -8100L};
 static const int32_t MT4_JOINT_SOFT_MAX_DEFAULT[MT4_NUM_JOINTS] = {
-    4580L, 2950L, 1150L, 6350L};
+    4580L, 2950L, 1150L, 8100L};
 /* Coupled J2+J3 extension limit (step counters). Because J2 and J3 have
  * opposite step signs, j2_deg - j3_deg = const - (j2_steps + j3_steps)/spd,
  * so a *minimum* link-angle difference at full stretch is a *maximum* on

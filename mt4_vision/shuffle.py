@@ -32,7 +32,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from mt4_jog.client import Mt4Client, Mt4ClientError
 from mt4_vision.calib import Calibration
 from mt4_vision.camera import grab_frame, open_camera
-from mt4_vision.pickplace import home_arm, pick, place
+from mt4_vision.detect import CubeDetection
+from mt4_vision.pickplace import home_arm, pick_cube, place, retreat_for_camera
 from mt4_vision.policy import Action, plan_shuffle
 from mt4_vision.scene import Scene, capture_scene, verify_pick_place
 
@@ -155,19 +156,13 @@ def _print_action(action: Action) -> None:
 
 def _action_targets(
     action: Action,
-) -> tuple[float, float, str, float, float] | None:
-    """Pick/place coords from one planned action, or None to wait."""
+) -> tuple[CubeDetection, float, float] | None:
+    """Pick cube + place coords from one planned action, or None to wait."""
     if action.kind != "pick" or action.cube is None:
         return None
     if action.place_x is None or action.place_y is None:
         return None
-    return (
-        float(action.cube.x),
-        float(action.cube.y),
-        action.cube.color,
-        float(action.place_x),
-        float(action.place_y),
-    )
+    return (action.cube, float(action.place_x), float(action.place_y))
 
 
 def _lookahead_action(
@@ -194,14 +189,26 @@ def _lookahead_action(
 
 
 def _plan_from_capture(
-    prefetch: _VisionPrefetch, avoid_xy: tuple[float, float] | None = None
+    prefetch: _VisionPrefetch,
+    client: Mt4Client,
+    calib: Calibration,
+    avoid_xy: tuple[float, float] | None = None,
 ) -> tuple[Scene, Action]:
+    # Closer camera: forearm over a marker hides ArUco tags → every marker
+    # becomes "unknown" and the planner wedges with free_markers=0. Clear
+    # the view before every planning capture.
+    try:
+        retreat_for_camera(client, calib)
+    except Mt4ClientError as exc:
+        print(f"camera retreat failed: {exc}")
     scene = prefetch.capture()
     return scene, plan_shuffle(scene, avoid_xy=avoid_xy)
 
 
 def _plan_after_move(
     prefetch: _VisionPrefetch,
+    client: Mt4Client,
+    calib: Calibration,
     *,
     pick_x: float,
     pick_y: float,
@@ -232,7 +239,7 @@ def _plan_after_move(
             place_y=place_y,
         )
     print(f"Post-move check: {verdict} (after {attempts} recheck(s))")
-    return scene, plan_shuffle(scene, avoid_xy=(place_x, place_y))
+    return _plan_from_capture(prefetch, client, calib, avoid_xy=(place_x, place_y))
 
 
 def _check_home_request(
@@ -281,7 +288,7 @@ def _run_home(
     prefetch.end_motion()
     home_arm(client)
     print("Home ok")
-    return _plan_from_capture(prefetch, avoid_xy)
+    return _plan_from_capture(prefetch, client, calib, avoid_xy)
 
 
 def _home_was_requested(watcher: _HomeKeyWatcher, exc: Mt4ClientError) -> bool:
@@ -311,7 +318,7 @@ def run_shuffle_loop(
     # doesn't move the same cube twice in a row when another is pickable.
     last_place: tuple[float, float] | None = None
     try:
-        scene, action = _plan_from_capture(prefetch, last_place)
+        scene, action = _plan_from_capture(prefetch, client, calib, last_place)
         while True:
             refreshed = _check_home_request(watcher, client, prefetch, calib, last_place)
             if refreshed is not None:
@@ -330,7 +337,9 @@ def run_shuffle_loop(
                 if refreshed is not None:
                     scene, action = refreshed
                 else:
-                    scene, action = _plan_from_capture(prefetch, last_place)
+                    scene, action = _plan_from_capture(
+                        prefetch, client, calib, last_place
+                    )
                 continue
 
             moves = [targets]
@@ -351,18 +360,32 @@ def run_shuffle_loop(
             executed: list[tuple[float, float, str, float, float]] = []
             failed_exc: Mt4ClientError | None = None
             prefetch.begin_motion()
-            for mpick_x, mpick_y, mcolor, mplace_x, mplace_y in moves:
+            for cube, mplace_x, mplace_y in moves:
+                yaw = (
+                    f" yaw={cube.yaw_deg:.0f}°"
+                    if cube.yaw_deg is not None
+                    else ""
+                )
                 print(
-                    f"Pick-and-place: {mcolor} ({mpick_x:.0f},{mpick_y:.0f}) "
+                    f"Pick-and-place: {cube.color} "
+                    f"({cube.x:.0f},{cube.y:.0f}){yaw} "
                     f"-> ({mplace_x:.0f},{mplace_y:.0f})"
                 )
                 try:
-                    pick(client, calib, mpick_x, mpick_y)
+                    pick_cube(client, calib, cube)
                     place(client, calib, mplace_x, mplace_y)
                 except Mt4ClientError as exc:
                     failed_exc = exc
                     break
-                executed.append((mpick_x, mpick_y, mcolor, mplace_x, mplace_y))
+                executed.append(
+                    (
+                        float(cube.x),
+                        float(cube.y),
+                        cube.color,
+                        mplace_x,
+                        mplace_y,
+                    )
+                )
             prefetch.end_motion()
 
             if executed:
@@ -380,12 +403,16 @@ def run_shuffle_loop(
                     scene, action = refreshed
                 else:
                     prefetch.take()
-                    scene, action = _plan_from_capture(prefetch, last_place)
+                    scene, action = _plan_from_capture(
+                        prefetch, client, calib, last_place
+                    )
                 continue
 
             last_pick_x, last_pick_y, last_color, last_place_x, last_place_y = executed[-1]
             scene, action = _plan_after_move(
                 prefetch,
+                client,
+                calib,
                 pick_x=last_pick_x,
                 pick_y=last_pick_y,
                 pick_color=last_color,

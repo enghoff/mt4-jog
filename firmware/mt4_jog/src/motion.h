@@ -25,6 +25,11 @@ void motion_init();
 void reset_joint_steps();
 /* setpos command: directly overwrite the joint step counters (no motion). */
 void motion_set_joint_steps(const long steps[MT4_NUM_JOINTS]);
+/* j4zero command: rewrite J4's step counter so the *current* physical wrist
+ * pose reports world-frame J4 = 0 (joint_j4 = -j1). No motion. After this,
+ * jaws aligned with the arm at j1=0 read as world j4=0; face-align picks can
+ * treat offset=0. Survives subsequent `home` (J4 is not re-zeroed there). */
+void motion_zero_j4_world();
 
 /* Install defaults, then (after home) set J1/J2 switch-side limits from the
  * pull-off distances used. Prints `home limits ...`. */

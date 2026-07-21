@@ -39,11 +39,13 @@ from mt4_vision.workspace import (
     rebuild_workspace_state,
 )
 
-# Real cube top faces under this camera land ~280-650px^2. Tighter than
-# detect.py's floor so low-area glare/arm flecks are not pick targets while
-# still counting toward marker occupancy via the raw detection list.
-PICK_MIN_AREA = 280.0
-PICK_MAX_AREA = 650.0
+# Real cube blobs under the closer overhead mount land ~2000-4000px^2
+# (on-pad red measured 2790 then 3627 on 2026-07-20 as pose/lighting
+# varied). Tighter than detect.py's floor so low-area glare/arm flecks
+# are not pick targets while still counting toward marker occupancy via
+# the raw detection list. Old far-mount pick band was 280-650.
+PICK_MIN_AREA = 400.0
+PICK_MAX_AREA = 5000.0
 # Allow cubes a bit outside the marker convex hull (markers aren't at the
 # desk edge). Measured phantoms run 60-90mm outside; real near-pad cubes
 # sit within ~15mm -- but measured live 2026-07-14, several genuine
@@ -51,6 +53,31 @@ PICK_MAX_AREA = 650.0
 # were wrongly dropped as phantoms at the old 40mm margin. 55mm recovers
 # those while staying short of the 60-90mm phantom range.
 HULL_OUTSIDE_MARGIN_MM = 55.0
+# A cube gripped at the capture pose hovers ~210mm over the table and
+# registers as a normal-looking detection near a predictable pixel; from
+# the raw list it leaks into marker occupancy / free-slot clearance and
+# vetoes real park spots. Area does NOT separate it from table cubes:
+# parallax scaling predicts ~2x (700-1070px^2) but measured 2026-07-19 a
+# held red read 622px^2 -- the gripper fingers occlude part of the top
+# face. Identity is color (the caller knows what it grips) + proximity to
+# the parallax-predicted pixel (measured 54px off prediction; the radius
+# covers that systematic error plus a few-mm grip offset at ~0.6mm/px).
+HELD_CUBE_RADIUS_PX = 90.0
+
+
+def is_held_cube_blob(
+    cube: CubeDetection,
+    held_px: tuple[float, float],
+    held_color: str | None = None,
+) -> bool:
+    """True when a raw detection is the gripped cube itself (held color at
+    its predicted capture-pose pixel), not a cube on the desk."""
+    if held_color is not None and cube.color != held_color:
+        return False
+    return (
+        math.hypot(cube.px - held_px[0], cube.py - held_px[1])
+        <= HELD_CUBE_RADIUS_PX
+    )
 
 
 @dataclass(frozen=True)
@@ -164,7 +191,7 @@ class Scene:
         cy = sum(m.y for m in self.markers) / max(len(self.markers), 1)
         out.sort(
             key=lambda c: (
-                abs(c.area - 400.0),
+                abs(c.area - 2500.0),  # closer mount: real tops ~2–4k px²
                 dist_mm(float(c.x), float(c.y), cx, cy),
             )
         )
@@ -210,14 +237,30 @@ def filter_phantoms(
     return [c for c in cubes if not is_phantom_detection(c, markers, hull=hull)]
 
 
-def capture_scene(calib: Calibration, frame: np.ndarray) -> Scene:
+def capture_scene(
+    calib: Calibration,
+    frame: np.ndarray,
+    *,
+    held_cube_px: tuple[float, float] | None = None,
+    held_color: str | None = None,
+) -> Scene:
     """Build a scene from one frame.
 
     Occupancy / free-marker / free-slot clearance uses *every* robot-mapped
     detection (raw). Phantom filtering only removes pick candidates.
+
+    ``held_cube_px`` / ``held_color``: predicted pixel and color of a cube
+    currently in the gripper (captures taken while holding). The matching
+    detection is dropped from the raw list so the held cube cannot occupy
+    markers or slots.
     """
     markers = marker_slots_from_calibration(calib)
     raw = cubes_with_robot_coords(detect_cubes(frame, calib))
+    if held_cube_px is not None:
+        raw = [
+            c for c in raw
+            if not is_held_cube_blob(c, held_cube_px, held_color)
+        ]
     visible = {m.marker_id for m in detect_markers(frame, MARKER_DICT)}
     state = rebuild_workspace_state(
         calib, markers, raw, visible_marker_ids=visible

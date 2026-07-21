@@ -1,0 +1,6 @@
+# Normalize all text files to LF in the repo regardless of client
+# core.autocrlf (the 2026-07-19 CRLF churn rewrote every file's diff).
+* text=auto
+
+*.jpg binary
+*.png binary

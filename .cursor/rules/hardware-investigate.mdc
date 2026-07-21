@@ -1,0 +1,42 @@
+---
+description: Proactively investigate MT4 arm, camera, and serial issues on real hardware
+alwaysApply: true
+---
+
+# Hardware: investigate, don't speculate
+
+Tasks involving the arm, camera, serial, or physical outcomes are **live-debugging work**. Pursue root cause on hardware yourself — do not stop at theories or ask the user to check things you can check.
+
+## Do first (without asking)
+
+1. **Arm state** — `mt4_status` (MCP): homed, TCP xyz/j4, joint steps, gripper S
+2. **Scene** — `mt4_scene` (MCP): cube positions, markers, yaw
+3. **Logs** — read Cursor `terminals/*.txt` and script stderr for firmware lines
+4. **Camera** — run capture / scene detection; try `--camera 1` if the default index is empty
+5. **Serial conflicts** — only one process owns the port; stop `jog.py`, `mt4_mcp`, and other clients before flash or a competing script
+
+## Map firmware errors
+
+| Error | Usual meaning |
+|-------|----------------|
+| `err mp joints` | Target pose exceeds joint soft limits |
+| `err mp segment` | Cartesian path failed mid-move (often stranded pose or J4 pinned) |
+| `err mp keepout` | XY inside J1 keep-out cylinder |
+| `err mp unreachable` | IK failed for target |
+
+J4 soft limits: about **-8100 .. 8100** steps. At limit, nearly every `mp` move fails.
+
+## Recovery playbook
+
+- **J4 near limit** or **TCP stranded low** (z below `safe_z`, e.g. over a grid point after aborted place/center) → `mt4_home`, then camera park **(200, 0, 260)**
+- **Aborted calibrate_height / stack_cubes** → assume bad pose until `mt4_status` proves otherwise; do not re-run blind
+- **Vision “lost cube”** → check arm occlusion and park pose before blaming calibration
+- **Firmware changes** → flash (`python flash_jog.py`) and verify on hardware (see `flash-ok` rule)
+
+## Pursue to resolution
+
+- Test hypotheses in order: pose → limits → port conflict → occlusion → calibration
+- When a systemic bug is found, fix code **and** verify on hardware
+- Prefer MCP motion tools or short Python probes over asking the user to jog manually
+
+Never end with “you could check X” when you can check X yourself.

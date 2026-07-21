@@ -41,6 +41,7 @@ from jog import (
     run_home,
     stop_jog,
     sync_cart_jog,
+    speed_us_from_stick_factor,
     wait_until_released,
     CJ_RESEND_S,
     GRIP_RESEND_S,
@@ -87,6 +88,7 @@ def print_help(*, gamepad: bool) -> None:
         print()
         print("Xbox controller:")
         print("  Sticks / triggers           jog, gripper (as jog.py)")
+        print(f"  Stick throw                 jog speed (full = {SPEED_MIN_US} µs)")
         print("  A       record marker (auto-identified: the one the arm hides)")
         print("  Y       home")
         print("  B       stop, drivers off")
@@ -243,14 +245,18 @@ def main() -> int:
             send(ser, "all f", wait=0.5)
             send(ser, "orient on", wait=0.3)
 
-            print("Homing first (clear the workspace)...")
-            run_home(ser, buf, args.j1_center, args.j2_pull, args.verbose)
+            status = query_status(ser, buf, args.verbose)
+            if status.homed:
+                print("Already homed (press H anytime to re-home and clear the view)")
+            else:
+                print("Homing first (clear the workspace)...")
+                run_home(ser, buf, args.j1_center, args.j2_pull, args.verbose)
         except (FirmwareNotReadyError, SerialGoneError) as exc:
             print(exc, file=sys.stderr)
             return 1
 
-        # Reference frame after homing: the arm sits clear of the table, so
-        # every physically present marker should be visible here.
+        # Reference frame: prefer a clear view of every marker. If we skipped
+        # home, the arm may still be over the pad -- H rehomes if needed.
         frame = grab_frame(cap)
         ref_markers = detect_markers(frame, args.dict)
         if len(ref_markers) < 3:
@@ -268,7 +274,8 @@ def main() -> int:
         active_cart: tuple[tuple[int, int, int] | None, int] | None = None
         grip_state: str | None = None
         last_cj_send = last_grip_send = 0.0
-        speed_us = DEFAULT_SPEED_US
+        keyboard_speed_us = DEFAULT_SPEED_US
+        applied_speed_us = keyboard_speed_us
         last_speed_adjust = 0.0
         invert_xy = False
         grave_was_down = False
@@ -288,6 +295,18 @@ def main() -> int:
                 now = time.monotonic()
 
                 if key_down("esc") or pad_edges & BACK:
+                    # If we already recorded everything visible/expected,
+                    # explicitly confirm quitting without saving.
+                    if recorded and ref_ids and set(recorded) >= ref_ids:
+                        flush_console_input()
+                        total = len(ref_ids)
+                        got = len(recorded)
+                        raw = input(
+                            f"\nAll markers recorded ({got}/{total}). "
+                            "Quit without saving? [y/N]: "
+                        ).strip().lower()
+                        if raw not in ("y", "yes"):
+                            continue
                     break
 
                 if key_down("enter") or pad_edges & START:
@@ -371,11 +390,32 @@ def main() -> int:
                 minus = key_down("minus")
                 plus = key_down("plus")
                 if (minus or plus) and now - last_speed_adjust >= SPEED_REPEAT_S:
-                    speed_us += -SPEED_STEP_US if plus else SPEED_STEP_US
-                    speed_us = max(SPEED_MIN_US, min(SPEED_MAX_US, speed_us))
-                    send_quick(ser, f"speed {speed_us}")
+                    # Keyboard -/+ sets the fallback speed. During active stick
+                    # movement, firmware speed is driven by `pad.speed_factor`
+                    # (ephemeral) instead.
+                    keyboard_speed_us += -SPEED_STEP_US if plus else SPEED_STEP_US
+                    keyboard_speed_us = max(
+                        SPEED_MIN_US, min(SPEED_MAX_US, keyboard_speed_us)
+                    )
                     last_speed_adjust = now
-                    print(f"Speed: {speed_us}")
+                    print(f"Speed: {keyboard_speed_us}")
+
+                # Thumbpad/stick throw speed: while sticks are active, drive
+                # firmware speed from `pad.speed_factor`. When sticks return to
+                # center, restore the keyboard -/+ fallback speed.
+                stick_factor = (
+                    pad.speed_factor
+                    if pad is not None and pad.connected
+                    else None
+                )
+                if stick_factor is not None:
+                    stick_speed = speed_us_from_stick_factor(stick_factor)
+                    if stick_speed != applied_speed_us:
+                        send_quick(ser, f"speed {stick_speed}")
+                        applied_speed_us = stick_speed
+                elif applied_speed_us != keyboard_speed_us:
+                    send_quick(ser, f"speed {keyboard_speed_us}")
+                    applied_speed_us = keyboard_speed_us
 
                 # Unified jog: Cartesian direction and J4 roll are one `cj`
                 # command, so the wrist rotates while the TCP moves.

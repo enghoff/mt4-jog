@@ -219,8 +219,12 @@ def main() -> int:
             await_firmware_alive(ser, port_label=port)
             send(ser, "all f", wait=0.5)
             send(ser, "orient off" if args.no_orient else "orient on", wait=0.3)
-            print("Homing first (clear the workspace)...")
-            run_home(ser, buf, args.j1_center, args.j2_pull, args.verbose)
+            status = query_status(ser, buf, args.verbose)
+            if status.homed:
+                print("Already homed (press H anytime to re-home)")
+            else:
+                print("Homing first (clear the workspace)...")
+                run_home(ser, buf, args.j1_center, args.j2_pull, args.verbose)
             print("Ready — tag in/out poses with D-pad Up/Down or ] / [")
         except (FirmwareNotReadyError, SerialGoneError) as exc:
             print(exc, file=sys.stderr)

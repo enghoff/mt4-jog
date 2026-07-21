@@ -29,11 +29,13 @@ No human interaction needed -- the arm places its own calibration probe.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 import time
 from pathlib import Path
 
+from mt4_jog.joints import JOINT_SOFT_MAX_STEPS, JOINT_SOFT_MIN_STEPS
 from mt4_jog.client import Mt4Client, Mt4ClientError
 from mt4_vision.calib import (
     DEFAULT_CALIB_PATH,
@@ -44,14 +46,44 @@ from mt4_vision.calib import (
 )
 from mt4_vision.camera import capture_frame
 from mt4_vision.detect import CubeDetection, detect_cubes
-from mt4_vision.pickplace import home_arm, pick, place
+from mt4_vision.pickplace import (
+    CAMERA_PARK_Z,
+    center_placed_cube,
+    home_arm,
+    near_camera_park,
+    pick,
+    place,
+    retreat_for_camera,
+)
 from mt4_vision.scene import filter_phantoms
 from mt4_vision.workspace import (
     MAX_REACH_MM,
     PLACE_CLEARANCE_MM,
     PLACEMENT_SLOTS,
+    is_mp_reachable_xy,
     marker_slots_from_calibration,
 )
+
+# Always include calibrated marker centers in the height-probe grid when they
+# aren't already covered. Markers 0/1 (x~35-50) sat ~100mm outside the old
+# PLACEMENT_SLOTS hull; cube-top picks there missed by ~26mm (2026-07-21).
+MARKER_PROBE_COVER_MM = 25.0
+
+
+def _marker_probe_targets(
+    calib, grid: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """Reachable marker centers not already near a scheduled probe target."""
+    extras: list[tuple[float, float]] = []
+    for m in marker_slots_from_calibration(calib):
+        if not is_mp_reachable_xy(m.x, m.y):
+            continue
+        if math.hypot(m.x, m.y) > MAX_REACH_MM:
+            continue
+        if any(math.hypot(m.x - gx, m.y - gy) < MARKER_PROBE_COVER_MM for gx, gy in grid):
+            continue
+        extras.append((m.x, m.y))
+    return extras
 
 # Grid of robot-frame (x, y) targets spread across the reachable workspace,
 # one quadrant/radius at a time -- ground truth is the arm's own positioning,
@@ -71,6 +103,12 @@ GRID_POINTS = PLACEMENT_SLOTS + [
     # picks actually struggled in.
     (140.0, 160.0),
     (215.0, 205.0),
+    # Near-base markers 0/1 sit at x~35-52 while every PLACEMENT_SLOTS probe
+    # is at x>=140. Cube-top extrapolation there measured ~26mm (2026-07-21
+    # place-on-m1: truth (35,266) read as (60,261)). These approach the
+    # marker papers without landing on the tags.
+    (100.0, -240.0),
+    (100.0, 240.0),
 ]
 # How far (px) the placed cube's centroid may land from where it's expected
 # and still count as "the probe" -- generous given measured parallax shifts
@@ -104,6 +142,9 @@ PLACEMENT_SANITY_MM = 100.0
 # leftover 2400us during manual testing.
 RESET_SPEED_US = 1524
 HOME_SETTLE_S = 0.5
+# center_placed_cube's ±90° J4 rotation can pin the wrist at a soft limit;
+# any subsequent mp move then fails with err mp segment.
+J4_SOFT_MARGIN_STEPS = 300
 
 
 def find_probe(frame, color: str, near_px: tuple[float, float]) -> CubeDetection | None:
@@ -115,6 +156,31 @@ def find_probe(frame, color: str, near_px: tuple[float, float]) -> CubeDetection
     if math.hypot(best.px - nx, best.py - ny) > MATCH_RADIUS_PX:
         return None
     return best
+
+
+def _needs_pose_recovery(client: Mt4Client, calib) -> tuple[bool, str]:
+    """True when the arm should home/retreat before the next pick/place leg."""
+    status = client.get_status()
+    j4_steps = status.joints.get("j4", 0)
+    if (
+        j4_steps >= JOINT_SOFT_MAX_STEPS[3] - J4_SOFT_MARGIN_STEPS
+        or j4_steps <= JOINT_SOFT_MIN_STEPS[3] + J4_SOFT_MARGIN_STEPS
+    ):
+        return True, f"J4 near soft limit ({j4_steps} steps)"
+    tcp = status.tcp
+    if tcp is not None and (
+        tcp.z < calib.safe_z - 5.0
+        or tcp.z < CAMERA_PARK_Z - 10.0
+        or not near_camera_park(tcp.x, tcp.y)
+    ):
+        return True, f"TCP stranded at ({tcp.x:.0f},{tcp.y:.0f},{tcp.z:.0f})"
+    return False, ""
+
+
+def _recover_pose(client: Mt4Client, calib, reason: str) -> None:
+    print(f"{reason}, re-homing...")
+    home_arm(client)
+    retreat_for_camera(client, calib)
 
 
 def main() -> int:
@@ -175,16 +241,25 @@ def main() -> int:
     try:
         client.ensure_connected()
         status = client.get_status()
-        if not status.homed:
+        if status.homed:
+            print("Already homed")
+        else:
             print("Homing first...")
             home_arm(client)  # raises on failure instead of sailing on unhomed
-            status = client.get_status()
+        needs_recovery, reason = _needs_pose_recovery(client, calib)
+        if needs_recovery:
+            _recover_pose(client, calib, reason)
+        status = client.get_status()
         # No-op move at the current pose, purely to reset cruise speed (see
         # RESET_SPEED_US) before the real moves below.
         client.move_to(status.tcp.x, status.tcp.y, status.tcp.z, speed_us=RESET_SPEED_US)
 
         base_grid = [] if args.skip_grid else list(GRID_POINTS)
         base_grid += [(float(x), float(y)) for x, y in args.extra_target]
+        if not args.skip_grid:
+            for mx, my in _marker_probe_targets(calib, base_grid):
+                print(f"Adding marker center ({mx:.1f},{my:.1f}) to height-probe grid")
+                base_grid.append((mx, my))
         grid = [(x, y) for x, y in base_grid if math.hypot(x, y) <= MAX_REACH_MM]
         for ax, ay in args.avoid:
             dropped_targets = [
@@ -200,13 +275,14 @@ def main() -> int:
             print(f"Only {len(grid)} usable grid points; need >={min_targets}", file=sys.stderr)
             return 1
 
+        markers = marker_slots_from_calibration(calib)
         frame = capture_frame(**camera_kwargs)
         # Phantom-filter the probe pool (keep-out cylinder, area, hull, reach):
         # the arm base's own hardware intermittently reads as small blue blobs
         # inside the keep-out zone, and the grasp-failure rotation below would
         # otherwise eventually send the gripper at one.
         all_blobs = detect_cubes(frame, calib)
-        cubes = filter_phantoms(all_blobs, marker_slots_from_calibration(calib))
+        cubes = filter_phantoms(all_blobs, markers)
         dropped = [c for c in all_blobs if c not in cubes]
         if dropped:
             print("Ignoring phantom blob(s): "
@@ -233,26 +309,39 @@ def main() -> int:
         robot_pts: list[tuple[float, float]] = []
         probe_colors: list[str] = []
 
-        def keep_probe_observations() -> None:
+        def keep_probe_observations(*, replace: bool = False) -> None:
             """Persist raw (pixel, robot, color) observations -- on every exit path that
             has any, not just success: a run aborted by a dropped cube already
             paid the arm time for its points, and offline refits can merge
             them with a later session's. Color matters: red- and blue-cube
             centroids of the same physical position measured ~10px apart
             (different HSV masks include different side faces), so
-            cross-color merges must model that or stay single-color."""
+            cross-color merges must model that or stay single-color.
+
+            Failure paths APPEND to the stored archive (replace=False): a
+            2-point aborted run must not destroy a prior full collection
+            (2026-07-20: an aborted run overwrote 10 good observations with
+            2 phantom ones). Only a successful refit replaces the archive
+            -- and when --merge was used, pixel_pts already contains the
+            stored points, so nothing is lost there either."""
             if not pixel_pts:
                 return
-            calib.probe_observations = [
+            new = [
                 {"pixel": [round(p[0], 2), round(p[1], 2)], "robot": list(r), "color": c}
                 for p, r, c in zip(pixel_pts, robot_pts, probe_colors)
             ]
+            if not replace and calib.probe_observations:
+                seen = {json.dumps(o, sort_keys=True) for o in calib.probe_observations}
+                new = calib.probe_observations + [
+                    o for o in new if json.dumps(o, sort_keys=True) not in seen
+                ]
+            calib.probe_observations = new
             calib.save(Path(args.calib))
 
-        def locate_probe(near_xy: tuple[float, float]) -> tuple[float, float] | None:
+        def locate_probe(near_xy: tuple[float, float]) -> CubeDetection | None:
             """Re-detect the probe fresh (never trust a carried-over
             assumption -- avoids compounding drift after any failed
-            grasp/placement earlier in the run). Returns its pixel position;
+            grasp/placement earlier in the run). Returns the detection;
             find_probe() bypasses the hull filter via calibration=None, which
             leaves CubeDetection.x/.y unset, so robot XY is computed
             separately here via the raw (uncorrected) table homography --
@@ -261,15 +350,17 @@ def main() -> int:
             frame = capture_frame(**camera_kwargs)
             found = find_probe(frame, probe_color, _inverse_guess(calib, *near_xy))
             if found is not None:
-                return (found.px, found.py)
+                return found
             candidates = [
-                c for c in detect_cubes(frame, calib)
+                c for c in filter_phantoms(detect_cubes(frame, calib), markers)
                 if c.color == probe_color and math.hypot(c.x, c.y) <= MAX_REACH_MM
             ]
             if not candidates:
                 return None
-            best = min(candidates, key=lambda c: math.hypot(c.x - near_xy[0], c.y - near_xy[1]))
-            return (best.px, best.py)
+            return min(
+                candidates,
+                key=lambda c: math.hypot(c.x - near_xy[0], c.y - near_xy[1]),
+            )
 
         grasp_fails = 0
         # Once the probe has been arm-placed somewhere, its position is known
@@ -277,15 +368,21 @@ def main() -> int:
         # through the still-uncorrected camera map. Vision only verifies the
         # cube is still where it was left; the pick targets the known coords.
         known_xy: tuple[float, float] | None = args.probe_at
+        first_center = True
         for gx, gy in grid:
-            pre_pick_px = locate_probe(known_xy or probe_xy)
-            if pre_pick_px is None:
+            needs_recovery, reason = _needs_pose_recovery(client, calib)
+            if needs_recovery:
+                _recover_pose(client, calib, reason)
+            pre_pick = locate_probe(known_xy or probe_xy)
+            if pre_pick is None:
                 if known_xy is not None:
                     # Not visible but the arm knows where it left it -- e.g.
                     # the homed arm occludes that spot. Pick blind; the
                     # post-place check still validates the data point.
                     print(f"\nTarget ({gx:.1f},{gy:.1f}): probe not visible, picking blind "
                           f"at arm-known ({known_xy[0]:.1f},{known_xy[1]:.1f})")
+                    pre_pick_px = None
+                    pick_yaw = None
                 else:
                     print(f"\nTarget ({gx:.1f},{gy:.1f}): lost track of the probe cube -- aborting", file=sys.stderr)
                     keep_probe_observations()
@@ -293,6 +390,9 @@ def main() -> int:
                         print(f"Kept {len(pixel_pts)} collected probe observation(s) "
                               "in the calibration file (cube_top_homography unchanged)")
                     return 1
+            else:
+                pre_pick_px = (pre_pick.px, pre_pick.py)
+                pick_yaw = pre_pick.yaw_deg
             seen_xy = calib.pixel_to_robot(*pre_pick_px) if pre_pick_px else None
             if (
                 known_xy is not None
@@ -317,9 +417,11 @@ def main() -> int:
             print(f"\nTarget ({gx:.1f},{gy:.1f}): probe at "
                   f"({probe_xy[0]:.1f},{probe_xy[1]:.1f}) [{origin}], picking...")
 
+            holding_probe = False
             try:
-                pick(client, calib, *probe_xy)
-                home_arm(client)
+                pick(client, calib, probe_xy[0], probe_xy[1], yaw_deg=pick_yaw)
+                holding_probe = True
+                retreat_for_camera(client, calib)
             except Mt4ClientError as exc:
                 print(f"  Pick failed ({exc}), skipping this point")
                 known_xy = None
@@ -353,10 +455,27 @@ def main() -> int:
             try:
                 # base avoidance is the firmware's job now: mp routes around
                 # the keep-out cylinder on its own
-                place(client, calib, gx, gy)
-                home_arm(client)
+                place(client, calib, gx, gy, lift_after=False)
+                holding_probe = False
+                center_placed_cube(
+                    client, calib, gx, gy, lift_before_rotate=first_center,
+                )
+                first_center = False
+                retreat_for_camera(client, calib)
             except Mt4ClientError as exc:
-                print(f"  Place failed ({exc}), skipping this point")
+                print(f"  Place/center failed ({exc}), skipping this point")
+                if holding_probe and known_xy is not None:
+                    try:
+                        print(f"  Recovering by re-homing and replacing probe at "
+                              f"({known_xy[0]:.1f},{known_xy[1]:.1f})")
+                        _recover_pose(client, calib, "  Placement failed while holding probe")
+                        place(client, calib, known_xy[0], known_xy[1])
+                        holding_probe = False
+                        retreat_for_camera(client, calib)
+                        probe_xy = known_xy
+                        continue
+                    except Mt4ClientError as recovery_exc:
+                        print(f"  Recovery place failed ({recovery_exc})")
                 known_xy = None
                 continue
             time.sleep(HOME_SETTLE_S)
@@ -394,9 +513,10 @@ def main() -> int:
             for _rep in range(max(0, args.reps - 1)):
                 try:
                     pick(client, calib, gx, gy)
-                    home_arm(client)
-                    place(client, calib, gx, gy)
-                    home_arm(client)
+                    retreat_for_camera(client, calib)
+                    place(client, calib, gx, gy, lift_after=False)
+                    center_placed_cube(client, calib, gx, gy)
+                    retreat_for_camera(client, calib)
                 except Mt4ClientError as exc:
                     print(f"  rep failed ({exc}); target stays single-sampled")
                     break
@@ -514,7 +634,7 @@ def main() -> int:
         ]
         print(f"With residual layer (mm): {[round(e, 2) for e in post]}")
 
-        keep_probe_observations()
+        keep_probe_observations(replace=True)
         print(f"\nSaved cube_top_homography + residual layer ({len(pixel_pts)} "
               f"raw probe observations kept) to {args.calib}")
         return 0

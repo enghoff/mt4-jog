@@ -371,6 +371,27 @@ static void angles_to_joint_steps(const JointAnglesDeg *q,
                    MT4_J4_STEP_SIGN);
 }
 
+void motion_zero_j4_world() {
+  // world_j4 = joint_j4 + j1; set joint_j4 = -j1 so world reports 0 at this
+  // pose without moving. Soft limits stay centered on the new step-0, so the
+  // usable wrist window is re-homed around the operator's alignment.
+  stop_jog();
+  motion_cancel_move();
+  const JointAnglesDeg q = angles_from_steps();
+  JointAnglesDeg target = q;
+  target.j4 = -q.j1;
+  long steps[MT4_NUM_JOINTS];
+  for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
+    steps[i] = joint_steps[i];
+  }
+  long computed[MT4_NUM_JOINTS];
+  angles_to_joint_steps(&target, computed);
+  steps[3] = computed[3];
+  dda_set_joint_steps(steps);
+  Serial.print(F("ok j4zero "));
+  print_joint_pos();
+}
+
 static bool joint_steps_to_deltas(const long current[MT4_NUM_JOINTS],
                                   const JointAnglesDeg *target,
                                   int32_t deltas[MT4_NUM_JOINTS],

@@ -192,6 +192,36 @@ class Mt4Client:
             self._ensure_connected_unlocked()
             return self._send_and_collect("stop", wait=COMMAND_WAIT_S)
 
+    def j4_zero(self) -> dict[str, object]:
+        """Rewrite firmware J4 origin so current pose reports world j4 = 0.
+
+        No motion. After this, jaws aligned with the arm (at the calibration
+        pose) read as world-frame J4 ≈ 0; face-align picks can use offset 0.
+        Survives subsequent ``home``; lost on power cycle until re-run.
+        """
+        with self._lock:
+            self._ensure_connected_unlocked()
+            lines = self._send_and_collect("j4zero", wait=COMMAND_WAIT_S)
+            for line in lines:
+                if line.startswith("err"):
+                    return {"ok": False, "error": line, "lines": lines}
+                if line.startswith("ok j4zero") or (
+                    line.startswith("ok ") and "pos J" in line
+                ):
+                    # Firmware prints "ok j4zero pos ..." then a tcp line.
+                    status = self._get_status_unlocked(retries=2)
+                    return {
+                        "ok": True,
+                        "lines": lines,
+                        "tcp": status.tcp.as_dict() if status.tcp else None,
+                        "joints": dict(status.joints),
+                    }
+            return {
+                "ok": False,
+                "error": "no j4zero ack (firmware may need flash)",
+                "lines": lines,
+            }
+
     def request_interrupt(self) -> None:
         """Ask an in-flight move/gripper settle to abort (e.g. shuffle home key)."""
         self._interrupt.set()
@@ -381,13 +411,37 @@ class Mt4Client:
                     )
                 j4 = status.tcp.j4
 
-            cmd = f"mp {x} {y} {z} {j4} {grip}"
+            # Firmware line_buf is 64 bytes; full Python float repr of
+            # detection XY + j4 + speed easily overflows and truncates mid-
+            # token (parse fails with the usage string). Match the firmware's
+            # own 0.1mm / 0.1deg reporting precision.
+            cmd = f"mp {x:.2f} {y:.2f} {z:.2f} {j4:.2f} {int(grip)}"
             if speed_us:
-                cmd += f" {speed_us}"
+                cmd += f" {int(speed_us)}"
+            if len(cmd) >= 64:
+                raise Mt4ClientError(
+                    f"mp command exceeds 64-byte firmware line buffer: {cmd!r}"
+                )
             collected = self._send_and_collect(cmd, wait=1.0)
             return self._await_completion(
                 done_prefix="mp done", timeout=timeout, collected=collected
             )
+
+    def set_speed(self, speed_us: int) -> dict[str, object]:
+        """Set the shared jog/`m`/`mp` step period (`speed <us>`)."""
+        if not JOG_SPEED_MIN_US <= speed_us <= JOG_SPEED_MAX_US:
+            raise Mt4ClientError(
+                f"speed_us must be {JOG_SPEED_MIN_US}-{JOG_SPEED_MAX_US}"
+            )
+        with self._lock:
+            self._ensure_connected_unlocked()
+            lines = self._send_and_collect(
+                f"speed {int(speed_us)}", wait=COMMAND_WAIT_S
+            )
+            for line in lines:
+                if line.startswith("err"):
+                    return {"ok": False, "error": line, "lines": lines}
+            return {"ok": True, "lines": lines}
 
     def move_relative(
         self,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 
 import cv2
 import numpy as np
@@ -109,3 +110,55 @@ def capture_frame(index: int = DEFAULT_CAMERA_INDEX) -> np.ndarray:
         return grab_frame(cap)
     finally:
         cap.release()
+
+
+class FrameStream:
+    """Continuously drained camera for long sessions needing FRESH frames.
+
+    A long-lived VideoCapture that is read only occasionally serves frames
+    from the driver's buffer -- scenes many seconds old (arm mid-motion,
+    cubes at previous positions), and a fixed flush count cannot promise
+    reaching the present. A one-shot reopen per capture is fresh but costs
+    2-3s of open + exposure warmup, and rapid reopen cycles are what cause
+    the unconverged-exposure cold starts. This reader thread drains the
+    stream at camera rate; ``fresh()`` blocks until a frame whose capture
+    STARTED after the call completes (min_advance=2: the frame being
+    delivered at call time plus one full frame period).
+    """
+
+    def __init__(self, index: int = DEFAULT_CAMERA_INDEX) -> None:
+        self._cap = open_camera(index)
+        self._cond = threading.Condition()
+        self._frame: np.ndarray | None = None
+        self._seq = 0
+        self._stopped = False
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stopped:
+            ok, frame = self._cap.read()
+            if not ok or frame is None:
+                continue
+            with self._cond:
+                self._frame = frame
+                self._seq += 1
+                self._cond.notify_all()
+
+    def fresh(self, min_advance: int = 2, timeout_s: float = 5.0) -> np.ndarray:
+        """A frame captured entirely after this call."""
+        with self._cond:
+            target = self._seq + min_advance
+            while self._seq < target and not self._stopped:
+                if not self._cond.wait(timeout=timeout_s):
+                    raise CameraError("frame stream stalled")
+            if self._frame is None:
+                raise CameraError("frame stream produced no frames")
+            return self._frame.copy()
+
+    def close(self) -> None:
+        self._stopped = True
+        with self._cond:
+            self._cond.notify_all()
+        self._thread.join(timeout=2.0)
+        self._cap.release()

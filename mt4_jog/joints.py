@@ -15,8 +15,10 @@ J3_HOME_PULLOFF_STEPS = 500
 # Mirror firmware config.h MT4_JOINT_SOFT_* / MT4_GROUND_Z_MM. J1/J2 mins are
 # replaced at home with -J1_HOME_CENTER_STEPS / -J2_HOME_PULLOFF_STEPS.
 GROUND_Z_MM = 136.0
-JOINT_SOFT_MIN_STEPS: tuple[int, int, int, int] = (-4800, -1000, -2050, -6600)
-JOINT_SOFT_MAX_STEPS: tuple[int, int, int, int] = (4580, 2950, 1150, 6350)
+# Soft joint limits (counters after home = 0). Mirror firmware
+# firmware/mt4_jog/src/config.h MT4_JOINT_SOFT_*.
+JOINT_SOFT_MIN_STEPS: tuple[int, int, int, int] = (-4800, -1000, -2050, -8100)
+JOINT_SOFT_MAX_STEPS: tuple[int, int, int, int] = (4580, 2950, 1150, 8100)
 # Coupled extension limit: j2_steps + j3_steps (see firmware MT4_J2_J3_SUM_*).
 # Equivalent to j2_deg - j3_deg >= ~15.2° at full stretch.
 J2_J3_SUM_MIN_STEPS = -1700

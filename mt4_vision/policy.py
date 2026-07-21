@@ -4,6 +4,9 @@ Priority:
   1. Pick a blocker (open-table cube) → place on a free marker.
   2. Else pick a marker cube → place on a free marker (fill empty slots).
   3. Else if no free markers: pick a marker cube → place on a free table slot.
+  4. Else if no free markers: pick a blocker → place on a free table slot
+     (unstick when ArUco tags are occluded by the arm and every marker is
+     "unknown" -- common after the closer camera mount).
 
 Within whichever tier applies, the cube/marker/slot is chosen *randomly*
 among the valid candidates -- picking the first one every time (by area,
@@ -144,6 +147,23 @@ def plan_shuffle(
             "pick",
             f"to_slot: pick {cube.color} from marker {marker.marker_id} "
             f"({cube.x:.0f},{cube.y:.0f}) -> ({sx:.0f},{sy:.0f})",
+            cube=cube,
+            place_x=sx,
+            place_y=sy,
+            place_marker_id=None,
+            place_kind="to_slot",
+        )
+
+    # No free markers (often: arm still over the pad, ArUco tags occluded →
+    # every marker "unknown"). Still park open-table blockers onto free
+    # slots so the loop cannot wedge with free_slots>0 and blockers>0.
+    if blockers and slots:
+        cube = random.choice(blockers)
+        sx, sy = random.choice(slots)
+        return Action(
+            "pick",
+            f"to_slot: pick blocker {cube.color} ({cube.x:.0f},{cube.y:.0f}) "
+            f"-> ({sx:.0f},{sy:.0f})",
             cube=cube,
             place_x=sx,
             place_y=sy,

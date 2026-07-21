@@ -87,12 +87,13 @@ def cmd_scene(args: argparse.Namespace) -> int:
     slots = marker_slots_from_calibration(calib) if calib is not None else []
     for c in cubes:
         robot = f" robot ({c.x:.1f}, {c.y:.1f})" if c.x is not None else ""
+        yaw = f" yaw {c.yaw_deg:.0f}°" if c.yaw_deg is not None else ""
         phantom = (
             " [phantom -- not a pick target]"
             if calib is not None and is_phantom_detection(c, slots)
             else ""
         )
-        print(f"  {c.color}: pixel ({c.px:.0f}, {c.py:.0f}) area {c.area:.0f}px^2{robot}{phantom}")
+        print(f"  {c.color}: pixel ({c.px:.0f}, {c.py:.0f}) area {c.area:.0f}px^2{robot}{yaw}{phantom}")
         cv2.circle(frame, (int(c.px), int(c.py)), 8, (255, 255, 255), 2)
         cv2.putText(
             frame, c.color, (int(c.px) + 10, int(c.py)),
@@ -110,7 +111,7 @@ def _pick_place_client(args: argparse.Namespace):
 
 def cmd_pick(args: argparse.Namespace) -> int:
     from mt4_jog.client import Mt4ClientError
-    from mt4_vision.pickplace import pick
+    from mt4_vision.pickplace import pick_cube
 
     calib = load_calibration(Path(args.calib))
     frame = capture_frame(args.camera)
@@ -122,10 +123,17 @@ def cmd_pick(args: argparse.Namespace) -> int:
     if target is None:
         print(f"No {args.color} cube in view")
         return 1
-    print(f"Picking {args.color} at robot ({target.x:.1f}, {target.y:.1f})")
+    yaw = (
+        f" yaw={target.yaw_deg:.0f}°"
+        if target.yaw_deg is not None
+        else ""
+    )
+    print(f"Picking {args.color} at robot ({target.x:.1f}, {target.y:.1f}){yaw}")
     client = _pick_place_client(args)
     try:
-        pick(client, calib, target.x, target.y)
+        result = pick_cube(client, calib, target)
+        if "j4" in result:
+            print(f"  face-align j4={result['j4']:.1f}°")
     except Mt4ClientError as exc:
         print(exc, file=sys.stderr)
         return 1
@@ -227,7 +235,12 @@ def cmd_goto_marker(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="mt4_vision")
+    parser = argparse.ArgumentParser(
+        prog="mt4_vision",
+        epilog="Put --camera / --calib before the subcommand, e.g. "
+               "python -m mt4_vision --camera 1 scene",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--camera", type=int, default=DEFAULT_CAMERA_INDEX)
     parser.add_argument("--calib", default=str(DEFAULT_CALIB_PATH))
     sub = parser.add_subparsers(dest="cmd", required=True)

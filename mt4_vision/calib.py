@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import cv2
@@ -125,6 +125,10 @@ class Calibration:
     # color mis-locates the others by a constant few-to-15mm offset
     # (measured 2026-07-18 by arm-placing different colors at one spot).
     color_xy_offset_mm: dict = field(default_factory=dict)
+    # When True, vision picks command J4 from CubeDetection.yaw_deg. On by
+    # default; assumes firmware ``j4zero`` (``calibrate_j4.py``) so world
+    # J4 = 0 means jaws along the arm.
+    face_align_picks: bool = True
     # Pixel-space convex hull of the marker centers. Detections outside it
     # are rejected (the arm's orange body and off-desk clutter live there).
     workspace_hull_px: list[list[float]] | None = None
@@ -175,7 +179,10 @@ def load_calibration(path: Path = DEFAULT_CALIB_PATH) -> Calibration:
             f"no calibration at {path} -- run: python calibrate_vision.py"
         )
     data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
-    return Calibration(**data)
+    # Ignore unknown / retired keys (e.g. removed j4_face_offset_deg) so old
+    # JSON files still load; the next save drops them.
+    known = {f.name for f in fields(Calibration)}
+    return Calibration(**{k: v for k, v in data.items() if k in known})
 
 
 def fit_homography(
