@@ -60,8 +60,30 @@ from mt4_vision.workspace import (
     MAX_REACH_MM,
     PLACE_CLEARANCE_MM,
     PLACEMENT_SLOTS,
+    is_mp_reachable_xy,
     marker_slots_from_calibration,
 )
+
+# Always include calibrated marker centers in the height-probe grid when they
+# aren't already covered. Markers 0/1 (x~35-50) sat ~100mm outside the old
+# PLACEMENT_SLOTS hull; cube-top picks there missed by ~26mm (2026-07-21).
+MARKER_PROBE_COVER_MM = 25.0
+
+
+def _marker_probe_targets(
+    calib, grid: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """Reachable marker centers not already near a scheduled probe target."""
+    extras: list[tuple[float, float]] = []
+    for m in marker_slots_from_calibration(calib):
+        if not is_mp_reachable_xy(m.x, m.y):
+            continue
+        if math.hypot(m.x, m.y) > MAX_REACH_MM:
+            continue
+        if any(math.hypot(m.x - gx, m.y - gy) < MARKER_PROBE_COVER_MM for gx, gy in grid):
+            continue
+        extras.append((m.x, m.y))
+    return extras
 
 # Grid of robot-frame (x, y) targets spread across the reachable workspace,
 # one quadrant/radius at a time -- ground truth is the arm's own positioning,
@@ -81,6 +103,12 @@ GRID_POINTS = PLACEMENT_SLOTS + [
     # picks actually struggled in.
     (140.0, 160.0),
     (215.0, 205.0),
+    # Near-base markers 0/1 sit at x~35-52 while every PLACEMENT_SLOTS probe
+    # is at x>=140. Cube-top extrapolation there measured ~26mm (2026-07-21
+    # place-on-m1: truth (35,266) read as (60,261)). These approach the
+    # marker papers without landing on the tags.
+    (100.0, -240.0),
+    (100.0, 240.0),
 ]
 # How far (px) the placed cube's centroid may land from where it's expected
 # and still count as "the probe" -- generous given measured parallax shifts
@@ -228,6 +256,10 @@ def main() -> int:
 
         base_grid = [] if args.skip_grid else list(GRID_POINTS)
         base_grid += [(float(x), float(y)) for x, y in args.extra_target]
+        if not args.skip_grid:
+            for mx, my in _marker_probe_targets(calib, base_grid):
+                print(f"Adding marker center ({mx:.1f},{my:.1f}) to height-probe grid")
+                base_grid.append((mx, my))
         grid = [(x, y) for x, y in base_grid if math.hypot(x, y) <= MAX_REACH_MM]
         for ax, ay in args.avoid:
             dropped_targets = [
