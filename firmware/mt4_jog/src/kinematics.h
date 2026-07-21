@@ -19,20 +19,14 @@ extern "C" {
 #define MT4_J3_STEP_SIGN 1.0f
 #define MT4_J4_STEP_SIGN 1.0f
 
-/* Model angles at the homed pose (step counters = 0). Measured directly
- * 2026-07-06 (J2-J4 straight-line distance 184mm + J4 height above base
- * 279mm, solved via the two-link geometry below and cross-checked against a
- * direct measurement of J2's pivot height, 140mm = CENCER_HEIGHT exactly) --
- * NOT the (0, 90, 0) upper-arm-vertical/forearm-horizontal pose previously
- * assumed. That assumption was only ever self-consistency-checked against
- * the factory-reported home TCP, which reflects the *factory* firmware's own
- * homing pull-off distances, not this custom firmware's (config.h
- * J1_HOME_CENTER_DEFAULT / J2_HOME_PULL_DEFAULT) -- there's no reason the two
- * should reach the same physical pose, and they don't: FK at (103, 4.7)
- * reports TCP (200.2, 0, 264.6), not the factory's (230, 0, 255.57). */
+/* Model angles at the homed pose (step counters = 0). Refit 2026-07-21 from
+ * tape at home: shoulder 140mm, wrist 240mm, TCP 226mm, radial ~190mm --
+ * solved via the two-link geometry for (r, zw)=(190, 240). Replaces the
+ * 2026-07-06 clinometer pair (103, 4.7), which over-reported home TCP as
+ * (200.2, 0, 264.6). FK at (107.0, -9.3) reports TCP (190.0, 0, 225.6). */
 #define MT4_HOME_J1_DEG 0.0f
-#define MT4_HOME_J2_DEG 103.0f
-#define MT4_HOME_J3_DEG 4.7f
+#define MT4_HOME_J2_DEG 107.0f
+#define MT4_HOME_J3_DEG (-9.3f)
 #define MT4_HOME_J4_DEG 0.0f
 
 extern const float MT4_STEPS_PER_DEG[MT4_NUM_JOINTS];

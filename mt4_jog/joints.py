@@ -11,10 +11,11 @@ J1_HOME_CENTER_STEPS = 4580
 J2_HOME_PULLOFF_STEPS = 1000
 J3_HOME_PULLOFF_STEPS = 500
 
-# Soft joint step limits + desk plane from envelope_samples.json (2026-07-19).
-# Mirror firmware config.h MT4_JOINT_SOFT_* / MT4_GROUND_Z_MM. J1/J2 mins are
-# replaced at home with -J1_HOME_CENTER_STEPS / -J2_HOME_PULLOFF_STEPS.
-GROUND_Z_MM = 136.0
+# Soft joint step limits + desk plane. Mirror firmware config.h
+# MT4_JOINT_SOFT_* / MT4_GROUND_Z_MM. J1/J2 mins are replaced at home with
+# -J1_HOME_CENTER_STEPS / -J2_HOME_PULLOFF_STEPS. Ground lowered 2026-07-21
+# with home-angle refit (desk contact ~127mm in new FK frame).
+GROUND_Z_MM = 115.0
 # Soft joint limits (counters after home = 0). Mirror firmware
 # firmware/mt4_jog/src/config.h MT4_JOINT_SOFT_*.
 JOINT_SOFT_MIN_STEPS: tuple[int, int, int, int] = (-4800, -1000, -2050, -8100)
