@@ -23,7 +23,7 @@
  *                            the boundary instead of hitting the base.
  *
  * Keep-out: the TCP cannot physically approach the base column closer than
- * ~MT4_KEEPOUT_RADIUS_MM (170mm) from the J1 axis at any Z. `mp` rejects
+ * ~MT4_KEEPOUT_RADIUS_MM (140mm) from the J1 axis at any Z. `mp` rejects
  * targets inside the cylinder ("err mp keepout") and automatically routes
  * paths that would cross it around the boundary (entry tangent, shortest
  * arc, exit tangent); a start inside the cylinder first escapes radially.

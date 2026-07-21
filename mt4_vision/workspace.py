@@ -44,7 +44,7 @@ MARKER_DICT = "4x4_50"
 # singularity edge while covering the measured workspace (marker 1 ~322mm).
 MAX_REACH_MM = 350.0
 # Firmware `mp` rejects TCP targets inside this cylinder (J1 axis, any Z).
-KEEPOUT_RADIUS_MM = 170.0
+KEEPOUT_RADIUS_MM = 140.0
 KEEPOUT_TARGET_MARGIN_MM = 0.5  # mirrors start_absolute_move in motion.cpp
 
 # Open-table placement candidates (robot frame, mm). Shared with

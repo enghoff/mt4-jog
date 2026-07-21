@@ -40,7 +40,7 @@ static const uint16_t MP_MAX_SEGMENTS = 250;
  * (tangent-arc-tangent, shortest side); Cartesian jog clamps the inward
  * velocity component at the boundary so jogging slides along the cylinder
  * instead of driving into the base. */
-static const float MT4_KEEPOUT_RADIUS_MM = 170.0f;
+static const float MT4_KEEPOUT_RADIUS_MM = 140.0f;
 /* Desk / ground plane: TCP Z below this is rejected (`mp`) and Cartesian jog
  * clamps downward velocity. Was 136 from envelope min Z in the old home-angle
  * frame (2026-07-19); after 2026-07-21 home refit (107/−9.3) the same desk
