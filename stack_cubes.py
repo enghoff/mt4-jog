@@ -18,6 +18,8 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+
 from mt4_jog.client import Mt4Client, Mt4ClientError
 from mt4_jog.kinematics import JointAnglesDeg, ik_position
 from mt4_vision.calib import DEFAULT_CALIB_PATH, CalibrationError, load_calibration
@@ -54,6 +56,15 @@ TRAVEL_ABOVE_MM = 35.0
 # Settle after retreat before a fresh scene capture.
 CAMERA_SETTLE_S = 0.8
 SITE_CLEAR_ATTEMPTS = 6
+# Camera line-of-sight shadow behind the stack: raised stack tops map
+# (via the 1-cube cube-top homography) to phantom table cubes further from
+# the camera than the site. Ignore pick candidates in that corridor.
+# Measured 2026-07-21 on marker 3: true (179,180) → phantoms ~(115,227)
+# (~79mm along the away-from-camera axis).
+STACK_SHADOW_LATERAL_MM = 45.0
+STACK_SHADOW_ALONG_MIN_MM = 25.0
+STACK_SHADOW_ALONG_PER_LEVEL_MM = 35.0
+STACK_SHADOW_ALONG_FLOOR_MM = 90.0
 
 
 def marker_by_id(calib, marker_id: int) -> MarkerSlot:
@@ -137,15 +148,88 @@ def choose_park_slot(
     return min(candidates, key=lambda p: dist_mm(p[0], p[1], sx, sy))
 
 
+def stack_shadow_behind_unit(
+    calib, sx: float, sy: float
+) -> tuple[float, float] | None:
+    """Unit XY vector from the stack site away from the camera.
+
+    Derived from table vs cube-top maps at the site: mapping the site's
+    table pixel through the cube-top homography shifts toward the camera;
+    the opposite direction is "behind the stack" along the camera LOS.
+    """
+    if not calib.cube_top_homography:
+        return None
+    ht_inv = np.linalg.inv(np.array(calib.homography, dtype=np.float64))
+    v = ht_inv @ np.array([sx, sy, 1.0])
+    px, py = float(v[0] / v[2]), float(v[1] / v[2])
+    cx, cy = calib.pixel_to_robot(px, py, on_cube_top=True)
+    # cube-top reading of the table-site pixel sits toward the camera.
+    toward_cam_x, toward_cam_y = cx - sx, cy - sy
+    length = math.hypot(toward_cam_x, toward_cam_y)
+    if length < 1.0:
+        return None
+    return (-toward_cam_x / length, -toward_cam_y / length)
+
+
+def in_stack_camera_shadow(
+    x: float,
+    y: float,
+    sx: float,
+    sy: float,
+    behind_u: tuple[float, float],
+    *,
+    stack_levels: int,
+) -> bool:
+    """True when (x, y) lies behind the stack along the camera LOS.
+
+    A real cube there would be occluded by the stack; detections in this
+    corridor are almost always raised stack tops mis-mapped as table cubes.
+    """
+    dx, dy = x - sx, y - sy
+    ux, uy = behind_u
+    along = dx * ux + dy * uy
+    lateral = abs(dx * uy - dy * ux)
+    along_max = max(
+        STACK_SHADOW_ALONG_FLOOR_MM,
+        stack_levels * STACK_SHADOW_ALONG_PER_LEVEL_MM,
+    )
+    return (
+        along >= STACK_SHADOW_ALONG_MIN_MM
+        and along <= along_max
+        and lateral <= STACK_SHADOW_LATERAL_MM
+    )
+
+
 def stack_candidates(
-    scene: Scene, sx: float, sy: float
+    scene: Scene,
+    sx: float,
+    sy: float,
+    *,
+    calib=None,
+    stack_levels: int = 0,
 ) -> list[CubeDetection]:
-    """Reachable pickable cubes outside the site keep-clear radius."""
-    return [
-        c
-        for c in scene.pickable(scene.cubes)
-        if dist_mm(float(c.x), float(c.y), sx, sy) >= SITE_CLEAR_MM
-    ]
+    """Reachable pickable cubes outside the site keep-clear radius.
+
+    When the stack already has cubes, also drop detections in the camera
+    line-of-sight shadow behind the site (stack-top phantoms).
+    """
+    behind_u = None
+    if stack_levels > 0 and calib is not None:
+        behind_u = stack_shadow_behind_unit(calib, sx, sy)
+    out: list[CubeDetection] = []
+    for c in scene.pickable(scene.cubes):
+        if dist_mm(float(c.x), float(c.y), sx, sy) < SITE_CLEAR_MM:
+            continue
+        if (
+            behind_u is not None
+            and in_stack_camera_shadow(
+                float(c.x), float(c.y), sx, sy, behind_u,
+                stack_levels=stack_levels,
+            )
+        ):
+            continue
+        out.append(c)
+    return out
 
 
 def release_z_for_level(calib, level: int) -> float:
@@ -295,7 +379,31 @@ def main() -> int:
                 break
 
             scene = snap_scene()
-            cands = stack_candidates(scene, sx, sy)
+            # Drop stack-top phantoms behind the site along the camera LOS
+            # (they appear once level 1+ is built).
+            shadowed = []
+            behind_u = (
+                stack_shadow_behind_unit(calib, sx, sy) if built > 0 else None
+            )
+            if behind_u is not None:
+                for c in scene.pickable(scene.cubes):
+                    if dist_mm(float(c.x), float(c.y), sx, sy) < SITE_CLEAR_MM:
+                        continue
+                    if in_stack_camera_shadow(
+                        float(c.x), float(c.y), sx, sy, behind_u,
+                        stack_levels=built,
+                    ):
+                        shadowed.append(c)
+            if shadowed:
+                print(
+                    "Ignoring stack-shadow phantom(s): "
+                    + ", ".join(
+                        f"{c.color}({c.x:.0f},{c.y:.0f})" for c in shadowed
+                    )
+                )
+            cands = stack_candidates(
+                scene, sx, sy, calib=calib, stack_levels=built,
+            )
             if not cands:
                 print(f"level {level}: no reachable cube outside site -- done")
                 break

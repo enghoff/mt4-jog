@@ -15,8 +15,10 @@ from stack_cubes import (
     choose_park_slot,
     clear_aside_xy,
     cubes_near_site,
+    in_stack_camera_shadow,
     release_z_for_level,
     stack_candidates,
+    stack_shadow_behind_unit,
     travel_z_for_level,
 )
 
@@ -65,6 +67,34 @@ def test_stack_candidates_exclude_site_and_use_pickable():
         pickable=lambda cubes: [far],
     )
     assert stack_candidates(scene, 200.0, 60.0) == [far]
+
+
+def test_stack_shadow_rejects_marker3_phantom():
+    """Field case 2026-07-21: stack (179,180) → phantom ~(115,227)."""
+    from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
+
+    calib = load_calibration(DEFAULT_CALIB_PATH)
+    sx, sy = 178.7, 179.8
+    behind = stack_shadow_behind_unit(calib, sx, sy)
+    assert behind is not None
+    assert in_stack_camera_shadow(
+        115.0, 227.0, sx, sy, behind, stack_levels=4,
+    )
+    # A cube off to the side of the corridor must still be pickable.
+    assert not in_stack_camera_shadow(
+        280.0, 0.0, sx, sy, behind, stack_levels=4,
+    )
+    phantom = SimpleNamespace(x=115.0, y=227.0, color="green", yaw_deg=0.0)
+    real = SimpleNamespace(x=250.0, y=96.0, color="red", yaw_deg=0.0)
+    scene = SimpleNamespace(
+        cubes=[phantom, real],
+        pickable=lambda cubes: list(cubes),
+    )
+    cands = stack_candidates(
+        scene, sx, sy, calib=calib, stack_levels=4,
+    )
+    assert phantom not in cands
+    assert real in cands
 
 
 def test_release_and_travel_z_step_by_cube_height():
