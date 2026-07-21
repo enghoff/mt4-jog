@@ -22,19 +22,35 @@ def j4_for_face_align(
     cube_yaw_deg: float,
     *,
     current_j4_deg: float | None = None,
+    x: float | None = None,
+    y: float | None = None,
+    j4_margin_steps: int = 200,
 ) -> float:
     """World-frame J4 (deg) so the jaws meet a cube face, not a corner.
 
     Assumes firmware ``j4zero``: jaws along the arm ⇒ world J4 = 0.
     ``cube_yaw_deg`` is a robot-frame edge angle from detection. Squares are
     90°-periodic; when ``current_j4_deg`` is given, pick the equivalent that
-    minimizes wrist travel.
+    minimizes wrist travel -- but only among candidates whose *joint* J4
+    (world − j1) stays inside soft limits at (x, y). Preferring nearest
+    world yaw alone can pin joint J4 past ±8100 on far −Y picks after the
+    wrist has drifted near 90° (stack level-4: world 109° at j1≈−72° →
+    joint 181° / 8130 steps → ``err mp joints``).
     """
+    base = fold_square_yaw_deg(cube_yaw_deg)
+    # Face-aligned lattice: base + k*90.
+    candidates = [base + 90.0 * k for k in range(-4, 5)]
+    if x is not None and y is not None:
+        j1 = math.degrees(math.atan2(y, x))
+        lo = JOINT_SOFT_MIN_STEPS[3] / STEPS_PER_DEG[3] + j4_margin_steps / STEPS_PER_DEG[3]
+        hi = JOINT_SOFT_MAX_STEPS[3] / STEPS_PER_DEG[3] - j4_margin_steps / STEPS_PER_DEG[3]
+        feasible = [w for w in candidates if lo <= (w - j1) <= hi]
+        if feasible:
+            candidates = feasible
     if current_j4_deg is None:
-        return fold_square_yaw_deg(cube_yaw_deg)
-    # j4 ≡ cube_yaw (mod 90), closest to current -- avoids ±360 duplicates.
-    delta = (cube_yaw_deg - current_j4_deg + 45.0) % 90.0 - 45.0
-    return current_j4_deg + delta
+        # Prefer the folded representative (or the feasible one closest to it).
+        return min(candidates, key=lambda w: abs(w - base))
+    return min(candidates, key=lambda w: abs(w - current_j4_deg))
 
 
 def j4_preserve_wrist(
@@ -174,18 +190,23 @@ def resolve_pick_j4(
     yaw_deg: float | None,
     *,
     face_align: bool = True,
+    x: float | None = None,
+    y: float | None = None,
 ) -> float | None:
     """Face-align world J4, or None so ``_travel`` preserves joint J4 instead.
 
     None must not mean world-yaw hold: that trips J4 soft limits on large
     J1 swings (marker 0 / far −Y). ``_travel``/``_approach`` map None to
-    ``j4_preserve_wrist``.
+    ``j4_preserve_wrist``. Pass pick (x, y) so face-align stays inside
+    joint-J4 soft limits at the target bearing.
     """
     if not face_align or yaw_deg is None:
         return None
     tcp = client.get_tcp()
     current = tcp.j4 if tcp is not None else None
-    return j4_for_face_align(yaw_deg, current_j4_deg=current)
+    return j4_for_face_align(
+        yaw_deg, current_j4_deg=current, x=x, y=y,
+    )
 
 
 def resolve_place_j4(
@@ -193,6 +214,8 @@ def resolve_place_j4(
     calib: Calibration,
     *,
     axis_align: bool = True,
+    x: float | None = None,
+    y: float | None = None,
 ) -> float | None:
     """World-frame J4 that lands the held cube square to the X/Y axes.
 
@@ -206,7 +229,7 @@ def resolve_place_j4(
     """
     if not axis_align:
         return None
-    return resolve_pick_j4(client, calib, 0.0, face_align=True)
+    return resolve_pick_j4(client, calib, 0.0, face_align=True, x=x, y=y)
 
 
 def pick(
@@ -229,7 +252,9 @@ def pick(
     _require_mp_reachable(x, y, "pick target")
     if face_align is None:
         face_align = bool(getattr(calib, "face_align_picks", True))
-    j4 = resolve_pick_j4(client, calib, yaw_deg, face_align=face_align)
+    j4 = resolve_pick_j4(
+        client, calib, yaw_deg, face_align=face_align, x=x, y=y,
+    )
     client.gripper(calib.grip_open_s)
     _travel(client, calib, x, y, calib.safe_z, "move to safe height", j4=j4)
     _approach(client, calib, x, y, calib.pick_z, "descend to pick height", j4=j4)
@@ -277,7 +302,10 @@ def place(
     *,
     on_released: Callable[[], None] | None = None,
     axis_align: bool = True,
+    along_arm: bool = False,
     lift_after: bool = True,
+    release_z: float | None = None,
+    travel_z: float | None = None,
 ) -> dict[str, object]:
     """Release the held cube at robot-frame (x, y).
 
@@ -287,21 +315,78 @@ def place(
     ``j4zero``) so the released cube lands aligned rather than at whatever
     orientation it happened to be picked in.
 
+    ``along_arm`` forces jaws along the arm (world J4 = 0, soft-limit
+    safe) instead of the nearest 90° square to the current wrist -- needed
+    after ``pick_centered``'s ±90° rotate, which otherwise leaves place at
+    world ~90° (jaws across the arm).
+
+    ``release_z`` overrides the table release height (stacking uses
+    ``pick_z + (level-1)*cube_height_mm``). ``travel_z`` overrides the
+    transit height (defaults to ``max(safe_z, release_z)``).
+
     When ``lift_after`` is False the TCP stays at release height over the
     target (for in-place centering immediately after).
     """
     ensure_homed(client)
     _require_mp_reachable(x, y, "place target")
-    j4 = resolve_place_j4(client, calib, axis_align=axis_align)
-    release_z = calib.pick_z + 3.0
-    _travel(client, calib, x, y, calib.safe_z, "move to safe height", j4=j4)
-    _approach(client, calib, x, y, release_z, "descend to release height", j4=j4)
+    if along_arm:
+        # Prefer world 0 (jaws along arm after j4zero), not nearest-to-current.
+        j4 = j4_for_face_align(0.0, current_j4_deg=None, x=x, y=y)
+    else:
+        j4 = resolve_place_j4(client, calib, axis_align=axis_align, x=x, y=y)
+    rz = calib.pick_z + 3.0 if release_z is None else float(release_z)
+    tz = max(float(calib.safe_z), rz) if travel_z is None else float(travel_z)
+    _travel(client, calib, x, y, tz, "move to safe height", j4=j4)
+    _approach(client, calib, x, y, rz, "descend to release height", j4=j4)
     client.gripper(calib.grip_open_s)
     if on_released is not None:
         on_released()
     if lift_after:
-        _travel(client, calib, x, y, calib.safe_z, "lift after release")
-    return {"ok": True, "placed_at": [x, y]}
+        _travel(client, calib, x, y, tz, "lift after release")
+    return {"ok": True, "placed_at": [x, y], "release_z": rz}
+
+
+def pick_centered(
+    client: Mt4Client,
+    calib: Calibration,
+    x: float,
+    y: float,
+    *,
+    yaw_deg: float | None = None,
+    face_align: bool | None = None,
+) -> dict[str, object]:
+    """Center under TCP then take the cube (calibrate_height-style align).
+
+    Does **not** call ``pick()`` (that lifts after the first grip and forces
+    an extra descend). Sequence:
+
+    1. Face-aligned approach, descend, grab
+    2. Release in place (still at pick height)
+    3. Lift to ``safe_z``
+    4. Rotate J4 ±90°
+    5. Lower, grab, lift — cube remains held for transport
+    """
+    ensure_homed(client)
+    _require_mp_reachable(x, y, "pick_centered target")
+    if face_align is None:
+        face_align = bool(getattr(calib, "face_align_picks", True))
+    j4 = resolve_pick_j4(
+        client, calib, yaw_deg, face_align=face_align, x=x, y=y,
+    )
+    client.gripper(calib.grip_open_s)
+    _travel(client, calib, x, y, calib.safe_z, "align: approach", j4=j4)
+    _approach(client, calib, x, y, calib.pick_z, "align: descend to grab", j4=j4)
+    _check(client.gripper(calib.grip_close_s), "align: grab")
+    _check(client.gripper(calib.grip_open_s), "align: release")
+    _travel(client, calib, x, y, calib.safe_z, "align: lift before rotate")
+    _rotate_j4_90_in_place(client)
+    _approach(client, calib, x, y, calib.pick_z, "align: descend to re-grip")
+    _check(client.gripper(calib.grip_close_s), "align: grip")
+    _travel(client, calib, x, y, calib.safe_z, "align: lift after grip")
+    out: dict[str, object] = {"ok": True, "picked_at": [x, y], "centered": True}
+    if yaw_deg is not None:
+        out["yaw_deg"] = round(float(yaw_deg), 2)
+    return out
 
 
 def place_here(client: Mt4Client, calib: Calibration) -> dict[str, object]:

@@ -55,6 +55,19 @@ def test_j4_face_align_picks_nearest_90_to_current():
     assert abs(j4 - 100.0) < 1e-9
 
 
+def test_j4_face_align_avoids_joint_soft_limit_at_far_neg_y():
+    # Stack level-4 failure: wrist ~89°, cube yaw ~-161° at (73,-224).
+    # Nearest world candidate is ~109°, but joint J4 = 109 - (-72) ≈ 181°
+    # exceeds soft max -- must fall back to ~19°.
+    j4 = j4_for_face_align(
+        -161.24, current_j4_deg=88.8, x=73.1, y=-223.6,
+    )
+    assert abs(j4 - 18.76) < 0.5
+    # joint J4 stays inside ±180° soft window
+    j1 = __import__("math").degrees(__import__("math").atan2(-223.6, 73.1))
+    assert abs(j4 - j1) < 180.0
+
+
 def test_j4_preserve_wrist_holds_joint_across_j1_swing():
     # Park (200,0) world j4=77.8 → joint j4=77.8; at marker-0 bearing
     # j1≈−79.2, world j4 should be ≈−1.4 so joint stays 77.8.
@@ -83,6 +96,7 @@ if __name__ == "__main__":
     test_fold_square_yaw_period_90()
     test_j4_face_align_folds_without_current()
     test_j4_face_align_picks_nearest_90_to_current()
+    test_j4_face_align_avoids_joint_soft_limit_at_far_neg_y()
     test_j4_preserve_wrist_holds_joint_across_j1_swing()
     test_resolve_place_j4_off_skips_hardware()
     test_resolve_place_j4_squares_to_zero_nearest_current()
