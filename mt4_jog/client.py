@@ -397,6 +397,22 @@ class Mt4Client:
                 done_prefix="mp done", timeout=timeout, collected=collected
             )
 
+    def set_speed(self, speed_us: int) -> dict[str, object]:
+        """Set the shared jog/`m`/`mp` step period (`speed <us>`)."""
+        if not JOG_SPEED_MIN_US <= speed_us <= JOG_SPEED_MAX_US:
+            raise Mt4ClientError(
+                f"speed_us must be {JOG_SPEED_MIN_US}-{JOG_SPEED_MAX_US}"
+            )
+        with self._lock:
+            self._ensure_connected_unlocked()
+            lines = self._send_and_collect(
+                f"speed {int(speed_us)}", wait=COMMAND_WAIT_S
+            )
+            for line in lines:
+                if line.startswith("err"):
+                    return {"ok": False, "error": line, "lines": lines}
+            return {"ok": True, "lines": lines}
+
     def move_relative(
         self,
         dj1: int,

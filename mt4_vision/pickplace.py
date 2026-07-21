@@ -6,6 +6,8 @@ import math
 from collections.abc import Callable
 
 from mt4_jog.client import Mt4Client, Mt4ClientError
+from mt4_jog.joints import JOINT_SOFT_MAX_STEPS, JOINT_SOFT_MIN_STEPS, JOG_SPEED_MIN_US
+from mt4_jog.kinematics import STEPS_PER_DEG
 from mt4_vision.calib import Calibration
 from mt4_vision.detect import CubeDetection
 from mt4_vision.workspace import KEEPOUT_RADIUS_MM, is_mp_reachable_xy
@@ -288,6 +290,7 @@ def place(
     *,
     on_released: Callable[[], None] | None = None,
     axis_align: bool = True,
+    lift_after: bool = True,
 ) -> dict[str, object]:
     """Release the held cube at robot-frame (x, y).
 
@@ -296,6 +299,9 @@ def place(
     driven square to the X/Y axes during the approach (calibrated
     ``j4_face_offset_deg``) so the released cube lands aligned rather than
     at whatever orientation it happened to be picked in.
+
+    When ``lift_after`` is False the TCP stays at release height over the
+    target (for in-place centering immediately after).
     """
     ensure_homed(client)
     _require_mp_reachable(x, y, "place target")
@@ -306,7 +312,8 @@ def place(
     client.gripper(calib.grip_open_s)
     if on_released is not None:
         on_released()
-    _travel(client, calib, x, y, calib.safe_z, "lift after release")
+    if lift_after:
+        _travel(client, calib, x, y, calib.safe_z, "lift after release")
     return {"ok": True, "placed_at": [x, y]}
 
 
@@ -314,6 +321,79 @@ def place_here(client: Mt4Client, calib: Calibration) -> dict[str, object]:
     """Release the held cube at the current TCP xy."""
     tcp = client.get_tcp()
     return place(client, calib, tcp.x, tcp.y)
+
+
+def _rotate_j4_90_in_place(client: Mt4Client) -> None:
+    """Rotate J4 ±90° via ``m``, picking the direction with more soft-limit headroom."""
+    dj4_90 = round(90.0 * STEPS_PER_DEG[3])
+    j4_min, j4_max = JOINT_SOFT_MIN_STEPS[3], JOINT_SOFT_MAX_STEPS[3]
+    j4 = client.get_status().joints.get("j4", 0)
+    options: list[tuple[int, int]] = []
+    for dj4 in (dj4_90, -dj4_90):
+        end = j4 + dj4
+        if j4_min <= end <= j4_max:
+            margin = min(end - j4_min, j4_max - end)
+            options.append((margin, dj4))
+    if not options:
+        raise Mt4ClientError("center: no j4 ±90° rotation within soft limits")
+    options.sort(key=lambda item: item[0], reverse=True)
+    status = client.get_status()
+    prev_speed = status.speed_us or (
+        int(status.tcp.speed) if status.tcp is not None else JOG_SPEED_MIN_US
+    )
+    _check(client.set_speed(JOG_SPEED_MIN_US), "center: max speed for j4 rotate")
+    try:
+        last_err: object = None
+        for _, dj4 in options:
+            result = client.move_relative(0, 0, 0, dj4)
+            if result.get("ok"):
+                return
+            last_err = result.get("error", result)
+        raise Mt4ClientError(f"center: rotate j4 ±90° failed: {last_err}")
+    finally:
+        if prev_speed != JOG_SPEED_MIN_US:
+            _check(client.set_speed(prev_speed), "center: restore speed")
+
+
+def center_placed_cube(
+    client: Mt4Client,
+    calib: Calibration,
+    x: float,
+    y: float,
+    *,
+    lift_before_rotate: bool = False,
+) -> dict[str, object]:
+    """Re-grip a placed cube after rotating J4 90° and release in place.
+
+    Centers the cube under the TCP (corrects placement/release drag). The
+    gripper closes and opens at pick height, then lifts straight up.
+
+    Expects ``place(..., lift_after=False)`` to have left the TCP at release
+    height over (x, y). The wrist is rotated in place with a relative joint
+    move (`m`); commanding absolute j4+90 through ``mp`` can exceed soft
+    limits because firmware sets joint_j4 = world_j4 - j1.
+
+    When ``lift_before_rotate`` is True (first calibration placement only),
+    lift to ``safe_z`` before the wrist rotation, then descend for grip/release.
+    """
+    ensure_homed(client)
+    _require_mp_reachable(x, y, "center target")
+    if lift_before_rotate:
+        tcp = client.get_tcp()
+        _travel(
+            client, calib, tcp.x, tcp.y, calib.safe_z,
+            "center: lift before rotate",
+        )
+    _rotate_j4_90_in_place(client)
+    _approach(client, calib, x, y, calib.pick_z, "center: descend to cube")
+    _check(client.gripper(calib.grip_close_s), "center: grip")
+    _check(client.gripper(calib.grip_open_s), "center: release")
+    tcp = client.get_tcp()
+    _travel(
+        client, calib, tcp.x, tcp.y, calib.safe_z,
+        "center: lift straight after release",
+    )
+    return {"ok": True, "centered_at": [x, y]}
 
 
 def goto_marker(
