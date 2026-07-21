@@ -7,7 +7,9 @@ marker→cube direction to CLEAR_PARK_MM (keep-clear + margin) first. Each stack
 sequence (yaw-pick → release → lift → rotate J4 90° → re-grip) via
 ``pick_centered``, then placed at the marker's calibrated XY by dead
 reckoning. Placement Z steps by ``cube_height_mm`` from the calibration;
-there is no visual alignment or post-place verification.
+there is no visual alignment or post-place verification. Stack place/retreat
+moves are vertical-then-horizontal within ``STACK_AXIS_CLEAR_MM`` of the
+site so the gripper cannot clip the growing column on a diagonal ``mp``.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from mt4_vision.calib import DEFAULT_CALIB_PATH, CalibrationError, load_calibrat
 from mt4_vision.camera import capture_frame
 from mt4_vision.detect import CubeDetection
 from mt4_vision.pickplace import (
+    STACK_AXIS_CLEAR_MM,
     home_arm,
     pick,
     pick_centered,
@@ -426,6 +429,8 @@ def main() -> int:
                     release_z=rz,
                     travel_z=tz,
                     along_arm=True,
+                    # No XYZ diagonal inside this radius of the stack axis.
+                    axis_clear_mm=STACK_AXIS_CLEAR_MM,
                 )
             except Mt4ClientError as exc:
                 print(f"  level {level} failed: {exc}", file=sys.stderr)

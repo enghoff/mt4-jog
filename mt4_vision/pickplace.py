@@ -119,6 +119,65 @@ def _travel(
     )
 
 
+# Within this radius of a stack axis, motion must be pure horizontal or pure
+# vertical (never a 3D diagonal) so the gripper cannot clip a tall column.
+STACK_AXIS_CLEAR_MM = 50.0
+_XY_EPS_MM = 0.5
+_Z_EPS_MM = 0.5
+
+
+def stack_clear_xy(
+    sx: float,
+    sy: float,
+    from_x: float,
+    from_y: float,
+    radius_mm: float = STACK_AXIS_CLEAR_MM,
+) -> tuple[float, float] | None:
+    """Reachable XY at ``radius_mm`` from (sx, sy), preferring the approach ray."""
+    dx, dy = from_x - sx, from_y - sy
+    if math.hypot(dx, dy) < 1.0:
+        dx, dy = sx, sy
+    if math.hypot(dx, dy) < 1.0:
+        dx, dy = 1.0, 0.0
+    scale = math.hypot(dx, dy)
+    ux, uy = dx / scale, dy / scale
+    for angle_deg in (0.0, 45.0, -45.0, 90.0, -90.0, 135.0, -135.0, 180.0):
+        ang = math.radians(angle_deg)
+        ca, sa = math.cos(ang), math.sin(ang)
+        vx, vy = ux * ca - uy * sa, ux * sa + uy * ca
+        px, py = sx + vx * radius_mm, sy + vy * radius_mm
+        if is_mp_reachable_xy(px, py):
+            return (px, py)
+    return None
+
+
+def travel_orthogonal(
+    client: Mt4Client,
+    calib: Calibration,
+    x: float,
+    y: float,
+    z: float,
+    step: str,
+    *,
+    j4: float | None = None,
+) -> None:
+    """Reach (x, y, z) via vertical-then-horizontal segments (no XYZ diagonal)."""
+    tcp = client.get_tcp()
+    if tcp is None:
+        raise Mt4ClientError(f"{step}: could not read TCP")
+    same_xy = math.hypot(float(tcp.x) - x, float(tcp.y) - y) < _XY_EPS_MM
+    same_z = abs(float(tcp.z) - z) < _Z_EPS_MM
+    if same_xy and same_z:
+        return
+    if not same_z:
+        _travel(
+            client, calib, float(tcp.x), float(tcp.y), z,
+            f"{step}: vertical", j4=j4,
+        )
+    if not same_xy:
+        _travel(client, calib, x, y, z, f"{step}: horizontal", j4=j4)
+
+
 def _approach(
     client: Mt4Client,
     calib: Calibration,
@@ -158,11 +217,28 @@ def near_camera_park(x: float, y: float) -> bool:
 
 
 def retreat_for_camera(client: Mt4Client, calib: Calibration) -> dict[str, object]:
-    """Move the TCP to the camera-clear park pose (post-move capture prep)."""
-    return _travel(
-        client, calib, CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z,
-        "retreat to camera park",
+    """Move the TCP to the camera-clear park pose (post-move capture prep).
+
+    Uses vertical-then-horizontal segments so a depart from over a stack
+    cannot clip the column on a diagonal ``mp``.
+    """
+    tcp = client.get_tcp()
+    if tcp is None:
+        raise Mt4ClientError("retreat to camera park: could not read TCP")
+    z_hi = max(float(tcp.z), CAMERA_PARK_Z, float(calib.safe_z))
+    travel_orthogonal(
+        client, calib, float(tcp.x), float(tcp.y), z_hi,
+        "retreat: lift clear",
     )
+    travel_orthogonal(
+        client, calib, CAMERA_PARK_X, CAMERA_PARK_Y, z_hi,
+        "retreat: over park",
+    )
+    travel_orthogonal(
+        client, calib, CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z,
+        "retreat: park height",
+    )
+    return {"ok": True, "parked_at": [CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z]}
 
 
 def ensure_homed(client: Mt4Client) -> None:
@@ -306,6 +382,7 @@ def place(
     lift_after: bool = True,
     release_z: float | None = None,
     travel_z: float | None = None,
+    axis_clear_mm: float | None = None,
 ) -> dict[str, object]:
     """Release the held cube at robot-frame (x, y).
 
@@ -324,6 +401,10 @@ def place(
     ``pick_z + (level-1)*cube_height_mm``). ``travel_z`` overrides the
     transit height (defaults to ``max(safe_z, release_z)``).
 
+    When ``axis_clear_mm`` is set (stacking), approach and depart use
+    vertical-then-horizontal segments and finish with a horizontal move to
+    that radius from (x, y) so later diagonals cannot clip the column.
+
     When ``lift_after`` is False the TCP stays at release height over the
     target (for in-place centering immediately after).
     """
@@ -336,13 +417,34 @@ def place(
         j4 = resolve_place_j4(client, calib, axis_align=axis_align, x=x, y=y)
     rz = calib.pick_z + 3.0 if release_z is None else float(release_z)
     tz = max(float(calib.safe_z), rz) if travel_z is None else float(travel_z)
-    _travel(client, calib, x, y, tz, "move to safe height", j4=j4)
+    tcp0 = client.get_tcp()
+    if tcp0 is None:
+        raise Mt4ClientError("place: could not read TCP")
+    if axis_clear_mm is not None and axis_clear_mm > 0:
+        travel_orthogonal(
+            client, calib, float(tcp0.x), float(tcp0.y), tz,
+            "stack approach height", j4=j4,
+        )
+        travel_orthogonal(
+            client, calib, x, y, tz, "horizontal over place XY", j4=j4,
+        )
+    else:
+        _travel(client, calib, x, y, tz, "move to safe height", j4=j4)
     _approach(client, calib, x, y, rz, "descend to release height", j4=j4)
     client.gripper(calib.grip_open_s)
     if on_released is not None:
         on_released()
     if lift_after:
         _travel(client, calib, x, y, tz, "lift after release")
+        if axis_clear_mm is not None and axis_clear_mm > 0:
+            clear = stack_clear_xy(
+                x, y, float(tcp0.x), float(tcp0.y), float(axis_clear_mm),
+            )
+            if clear is not None:
+                _travel(
+                    client, calib, clear[0], clear[1], tz,
+                    "horizontal clear of stack axis",
+                )
     return {"ok": True, "placed_at": [x, y], "release_z": rz}
 
 
