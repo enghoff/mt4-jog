@@ -55,10 +55,6 @@ def test_j4_face_align_picks_nearest_90_to_current():
     assert abs(j4 - 100.0) < 1e-9
 
 
-def test_j4_face_align_applies_offset():
-    assert abs(j4_for_face_align(0.0, offset_deg=12.0) - 12.0) < 1e-9
-
-
 def test_j4_preserve_wrist_holds_joint_across_j1_swing():
     # Park (200,0) world j4=77.8 → joint j4=77.8; at marker-0 bearing
     # j1≈−79.2, world j4 should be ≈−1.4 so joint stays 77.8.
@@ -70,25 +66,24 @@ def test_j4_preserve_wrist_holds_joint_across_j1_swing():
 
 def test_resolve_place_j4_off_skips_hardware():
     # Explicitly disabled: no squaring, and no hardware access either.
-    calib = _calib(j4_face_offset_deg=33.0)
+    calib = _calib()
     assert resolve_place_j4(None, calib, axis_align=False) is None
 
 
-def test_resolve_place_j4_squares_to_offset_nearest_current():
-    calib = _calib(j4_face_offset_deg=33.0)
-    # Default is on; no TCP reading: folded offset.
-    assert abs(resolve_place_j4(_StubClient(), calib) - 33.0) < 1e-9
-    # Wrist at 95°: nearest 90°-equivalent of 33° is 123°.
+def test_resolve_place_j4_squares_to_zero_nearest_current():
+    calib = _calib()
+    # Default is on; no TCP reading: folded 0°.
+    assert abs(resolve_place_j4(_StubClient(), calib) - 0.0) < 1e-9
+    # Wrist at 95°: nearest 90°-equivalent of 0° is 90°.
     j4 = resolve_place_j4(_StubClient(_Tcp(95.0)), calib)
-    assert abs(j4 - 123.0) < 1e-9
+    assert abs(j4 - 90.0) < 1e-9
 
 
 if __name__ == "__main__":
     test_fold_square_yaw_period_90()
     test_j4_face_align_folds_without_current()
     test_j4_face_align_picks_nearest_90_to_current()
-    test_j4_face_align_applies_offset()
     test_j4_preserve_wrist_holds_joint_across_j1_swing()
     test_resolve_place_j4_off_skips_hardware()
-    test_resolve_place_j4_squares_to_offset_nearest_current()
+    test_resolve_place_j4_squares_to_zero_nearest_current()
     print("ok")

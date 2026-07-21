@@ -251,7 +251,6 @@ def main() -> int:
         # invalidates them just like the parallax fallback below. Re-measure
         # at the new pose if needed.
         color_xy_offset_mm={},
-        j4_face_offset_deg=prev.j4_face_offset_deg,
         face_align_picks=prev.face_align_picks,
         # Hull from every visible marker (matched or not), like
         # calibrate_vision.py -- a hull of only the matched markers would

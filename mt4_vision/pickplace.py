@@ -13,12 +13,6 @@ from mt4_vision.detect import CubeDetection
 from mt4_vision.workspace import KEEPOUT_RADIUS_MM, is_mp_reachable_xy
 
 
-# Optional constant added to cube-edge yaw before commanding world-frame J4.
-# Jaws vs j4=0 depends on the mechanical mount -- leave 0 until measured;
-# override via Calibration.j4_face_offset_deg when known.
-DEFAULT_J4_FACE_OFFSET_DEG = 0.0
-
-
 def fold_square_yaw_deg(yaw_deg: float) -> float:
     """Map any angle into (-45, 45] -- one face of a square (90° period)."""
     return (yaw_deg + 45.0) % 90.0 - 45.0
@@ -28,19 +22,18 @@ def j4_for_face_align(
     cube_yaw_deg: float,
     *,
     current_j4_deg: float | None = None,
-    offset_deg: float = DEFAULT_J4_FACE_OFFSET_DEG,
 ) -> float:
     """World-frame J4 (deg) so the jaws meet a cube face, not a corner.
 
+    Assumes firmware ``j4zero``: jaws along the arm ⇒ world J4 = 0.
     ``cube_yaw_deg`` is a robot-frame edge angle from detection. Squares are
     90°-periodic; when ``current_j4_deg`` is given, pick the equivalent that
     minimizes wrist travel.
     """
-    base = cube_yaw_deg + offset_deg
     if current_j4_deg is None:
-        return fold_square_yaw_deg(base)
-    # j4 ≡ base (mod 90), closest to current -- avoids ±360 duplicates.
-    delta = (base - current_j4_deg + 45.0) % 90.0 - 45.0
+        return fold_square_yaw_deg(cube_yaw_deg)
+    # j4 ≡ cube_yaw (mod 90), closest to current -- avoids ±360 duplicates.
+    delta = (cube_yaw_deg - current_j4_deg + 45.0) % 90.0 - 45.0
     return current_j4_deg + delta
 
 
@@ -190,10 +183,9 @@ def resolve_pick_j4(
     """
     if not face_align or yaw_deg is None:
         return None
-    offset = float(getattr(calib, "j4_face_offset_deg", DEFAULT_J4_FACE_OFFSET_DEG))
     tcp = client.get_tcp()
     current = tcp.j4 if tcp is not None else None
-    return j4_for_face_align(yaw_deg, current_j4_deg=current, offset_deg=offset)
+    return j4_for_face_align(yaw_deg, current_j4_deg=current)
 
 
 def resolve_place_j4(
@@ -205,10 +197,8 @@ def resolve_place_j4(
     """World-frame J4 that lands the held cube square to the X/Y axes.
 
     A gripped cube's orientation relative to the jaws is fixed at pick time,
-    so driving J4 to ``j4_face_offset_deg`` (mod 90°, closest to the current
-    wrist to minimize travel) squares whatever face is held to the world
-    axes -- the same calibrated offset ``resolve_pick_j4`` uses, just with
-    the target edge angle fixed at 0° instead of a detected cube yaw.
+    so driving J4 to 0° (mod 90°, closest to the current wrist) squares
+    whatever face is held to the world axes — assumes ``j4zero``.
 
     Defaults on unconditionally (validated safe on hardware): even for a
     pick that wasn't face-aligned, squaring the wrist costs nothing worse
@@ -232,11 +222,8 @@ def pick(
 
     When ``yaw_deg`` is set (robot-frame cube-edge angle from detection) and
     face-align is enabled, world-frame J4 is commanded so the jaws meet a
-    face rather than a corner. Face-align defaults on now that
-    ``Calibration.face_align_picks`` / ``j4_face_offset_deg`` are validated
-    on hardware -- a wrong offset is worse than a fixed yaw, so don't flip
-    this back off without a re-measured offset. Callers with a
-    ``CubeDetection`` should prefer ``pick_cube``.
+    face rather than a corner. Face-align defaults on and assumes firmware
+    ``j4zero`` (``calibrate_j4.py``): world J4 = 0 means jaws along the arm.
     """
     ensure_homed(client)
     _require_mp_reachable(x, y, "pick target")
@@ -296,9 +283,9 @@ def place(
 
     Releases slightly above pick height so the cube drops the last couple of
     mm instead of being pressed into the table. By default world-frame J4 is
-    driven square to the X/Y axes during the approach (calibrated
-    ``j4_face_offset_deg``) so the released cube lands aligned rather than
-    at whatever orientation it happened to be picked in.
+    driven square to the X/Y axes during the approach (world J4 = 0 after
+    ``j4zero``) so the released cube lands aligned rather than at whatever
+    orientation it happened to be picked in.
 
     When ``lift_after`` is False the TCP stays at release height over the
     target (for in-place centering immediately after).

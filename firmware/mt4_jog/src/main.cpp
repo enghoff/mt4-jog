@@ -39,6 +39,12 @@
  *       Directly overwrite the joint step counters (no motion) -- for
  *       correcting drift after an external reference (e.g. a soft-contact
  *       seek on an unreferenced joint like J3, which has no limit switch).
+ *   j4zero
+ *       Rewrite J4's step counter so the current physical wrist pose reports
+ *       world-frame J4 = 0 (no motion). Used after the operator aligns the
+ *       jaws with the arm axis; subsequent face-align picks assume offset 0.
+ *       Survives `home` (J4 counter is preserved across homing). Lost on
+ *       power cycle / reflash until re-run.
  *
  * Relative move (bounded, coordinated):
  *   m <dj1> <dj2> <dj3> <dj4> [dg]
@@ -72,7 +78,11 @@
  *                     trigger, drive J3 into interference with J2 until I20
  *                     releases (J3's indirect end-of-travel reference, since
  *                     it has no limit switch of its own), then pull J2 and
- *                     J3 both off by the same amount (default/arg j2)
+ *                     J3 both off by the same amount (default/arg j2), then
+ *                     rotate J4 to its calibrated zero (step counter → 0;
+ *                     after `j4zero` that is jaws-along-arm / world J4=0 at
+ *                     the homed pose). J4's counter is preserved across the
+ *                     J1–J3 zeroing so this move is meaningful.
  *   g o | g c | g stop   gripper sweep open/close (S120–S285 on device)
  *   g <120-285>           set S clamped to limits (manual)
  *   ? | s           status / limits

@@ -255,6 +255,10 @@ void handle_line(char *line) {
     motion_set_joint_steps(v);
     return;
   }
+  if (!strcmp(line, "j4zero")) {
+    motion_zero_j4_world();
+    return;
+  }
   if (!strncmp(line, "speed ", 6)) {
     const char *arg = line + 6;
     while (*arg == ' ') {

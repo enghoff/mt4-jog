@@ -192,6 +192,36 @@ class Mt4Client:
             self._ensure_connected_unlocked()
             return self._send_and_collect("stop", wait=COMMAND_WAIT_S)
 
+    def j4_zero(self) -> dict[str, object]:
+        """Rewrite firmware J4 origin so current pose reports world j4 = 0.
+
+        No motion. After this, jaws aligned with the arm (at the calibration
+        pose) read as world-frame J4 ≈ 0; face-align picks can use offset 0.
+        Survives subsequent ``home``; lost on power cycle until re-run.
+        """
+        with self._lock:
+            self._ensure_connected_unlocked()
+            lines = self._send_and_collect("j4zero", wait=COMMAND_WAIT_S)
+            for line in lines:
+                if line.startswith("err"):
+                    return {"ok": False, "error": line, "lines": lines}
+                if line.startswith("ok j4zero") or (
+                    line.startswith("ok ") and "pos J" in line
+                ):
+                    # Firmware prints "ok j4zero pos ..." then a tcp line.
+                    status = self._get_status_unlocked(retries=2)
+                    return {
+                        "ok": True,
+                        "lines": lines,
+                        "tcp": status.tcp.as_dict() if status.tcp else None,
+                        "joints": dict(status.joints),
+                    }
+            return {
+                "ok": False,
+                "error": "no j4zero ack (firmware may need flash)",
+                "lines": lines,
+            }
+
     def request_interrupt(self) -> None:
         """Ask an in-flight move/gripper settle to abort (e.g. shuffle home key)."""
         self._interrupt.set()

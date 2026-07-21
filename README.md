@@ -162,6 +162,7 @@ Full reference lives in the header comment of
 | `speed <us>` | Live jog step period, 700–4000 µs (session state) |
 | `pos` | Joint steps + derived TCP mm, world-frame J4 deg, gripper S, move speed |
 | `setpos <j1> <j2> <j3> <j4>` | Overwrite step counters |
+| `j4zero` | Rewrite J4 steps so current pose reports world J4 = 0 (no motion; survives home) |
 | `m <dj1> <dj2> <dj3> <dj4> [dg]` | Bounded relative move; all axes finish together |
 | `mp <x> <y> <z> <j4> <g> [speed_us]` | Absolute move: TCP position (mm) + world-frame J4 (deg) + gripper S + optional step period. XYZ interpolated along straight world-frame lines in short segments with closed-form IK per segment; when the commanded J4 matches the current world-frame yaw, gripper orientation is held fixed in world space. Rejected with `err not homed` unless homed this session |
 | `home [j1 j2]` | On-device homing (see below) |

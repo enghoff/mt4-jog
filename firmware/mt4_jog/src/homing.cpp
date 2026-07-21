@@ -166,9 +166,41 @@ void do_home(uint16_t j1_center, uint16_t j2_pull) {
 
   stop_jog();
   step_pin = 0;
-  homing_active = false;
+  // Preserve J4's step counter across the J1–J3 zeroing: J4 has no limit
+  // switch, and `j4zero` (operator jaw alignment) would otherwise be wiped.
+  // Homing never drives J4 above, so the counter stays physically meaningful.
+  const long j4_keep = joint_steps[3];
   reset_joint_steps();
+  {
+    long steps[MT4_NUM_JOINTS] = {0, 0, 0, j4_keep};
+    dda_set_joint_steps(steps);
+  }
   motion_apply_home_soft_limits(j1_center, j2_pull, J3_HOME_PULL_DEFAULT);
+
+  // 6) Rotate J4 to the calibrated zero (joint steps → 0). After `j4zero`,
+  // that is jaws-along-arm; at the homed pose (j1=0) it is also world J4=0.
+  if (j4_keep != 0) {
+    // J_DIR_POS_HIGH[3]==false: positive steps ⇒ DIR low; to decrease the
+    // counter when j4_keep>0 we need DIR high, and the reverse when <0.
+    const bool dir_high =
+        (j4_keep > 0) ? !J_DIR_POS_HIGH[3] : J_DIR_POS_HIGH[3];
+    const int32_t step_sign = (j4_keep > 0) ? -1 : 1;
+    const uint32_t n = (j4_keep > 0) ? static_cast<uint32_t>(j4_keep)
+                                     : static_cast<uint32_t>(-j4_keep);
+    prepare_axis(J4_DRIVE, J4_DIR, dir_high);
+    for (uint32_t i = 0; i < n; ++i) {
+      if (serial_abort()) {
+        Serial.println(F("home fail J4"));
+        homing_active = false;
+        return;
+      }
+      do_one_step(J4_DRIVE);
+      joint_steps[3] += step_sign;
+    }
+  }
+
+  step_pin = 0;
+  homing_active = false;
   mt4_homed = true;
   Serial.println(F("home ok"));
 }
