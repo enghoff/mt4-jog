@@ -26,6 +26,8 @@ Cursor rules with full detail:
 | `mt4_vision.camera.capture_frame` | Camera / detection issues |
 | `terminals/*.txt` | Recent command output and firmware errors |
 
+Homed FK TCP is about **(190, 0, 226)**; J1 keep-out **140 mm**; soft ground **115 mm**. After kinematics or keep-out changes, flash and re-run vision calibration.
+
 ## Typical failure patterns
 
 - **`err mp segment` after aborted calibration** — arm often stranded low with **J4 at soft limit**; home + park before retrying.

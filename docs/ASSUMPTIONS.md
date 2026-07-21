@@ -1,4 +1,4 @@
-# Assumption audit — pick / place / stacking accuracy (2026-07-20)
+# Assumption audit — pick / place / stacking accuracy (2026-07-20; kinematics updated 2026-07-21)
 
 Every row names an assumption the system currently relies on, what we
 actually know about its validity (uncertainty), and how strongly system
@@ -9,13 +9,13 @@ instrumented runs where applicable.
 
 | # | Assumption | Uncertainty | Sensitivity | Notes / evidence |
 |---|---|---|---|---|
-| 1 | Kinematic constants are exact: `LINKAGE1=130`, `LINKAGE2=150`, `CENCER_OFFSET=45`, `HEAD_OFFSET=35`, `HEAD_HEIGHT=14.43`, home angles (103°, 4.7°) | ±1–2 mm per link, ±0.5–1° per home angle — hand-measured (tape + phone clinometer), never fit from data | **HIGH** | The measured "z-walk" (XY drifts 4–9 mm per 20 mm of commanded z, radius-dependent) is exactly the signature of link / home-angle error; it forced the whole feed-forward + servo apparatus. A hover-profile fit would attack the root cause. |
-| 2 | Steps/degree are integer and identical across J1–J3 (35.0) | A 1% ratio error ≈ 1° over 100° excursion ≈ several mm at the TCP, growing with joint travel | **HIGH**, position-dependent | Assumed from "shared gearbox design"; the EEPROM dump itself had 35.556 for another axis. Indistinguishable from map error at calibration poses, divergent elsewhere — co-candidate for the z-walk. |
+| 1 | Kinematic constants are exact: `LINKAGE1=130`, `LINKAGE2=150`, `CENCER_OFFSET=45`, `HEAD_OFFSET=35`, `HEAD_HEIGHT=14.43`, home angles **(107.0°, −9.3°)** | Links still ±1–2 mm hand-measured; homes tape-fit 2026-07-21 to home TCP (r≈190, wrist z=240, pads≈226) — not a multi-radius hover fit | **HIGH** (walk), **lower for absolute Z** | Pre-fit clinometer homes (103°, 4.7°) over-reported home Z by ~40 mm and table contact by ~20 mm. Absolute Z at home now matches tape; residual **z-walk** (XY vs commanded Z) and J2/J3 SPD ratio remain open — still want a hover-profile fit. |
+| 2 | Steps/degree are integer and identical across J1–J3 (35.0) | A 1% ratio error ≈ 1° over 100° excursion ≈ several mm at the TCP, growing with joint travel | **HIGH**, position-dependent | Assumed from "shared gearbox design"; the EEPROM dump itself had 35.556 for another axis. **Differential** J2 vs J3 SPD is the strongest remaining z-walk lever after the home refit. |
 | 3 | The arm is rigid (no sag, no elastic deflection) | Unmeasured; arm is demonstrably springy (exploited for press-releases), load = one 20mm cube | **MEDIUM** | "Hover-measured walk doesn't transfer to the place context" (documented) is consistent with load/pose-dependent deflection. A few mm, folded invisibly into every calibration. |
 | 4 | Commanded moves position the TCP exactly (no backlash/stiction) | Measured ~6–9mm dead-zone on small reversing moves at r=209 (attempts 1, 5); apparent response "gain ~2" with sign flips in x even after take-up moves (attempt 10) | **HIGH** | Current convergence floor of the landing servo. Confounded with #11 — the "gain 2" could equally be measurement noise, not backlash. |
 | 5 | Step counters = physical position (no lost steps in normal operation) | No encoders; `get_tcp` reports *commanded* steps, not reality | **CATASTROPHIC when violated** | r=315 stall precedent shows this fails under load+speed; slow loaded legs mitigate, but nothing *detects* a silent stall — every later arm-frame coordinate is wrong until re-homing. |
-| 6 | Motion between waypoints is a Cartesian straight line | Unmeasured; plausibly 5–15mm mid-path sag/arc at these radii (firmware interpolates joints, not Cartesian) | **MEDIUM-HIGH** near the stack | Retreat legs clear the placed cube by only ~12–16mm — same order as plausible sag. |
-| 7 | Commanded z is true z (`pick_z=149` everywhere) | Unconstrained; monocular vision cannot observe z error (it couples into XY) | **HIGH** | ±3mm decides contact-set vs. edge-drop. Edge-drops bounce cubes 30–60mm (attempts 5–7); current mitigation (release 3mm below nominal seat) validated once. |
+| 6 | Motion between waypoints is a Cartesian straight line | Firmware `mp` is piecewise Cartesian; mid-path sag still unmeasured | **MEDIUM** near the stack | Stack place/retreat now use **vertical-then-horizontal** segments within `STACK_AXIS_CLEAR_MM` (50 mm) of the site so diagonals cannot clip the column. Other paths (table pick/place) may still diagonal. |
+| 7 | Commanded z is true z (`pick_z` / `table_z` from calibration, ~127 mm after 2026-07-21 re-calib) | Unconstrained; monocular vision cannot observe z error (it couples into XY) | **HIGH** | ±3mm decides contact-set vs. edge-drop. Soft `GROUND_Z_MM=115`. Edge-drops bounce cubes 30–60mm (attempts 5–7); current mitigation (release slightly above seat) validated once. |
 
 ## B. Camera / vision geometry
 
@@ -59,7 +59,7 @@ instrumented runs where applicable.
 |---|---|---|---|
 | 1 | Release event physics | #17, #7 | Extreme, dominant per-level risk |
 | 2 | Held-cube measurement noise vs. backlash / occlusion confound | #11, #4, #14 | Blocks servo convergence below ~3mm; needs the discriminating experiment |
-| 3 | Kinematic constants / z-walk root cause | #1, #2, #7 | Taxes everything downstream |
+| 3 | Residual z-walk / J2–J3 SPD ratio | #1, #2, #7 | Absolute home Z improved 2026-07-21; walk + height-from-parallax coupling remain |
 | 4 | Blob identity as object identity | #24, #12 | Patched, still fragile |
 | 5 | Silent lost steps | #5 | Rare but unbounded damage, undetected |
 | 6 | Camera drift + occluded markers | #8 | Slow, recurring, partially detected |

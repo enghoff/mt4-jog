@@ -24,6 +24,7 @@ backed up and restorable, see [Restoring stock firmware](#restoring-stock-firmwa
 | `calibrate_height.py` | Auto probe-fit cube-top / pick-height correction after vision calibration |
 | `recalibrate_camera.py` | Camera-only homography refit when the camera moved but markers/base did not |
 | `shuffle_blocks.py` | Live loop: detect cubes and shuffle them between markers / open table |
+| `stack_cubes.py` | Build a cube stack on a calibration marker (`--marker`, optional `--camera`) |
 | `flash_jog.py` | Flash the custom firmware |
 | `restore_stock.py` | Flash the stock firmware backup |
 | `backups/` | Stock flash/EEPROM images |
@@ -68,6 +69,7 @@ python calibrate_height.py          # optional probe-fit for pick height
 python -m mt4_vision scene          # sanity-check cube detections in robot coords
 python -m mt4_vision pick red       # hardware test: pick a cube by color
 python shuffle_blocks.py            # live shuffle loop (Ctrl+C stop, H re-home)
+python stack_cubes.py --marker 4 --camera 1   # stack on a calibration marker
 
 # MCP server for LLM control
 python -m mt4_mcp                   # HTTP at http://127.0.0.1:8787/mcp
@@ -176,19 +178,21 @@ angle, J3 sets the forearm absolute angle through the link rods (independent
 of J2), and the head platform stays level. The model uses EEPROM link/offset
 geometry (L1 130, L2 150, base 45/140, head 35/14.43).
 
-The homed pose (step counters = 0) is **q2 = 103°, q3 = 4.7°** — measured
-directly (J2–J4 straight-line distance + J4 height above the base), not the
-upper-arm-vertical / forearm-horizontal (90°, 0°) previously assumed. This
-firmware's homing pull-off distances don't reach the same physical pose the
-factory firmware's homing does, so the home TCP is (200.2, 0, 264.6) rather
-than the factory-reported (230, 0, 255.57).
+The homed pose (step counters = 0) is **q2 = 107.0°, q3 = −9.3°** — tape-fit
+2026-07-21 from measured home TCP (shoulder 140 mm, wrist 240 mm, pads
+≈226 mm, radial ≈190 mm). That replaced the 2026-07-06 clinometer pair
+(103°, 4.7°), which over-reported home as (200.2, 0, 264.6). FK at the
+current homes reports **(190.0, 0, 225.6)**. Soft desk floor
+`GROUND_Z_MM` is **115** (was 136 in the old frame). J1 keep-out cylinder
+is **140 mm** (was 170).
 
-Per-joint calibration is from direct measurement (phone clinometer for
-J2–J4, direct yaw measurement for J1): J1/J2/J3 = 35 steps/deg, J4 = 45
-steps/deg. `MT4_STEPS_PER_DEG` / `J_STEP_SIGN` are duplicated in
-`firmware/mt4_jog/src/kinematics.{h,cpp}`, `mt4_jog/joints.py`, and
-`mt4_jog/kinematics.py` — there is no shared config file, so edit all three
-together.
+Per-joint steps/deg are from direct measurement (phone clinometer for
+J2–J4, direct yaw for J1): J1/J2/J3 = 35, J4 = 45 — still a z-walk
+co-candidate if J2/J3 ratios differ. `MT4_STEPS_PER_DEG` / `J_STEP_SIGN` /
+homes are duplicated in `firmware/mt4_jog/src/kinematics.{h,cpp}`,
+`mt4_jog/joints.py`, and `mt4_jog/kinematics.py` — edit all three
+together, flash, then re-run `calibrate_vision.py` / `calibrate_height.py`
+(and `calibrate_j4.py` after power cycle).
 
 ### Homing
 

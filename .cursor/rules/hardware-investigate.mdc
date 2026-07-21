@@ -21,14 +21,15 @@ Tasks involving the arm, camera, serial, or physical outcomes are **live-debuggi
 |-------|----------------|
 | `err mp joints` | Target pose exceeds joint soft limits |
 | `err mp segment` | Cartesian path failed mid-move (often stranded pose or J4 pinned) |
-| `err mp keepout` | XY inside J1 keep-out cylinder |
+| `err mp keepout` | XY inside J1 keep-out cylinder (**140 mm** radius) |
 | `err mp unreachable` | IK failed for target |
 
 J4 soft limits: about **-8100 .. 8100** steps. At limit, nearly every `mp` move fails.
+Soft desk floor: **`GROUND_Z_MM=115`**. Homed FK TCP ≈ **(190, 0, 226)**.
 
 ## Recovery playbook
 
-- **J4 near limit** or **TCP stranded low** (z below `safe_z`, e.g. over a grid point after aborted place/center) → `mt4_home`, then camera park **(200, 0, 260)**
+- **J4 near limit** or **TCP stranded low** (z below `safe_z`, e.g. over a grid point after aborted place/center) → `mt4_home`, then camera park **(200, 0, 260)** (retreat is vertical-then-horizontal)
 - **Aborted calibrate_height / stack_cubes** → assume bad pose until `mt4_status` proves otherwise; do not re-run blind
 - **Vision “lost cube”** → check arm occlusion and park pose before blaming calibration
 - **Firmware changes** → flash (`python flash_jog.py`) and verify on hardware (see `flash-ok` rule)
