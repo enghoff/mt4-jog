@@ -30,6 +30,20 @@ void dda_set_speed_us(long us);
 /* Same clamp/apply as dda_set_speed_us() but without the serial ack line. */
 void dda_set_speed_us_quiet(long us);
 uint16_t dda_get_speed_us();
+
+/* Cartesian-jog speed smoothing -- separate from dda_set_speed_us()'s
+ * instant apply, and fully inert until a host opts in with a nonzero ramp
+ * step (`cjramp <us>`), which is also the rollback lever: `cjramp 0` (the
+ * power-on default) makes dda_set_cj_target_speed_us() apply immediately,
+ * byte-for-byte the old instant-write behavior, no reflash needed to
+ * disable this. `speed`/mp/legacy-jog paths are untouched either way. */
+void dda_set_cj_target_speed_us(long us);
+void dda_set_cj_ramp_step_us(long us);
+uint16_t dda_get_cj_ramp_step_us();
+/* Step the applied cj speed toward its target by at most the ramp step;
+ * call once per CJ_REFRESH_MS tick while a cartesian jog is active. No-op
+ * if ramping is disabled (step == 0) or already at target. */
+void dda_tick_cj_speed_ramp();
 /* Configure an acceleration ramp for an upcoming multi-segment coordinated
  * move (the `mp` command): starts at start_us, ramps toward cruise_us over
  * up to ramp_ticks master ticks, holds cruise, then ramps symmetrically back

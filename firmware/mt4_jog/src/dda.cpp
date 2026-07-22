@@ -187,6 +187,56 @@ void dda_set_speed_us_quiet(long us) { set_speed_us_impl(us, false); }
 
 uint16_t dda_get_speed_us() { return jog_step_period_us; }
 
+// cj speed-ramp state. cj_ramp_step_us == 0 (the power-on default) keeps
+// dda_set_cj_target_speed_us() applying instantly -- see dda.h for why that's
+// the rollback lever.
+static uint16_t cj_target_period_us = 1524;
+static uint16_t cj_ramp_step_us = 0;
+
+void dda_set_cj_target_speed_us(long us) {
+  if (us < JOG_STEP_PERIOD_MIN_US) {
+    us = JOG_STEP_PERIOD_MIN_US;
+  } else if (us > JOG_STEP_PERIOD_MAX_US) {
+    us = JOG_STEP_PERIOD_MAX_US;
+  }
+  cj_target_period_us = static_cast<uint16_t>(us);
+  if (cj_ramp_step_us == 0) {
+    jog_step_period_us = cj_target_period_us;
+    apply_jog_speed();
+  }
+  Serial.print(F("ok cjspeed "));
+  Serial.println(cj_target_period_us);
+}
+
+void dda_set_cj_ramp_step_us(long us) {
+  if (us < 0) {
+    us = 0;
+  } else if (us > JOG_STEP_PERIOD_MAX_US) {
+    us = JOG_STEP_PERIOD_MAX_US;
+  }
+  cj_ramp_step_us = static_cast<uint16_t>(us);
+  Serial.print(F("ok cjramp "));
+  Serial.println(cj_ramp_step_us);
+}
+
+uint16_t dda_get_cj_ramp_step_us() { return cj_ramp_step_us; }
+
+void dda_tick_cj_speed_ramp() {
+  if (cj_ramp_step_us == 0 || jog_step_period_us == cj_target_period_us) {
+    return;
+  }
+  int32_t diff = static_cast<int32_t>(cj_target_period_us) -
+                 static_cast<int32_t>(jog_step_period_us);
+  if (diff > static_cast<int32_t>(cj_ramp_step_us)) {
+    diff = cj_ramp_step_us;
+  } else if (diff < -static_cast<int32_t>(cj_ramp_step_us)) {
+    diff = -static_cast<int32_t>(cj_ramp_step_us);
+  }
+  jog_step_period_us =
+      static_cast<uint16_t>(static_cast<int32_t>(jog_step_period_us) + diff);
+  apply_jog_speed();
+}
+
 void dda_ramp_clear() { ramp_phase = RAMP_NONE; }
 
 void dda_set_ramp(uint16_t start_us, uint16_t cruise_us, int32_t total_ticks,

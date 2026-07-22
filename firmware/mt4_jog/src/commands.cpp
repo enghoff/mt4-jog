@@ -161,11 +161,18 @@ void handle_line(char *line) {
    * "g <S>") don't touch TCP motion and used to be caught by this net too,
    * silently killing cartesian jog every time the gripper was actuated
    * while jogging. Exempt them so the gripper sweeps concurrently with an
-   * active `cj` jog instead of interrupting it. */
+   * active `cj` jog instead of interrupting it. Same story for "pos": it's
+   * a read-only FK query polled every tick by cj-based trackers specifically
+   * as a non-blocking, non-disruptive status read (unlike "?", which also
+   * dumps mode/limits/gripper and isn't polled in a hot loop) -- without
+   * this exemption it silently killed the jog on the very next tick after
+   * every re-engage, which read as the tracker barely moving at all. */
   if (strcmp(line, "!") && strcmp(line, "stop") && strcmp(line, "j") &&
       strcmp(line, "jog") && strcmp(line, "home") && strcmp(line, "$H") &&
       strncmp(line, "home ", 5) && strncmp(line, "cj ", 3) &&
-      strncmp(line, "speed ", 6) && line[0] != 'g' && line[0] != 'G') {
+      strncmp(line, "speed ", 6) && strncmp(line, "cjspeed ", 8) &&
+      strncmp(line, "cjramp ", 7) && strcmp(line, "pos") &&
+      line[0] != 'g' && line[0] != 'G') {
     stop_jog();
   }
 
@@ -271,6 +278,34 @@ void handle_line(char *line) {
       return;
     }
     motion_set_speed_us(us);
+    return;
+  }
+  if (!strncmp(line, "cjspeed ", 8)) {
+    const char *arg = line + 8;
+    while (*arg == ' ') {
+      ++arg;
+    }
+    char *end = nullptr;
+    long us = strtol(arg, &end, 10);
+    if (end == arg || *end != '\0') {
+      Serial.println(F("err cjspeed <us>"));
+      return;
+    }
+    motion_set_cj_target_speed_us(us);
+    return;
+  }
+  if (!strncmp(line, "cjramp ", 7)) {
+    const char *arg = line + 7;
+    while (*arg == ' ') {
+      ++arg;
+    }
+    char *end = nullptr;
+    long us = strtol(arg, &end, 10);
+    if (end == arg || *end != '\0') {
+      Serial.println(F("err cjramp <us>"));
+      return;
+    }
+    motion_set_cj_ramp_step_us(us);
     return;
   }
   if (!strncmp(line, "orient ", 7)) {
