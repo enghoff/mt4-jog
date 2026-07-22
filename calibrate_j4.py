@@ -110,7 +110,7 @@ def main() -> int:
     try:
         client.ensure_connected()
         ensure_homed(client)
-        _travel(client, calib, *args.pose, "park for J4 alignment", j4=None)
+        _travel(client, calib, *args.pose, "park for J4 alignment", j4=0.0)
         time.sleep(1.0)
     except Mt4ClientError as exc:
         print(exc, file=sys.stderr)
