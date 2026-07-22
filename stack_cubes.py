@@ -3,7 +3,10 @@
 
 The stack site is a marker id passed on the CLI (required -- no default).
 Any cubes within SITE_CLEAR_MM of that marker are nudged aside along the
-marker→cube direction to CLEAR_PARK_MM (keep-clear + margin) first. Each stack cube is taken with the calibrate_height centering
+marker→cube direction to CLEAR_PARK_MM (keep-clear + margin) first, preferring
+landings that stay inside the pick hull and out of the stack camera-shadow
+corridor (with open-table free slots as fallback). Each stack cube is taken
+with the calibrate_height centering
 sequence (yaw-pick → release → lift → rotate J4 90° → re-grip) via
 ``pick_centered``, then placed at the marker's calibrated XY by dead
 reckoning. Placement Z steps by ``cube_height_mm`` from the calibration;
@@ -35,7 +38,7 @@ from mt4_vision.pickplace import (
     place,
     retreat_for_camera,
 )
-from mt4_vision.scene import Scene, capture_scene
+from mt4_vision.scene import Scene, capture_scene, within_pick_hull
 from mt4_vision.workspace import (
     MAX_REACH_MM,
     MarkerSlot,
@@ -93,18 +96,53 @@ def cubes_near_site(
     ]
 
 
+def _clear_landing_ok(
+    tx: float,
+    ty: float,
+    *,
+    sx: float,
+    sy: float,
+    occupied: list[tuple[float, float]],
+    markers: list[MarkerSlot] | None,
+    behind_u: tuple[float, float] | None,
+    shadow_levels: int,
+) -> bool:
+    """True when a clear drop should remain a later pick candidate."""
+    if not is_mp_reachable_xy(tx, ty):
+        return False
+    if math.hypot(tx, ty) > MAX_REACH_MM:
+        return False
+    if any(dist_mm(tx, ty, ox, oy) < CLEAR_SEP_MM for ox, oy in occupied):
+        return False
+    # Stay inside the same hull gate pick uses, so clears are not dropped
+    # as "phantoms" on the next capture.
+    if markers is not None and not within_pick_hull(tx, ty, markers):
+        return False
+    # Avoid the camera-LOS corridor behind the site (ignored once stacked).
+    if behind_u is not None and in_stack_camera_shadow(
+        tx, ty, sx, sy, behind_u, stack_levels=shadow_levels,
+    ):
+        return False
+    return True
+
+
 def clear_aside_xy(
     sx: float,
     sy: float,
     cx: float,
     cy: float,
     occupied: list[tuple[float, float]],
+    *,
+    markers: list[MarkerSlot] | None = None,
+    behind_u: tuple[float, float] | None = None,
+    shadow_levels: int = 8,
 ) -> tuple[float, float] | None:
     """Push a cube away from the marker along marker→cube, with margin.
 
     Lands at ~CLEAR_PARK_MM from the site (not on a barely-outside free
     slot that vision will still read as "near site"). Tries a few angles
-    and radii if the primary landing is blocked or unreachable.
+    and radii if the primary landing is blocked or unreachable. Prefers
+    landings that stay pickable (marker hull + not in stack camera shadow).
     """
     dx, dy = cx - sx, cy - sy
     r = math.hypot(dx, dy)
@@ -113,19 +151,19 @@ def clear_aside_xy(
         dx, dy = sx, sy
         r = math.hypot(dx, dy) or 1.0
     ux, uy = dx / r, dy / r
-    for dist in (CLEAR_PARK_MM, CLEAR_PARK_MM + 30.0, CLEAR_PARK_MM + 60.0):
+    # Cap how far we push: +60 often exits the pick hull on edge markers.
+    for dist in (CLEAR_PARK_MM, CLEAR_PARK_MM + 25.0, CLEAR_PARK_MM + 45.0):
         for angle_deg in (0.0, 35.0, -35.0, 70.0, -70.0, 110.0, -110.0):
             ang = math.radians(angle_deg)
             ca, sa = math.cos(ang), math.sin(ang)
             vx, vy = ux * ca - uy * sa, ux * sa + uy * ca
             tx, ty = sx + vx * dist, sy + vy * dist
-            if not is_mp_reachable_xy(tx, ty):
-                continue
-            if math.hypot(tx, ty) > MAX_REACH_MM:
-                continue
-            if any(dist_mm(tx, ty, ox, oy) < CLEAR_SEP_MM for ox, oy in occupied):
-                continue
-            return (tx, ty)
+            if _clear_landing_ok(
+                tx, ty, sx=sx, sy=sy, occupied=occupied,
+                markers=markers, behind_u=behind_u,
+                shadow_levels=shadow_levels,
+            ):
+                return (tx, ty)
     return None
 
 
@@ -135,6 +173,9 @@ def choose_park_slot(
     sy: float,
     *,
     avoid: list[tuple[float, float]] | None = None,
+    markers: list[MarkerSlot] | None = None,
+    behind_u: tuple[float, float] | None = None,
+    shadow_levels: int = 8,
 ) -> tuple[float, float] | None:
     """Nearest free open-table slot well clear of the stack site."""
     avoid = avoid or []
@@ -142,9 +183,11 @@ def choose_park_slot(
         (x, y)
         for x, y in scene.free_slots
         if dist_mm(x, y, sx, sy) >= CLEAR_PARK_MM
-        and all(dist_mm(x, y, ax, ay) >= CLEAR_SEP_MM for ax, ay in avoid)
-        and is_mp_reachable_xy(x, y)
-        and math.hypot(x, y) <= MAX_REACH_MM
+        and _clear_landing_ok(
+            x, y, sx=sx, sy=sy, occupied=avoid,
+            markers=markers, behind_u=behind_u,
+            shadow_levels=shadow_levels,
+        )
     ]
     if not candidates:
         return None
@@ -317,6 +360,10 @@ def main() -> int:
             f"({sx:.1f},{sy:.1f}), cube_height={cube_h:.1f}mm"
         )
 
+        all_markers = marker_slots_from_calibration(calib)
+        behind_u = stack_shadow_behind_unit(calib, sx, sy)
+        shadow_levels = max(1, int(args.max_levels))
+
         # --- Clear cubes near the stack marker ---------------------------------
         for attempt in range(1, SITE_CLEAR_ATTEMPTS + 1):
             scene = snap_scene()
@@ -337,7 +384,15 @@ def main() -> int:
             ]
             dest = clear_aside_xy(
                 sx, sy, float(target.x), float(target.y), occupied,
+                markers=all_markers, behind_u=behind_u,
+                shadow_levels=shadow_levels,
             )
+            if dest is None:
+                dest = choose_park_slot(
+                    scene, sx, sy, avoid=occupied,
+                    markers=all_markers, behind_u=behind_u,
+                    shadow_levels=shadow_levels,
+                )
             if dest is None:
                 print(
                     f"No reachable clear spot for {target.color} at "

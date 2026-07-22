@@ -205,6 +205,25 @@ def _marker_hull_robot(markers: list[MarkerSlot]) -> np.ndarray | None:
     return cv2.convexHull(pts)
 
 
+def within_pick_hull(
+    x: float,
+    y: float,
+    markers: list[MarkerSlot],
+    *,
+    margin_mm: float = HULL_OUTSIDE_MARGIN_MM,
+    hull: np.ndarray | None = None,
+) -> bool:
+    """True when (x, y) is inside the marker hull or within ``margin_mm``.
+
+    Same gate ``filter_phantoms`` uses for pick candidates. With fewer than
+    three markers there is no hull and every point is accepted.
+    """
+    hull = hull if hull is not None else _marker_hull_robot(markers)
+    if hull is None:
+        return True
+    return cv2.pointPolygonTest(hull, (float(x), float(y)), True) >= -margin_mm
+
+
 def is_phantom_detection(
     cube: CubeDetection,
     markers: list[MarkerSlot],
@@ -221,12 +240,10 @@ def is_phantom_detection(
     if math.hypot(float(cube.x), float(cube.y)) > MAX_REACH_MM:
         return True
     hull = hull if hull is not None else _marker_hull_robot(markers)
-    if hull is not None:
-        inside = cv2.pointPolygonTest(
-            hull, (float(cube.x), float(cube.y)), True
-        )
-        if inside < -HULL_OUTSIDE_MARGIN_MM:
-            return True
+    if hull is not None and not within_pick_hull(
+        float(cube.x), float(cube.y), markers, hull=hull
+    ):
+        return True
     return False
 
 
