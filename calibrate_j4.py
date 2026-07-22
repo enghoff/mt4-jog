@@ -16,6 +16,7 @@ on power cycle / reflash until this script is run again.
 Controls (same as jog.py for J4):
   - Left thumbstick horizontal: world X nudge
   - J / L (or right stick X): J4 wrist roll
+  - H / A: home (on-device); arm ends at home pose, not the park pose
   - ENTER / Start: run j4zero and save
   - ESC: abort
 """
@@ -34,13 +35,15 @@ from jog import (
     drain_async,
     j4_roll_state,
     key_down,
+    run_home,
     speed_us_from_stick_factor,
     stop_jog,
     sync_cart_jog,
+    wait_until_released,
 )
 from mt4_jog.client import Mt4Client, Mt4ClientError
-from mt4_jog.gamepad import START, XboxGamepad
-from mt4_jog.joints import DEFAULT_BAUD
+from mt4_jog.gamepad import A, START, XboxGamepad
+from mt4_jog.joints import DEFAULT_BAUD, J1_HOME_CENTER_STEPS, J2_HOME_PULLOFF_STEPS
 from mt4_jog.ports import resolve_port
 from mt4_jog.serial import (
     await_firmware_alive,
@@ -126,6 +129,7 @@ def main() -> int:
         "\nAlign jaws with the arm axis, then confirm:\n"
         "  Left thumbstick horizontal  world X nudge\n"
         "  J / L (or right stick X)    J4 wrist roll\n"
+        "  H / A                       home (on-device, leaves park pose)\n"
         "  ENTER / Start               firmware j4zero (world J4 → 0)\n"
         "  ESC                         abort\n"
     )
@@ -165,6 +169,21 @@ def main() -> int:
                 print(f"Aligned at world J4 = {before:+.1f} deg")
                 confirmed = True
                 break
+
+            if key_down("h") or (pad is not None and pad.home):
+                stop_jog(ser)
+                active_cart = None
+                active_roll = 0
+                run_home(
+                    ser, buf, J1_HOME_CENTER_STEPS, J2_HOME_PULLOFF_STEPS,
+                    args.verbose,
+                )
+                print("Homed — re-park to the alignment pose before aligning J4.")
+                wait_until_released(
+                    ser, buf, args.verbose, poll_s, gamepad=gamepad,
+                    keyboard_keys=("h",), gamepad_mask=A,
+                )
+                continue
 
             pad_cart = pad.cart if pad is not None and pad.connected else None
             pad_j4 = pad.j4 if pad is not None and pad.connected else None
