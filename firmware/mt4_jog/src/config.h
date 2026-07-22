@@ -66,9 +66,16 @@ static const int32_t MT4_JOINT_SOFT_MAX_DEFAULT[MT4_NUM_JOINTS] = {
  * J3 min + ground Z. */
 static const int32_t MT4_J2_J3_SUM_MAX = 4410L;
 static const int32_t MT4_J2_J3_SUM_MIN = -200L;
-/* Max path pieces for a routed `mp` move: radial escape (when starting
- * inside the cylinder) + entry tangent + arc + exit tangent. */
-static const uint8_t MP_MAX_PIECES = 4;
+/* Max path pieces for a routed `mp` move: radial onto a route cylinder +
+ * entry tangent + arc + exit tangent (+ optional radial in). */
+static const uint8_t MP_MAX_PIECES = 5;
+/* When the keep-out arc at R=140 would violate soft joint limits (common
+ * at high Z), `mp` retries the same tangent-arc-tangent topology at these
+ * larger radii until a joint-feasible route is found. */
+static const float MT4_ROUTE_RADIUS_MM[] = {140.0f, 165.0f, 190.0f, 215.0f,
+                                           240.0f, 265.0f};
+static const uint8_t MT4_ROUTE_RADIUS_COUNT =
+    sizeof(MT4_ROUTE_RADIUS_MM) / sizeof(MT4_ROUTE_RADIUS_MM[0]);
 /* `mp` acceleration ramp (dda.cpp): a move starts at this slower, safe-to-
  * start-from-rest step period and ramps toward the move's cruise speed over
  * up to this many master ticks, then symmetrically ramps back up to

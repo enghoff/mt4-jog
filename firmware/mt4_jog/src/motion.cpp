@@ -190,20 +190,20 @@ void print_joint_pos() {
 // pending with a plain bool instead of caching the F() string itself.
 static bool move_done_is_mp = false;
 
-/* One piece of an `mp` path's XY track: a straight line or an arc along the
- * keep-out cylinder (radius MT4_KEEPOUT_RADIUS_MM, centered on the J1
- * axis). Lines: (a,b) -> (c,d). Arcs: start angle a, signed sweep b. */
+/* One piece of an `mp` path's XY track: a straight line or an arc about the
+ * J1 axis. Lines: (a,b) -> (c,d). Arcs: start angle a, signed sweep b,
+ * radius c (mm). */
 typedef struct {
   uint8_t kind;  // 0 = line, 1 = arc
   float a, b, c, d;
   float len;
 } MpPiece;
 
-/* `mp` path: the XY track is a piecewise line/arc route around the keep-out
- * cylinder (a single straight line when the direct path clears it); Z and
- * J4 interpolate linearly over total path length. J4 is either held fixed
- * in world space (when the commanded J4 matches the pose at move start) or
- * interpolated linearly. */
+/* `mp` path: the XY track is a piecewise line/arc route that clears the
+ * keep-out cylinder and (when needed) a larger joint-feasible cylinder; Z
+ * and J4 interpolate linearly over total path length. J4 is either held
+ * fixed in world space (when the commanded J4 matches the pose at move
+ * start) or interpolated linearly. */
 static struct {
   bool active;
   bool hold_ws_orient;
@@ -217,6 +217,9 @@ static struct {
 } mp_path;
 
 static bool mp_drivers_ready = false;
+
+static void angles_to_joint_steps(const JointAnglesDeg *q,
+                                  long out[MT4_NUM_JOINTS]);
 
 static void mp_path_cancel() {
   mp_path.active = false;
@@ -261,15 +264,13 @@ static float mp_piece_line(MpPiece *p, float ax, float ay, float bx, float by) {
   return p->len;
 }
 
-/* Route the XY track from S to E around the keep-out cylinder: straight
- * when the direct segment clears it; otherwise entry tangent -> shortest
- * arc along the cylinder -> exit tangent. A start inside the cylinder
- * (reachable via joint-space moves / homing) gets a radial escape piece
- * first. The 0.25mm tolerance stops borderline float noise from forcing
- * detours, so the effective guarantee is R - 0.25mm. */
-static uint8_t plan_keepout_path(float sx, float sy, float ex, float ey,
-                                 MpPiece *out, float *total_len) {
-  const float R = MT4_KEEPOUT_RADIUS_MM;
+/* Route the XY track from S to E around a cylinder of radius R centered on
+ * J1: straight when the direct segment clears it; otherwise entry tangent
+ * -> shortest arc -> exit tangent. A start inside the cylinder gets a
+ * radial escape piece first; an end inside gets a final radial in. The
+ * 0.25mm tolerance stops borderline float noise from forcing detours. */
+static uint8_t plan_cylinder_path(float sx, float sy, float ex, float ey,
+                                  float R, MpPiece *out, float *total_len) {
   uint8_t n = 0;
   float len = 0.0f;
   float cx = sx;
@@ -287,61 +288,95 @@ static uint8_t plan_keepout_path(float sx, float sy, float ex, float ey,
       ux = sx / r_s;
       uy = sy / r_s;
     }
+    if (n >= MP_MAX_PIECES) {
+      return 0;
+    }
     len += mp_piece_line(&out[n++], cx, cy, ux * R, uy * R);
     cx = ux * R;
     cy = uy * R;
   }
 
-  if (seg_dist_origin(cx, cy, ex, ey) >= R - 0.25f) {
-    len += mp_piece_line(&out[n++], cx, cy, ex, ey);
-    *total_len = len;
-    return n;
+  float dx = ex;
+  float dy = ey;
+  const float r_e = sqrtf(ex * ex + ey * ey);
+  const bool end_inside = r_e < R - 0.25f;
+  if (end_inside) {
+    float ux;
+    float uy;
+    if (r_e < 1e-6f) {
+      const float r_c = sqrtf(cx * cx + cy * cy);
+      ux = (r_c > 1e-6f) ? cx / r_c : 1.0f;
+      uy = (r_c > 1e-6f) ? cy / r_c : 0.0f;
+    } else {
+      ux = ex / r_e;
+      uy = ey / r_e;
+    }
+    dx = ux * R;
+    dy = uy * R;
   }
 
-  const float d_s = sqrtf(cx * cx + cy * cy);
-  const float d_e = sqrtf(ex * ex + ey * ey);
-  const float th_s = atan2f(cy, cx);
-  const float th_e = atan2f(ey, ex);
-  float cs = R / d_s;
-  float ce = R / d_e;
-  if (cs > 1.0f) cs = 1.0f;
-  if (ce > 1.0f) ce = 1.0f;
-  const float ph_s = acosf(cs);
-  const float ph_e = acosf(ce);
+  if (seg_dist_origin(cx, cy, dx, dy) >= R - 0.25f) {
+    if (n >= MP_MAX_PIECES) {
+      return 0;
+    }
+    len += mp_piece_line(&out[n++], cx, cy, dx, dy);
+  } else {
+    const float d_s = sqrtf(cx * cx + cy * cy);
+    const float d_e = sqrtf(dx * dx + dy * dy);
+    if (d_s < R - 0.25f || d_e < R - 0.25f) {
+      return 0;
+    }
+    const float th_s = atan2f(cy, cx);
+    const float th_e = atan2f(dy, dx);
+    float cs = R / d_s;
+    float ce = R / d_e;
+    if (cs > 1.0f) cs = 1.0f;
+    if (ce > 1.0f) ce = 1.0f;
+    const float ph_s = acosf(cs);
+    const float ph_e = acosf(ce);
 
-  /* Wrap counterclockwise: leave S touching at th_s+ph_s, rejoin toward E
-   * at th_e-ph_e; clockwise mirrors. Tangent lengths are equal either way,
-   * so the shorter arc decides the side. */
-  const float a1 = th_s + ph_s;
-  const float a2 = th_e - ph_e;
-  const float d_ccw = wrap_2pi_f(a2 - a1);
-  const float b1 = th_s - ph_s;
-  const float b2 = th_e + ph_e;
-  const float d_cw = wrap_2pi_f(b1 - b2);
+    const float a1 = th_s + ph_s;
+    const float a2 = th_e - ph_e;
+    const float d_ccw = wrap_2pi_f(a2 - a1);
+    const float b1 = th_s - ph_s;
+    const float b2 = th_e + ph_e;
+    const float d_cw = wrap_2pi_f(b1 - b2);
 
-  const float t1a = (d_ccw <= d_cw) ? a1 : b1;
-  const float t2a = (d_ccw <= d_cw) ? a2 : b2;
-  const float sweep = (d_ccw <= d_cw) ? d_ccw : -d_cw;
+    const float t1a = (d_ccw <= d_cw) ? a1 : b1;
+    const float t2a = (d_ccw <= d_cw) ? a2 : b2;
+    const float sweep = (d_ccw <= d_cw) ? d_ccw : -d_cw;
 
-  len += mp_piece_line(&out[n++], cx, cy, R * cosf(t1a), R * sinf(t1a));
-  out[n].kind = 1;
-  out[n].a = t1a;
-  out[n].b = sweep;
-  out[n].c = 0.0f;
-  out[n].d = 0.0f;
-  out[n].len = R * fabsf(sweep);
-  len += out[n].len;
-  ++n;
-  len += mp_piece_line(&out[n++], R * cosf(t2a), R * sinf(t2a), ex, ey);
+    if (n + 3 > MP_MAX_PIECES) {
+      return 0;
+    }
+    len += mp_piece_line(&out[n++], cx, cy, R * cosf(t1a), R * sinf(t1a));
+    out[n].kind = 1;
+    out[n].a = t1a;
+    out[n].b = sweep;
+    out[n].c = R;
+    out[n].d = 0.0f;
+    out[n].len = R * fabsf(sweep);
+    len += out[n].len;
+    ++n;
+    len += mp_piece_line(&out[n++], R * cosf(t2a), R * sinf(t2a), dx, dy);
+  }
+
+  if (end_inside) {
+    if (n >= MP_MAX_PIECES) {
+      return 0;
+    }
+    len += mp_piece_line(&out[n++], dx, dy, ex, ey);
+  }
   *total_len = len;
   return n;
 }
 
-/* XY position at arc length s along the planned pieces. */
-static void mp_path_xy_at(float s, float *wx, float *wy) {
-  for (uint8_t i = 0; i < mp_path.num_pieces; ++i) {
-    const MpPiece *p = &mp_path.pieces[i];
-    const bool last = (i == mp_path.num_pieces - 1);
+/* XY position at arc length s along pieces[0..num_pieces). */
+static void pieces_xy_at(const MpPiece *pieces, uint8_t num_pieces, float s,
+                         float *wx, float *wy) {
+  for (uint8_t i = 0; i < num_pieces; ++i) {
+    const MpPiece *p = &pieces[i];
+    const bool last = (i == num_pieces - 1);
     if (s <= p->len || last) {
       float u = (p->len < 1e-6f) ? 0.0f : s / p->len;
       if (u > 1.0f) {
@@ -354,13 +389,106 @@ static void mp_path_xy_at(float s, float *wx, float *wy) {
         *wy = p->b + u * (p->d - p->b);
       } else {
         const float ang = p->a + u * p->b;
-        *wx = MT4_KEEPOUT_RADIUS_MM * cosf(ang);
-        *wy = MT4_KEEPOUT_RADIUS_MM * sinf(ang);
+        const float rad = (p->c > 1.0f) ? p->c : MT4_KEEPOUT_RADIUS_MM;
+        *wx = rad * cosf(ang);
+        *wy = rad * sinf(ang);
       }
       return;
     }
     s -= p->len;
   }
+}
+
+/* XY position at arc length s along the planned pieces. */
+static void mp_path_xy_at(float s, float *wx, float *wy) {
+  pieces_xy_at(mp_path.pieces, mp_path.num_pieces, s, wx, wy);
+}
+
+/* True when IK + soft limits succeed at samples along the XY pieces with
+ * linear Z / world-J4 interpolation (same model as mp_segment_target). */
+static bool route_joints_feasible(const MpPiece *pieces, uint8_t num_pieces,
+                                  float xy_len, float z0, float z1,
+                                  float j4_ws0, float j4_ws1, bool hold_ws,
+                                  const JointAnglesDeg *near0) {
+  if (num_pieces == 0) {
+    return false;
+  }
+  const float cart =
+      sqrtf(xy_len * xy_len + (z1 - z0) * (z1 - z0));
+  uint16_t n = static_cast<uint16_t>(ceilf(cart / MP_CART_SEGMENT_MM));
+  if (n < 1) {
+    n = 1;
+  }
+  if (n > MP_MAX_SEGMENTS) {
+    n = MP_MAX_SEGMENTS;
+  }
+  // Cap preflight cost on long paths; still denser than the failure modes
+  // we care about (soft-limit peaks span many mm).
+  if (n > 40) {
+    n = 40;
+  }
+
+  JointAnglesDeg near = *near0;
+  long steps[MT4_NUM_JOINTS];
+  for (uint16_t i = 0; i <= n; ++i) {
+    const float t = static_cast<float>(i) / static_cast<float>(n);
+    float wx;
+    float wy;
+    pieces_xy_at(pieces, num_pieces, t * xy_len, &wx, &wy);
+    const float wz = z0 + t * (z1 - z0);
+    const float wj4 = hold_ws ? j4_ws0 : j4_ws0 + t * (j4_ws1 - j4_ws0);
+    JointAnglesDeg q;
+    if (!mt4_ik_position(&near, wx, wy, wz, 0.0f, &q)) {
+      return false;
+    }
+    q.j4 = wj4 - q.j1;
+    angles_to_joint_steps(&q, steps);
+    if (!motion_joints_within_soft_limits(steps)) {
+      return false;
+    }
+    near = q;
+  }
+  return true;
+}
+
+/* Pick a keep-out-clear XY route whose samples stay inside soft joint
+ * limits at the commanded Z profile. Prefers the straight chord; otherwise
+ * tries successively larger cylinder radii (high-Z chords that graze the
+ * keep-out often need r≳170mm to keep J3 under its soft max). */
+static uint8_t plan_mp_xy_route(float sx, float sy, float ex, float ey,
+                               float z0, float z1, float j4_ws0, float j4_ws1,
+                               bool hold_ws, const JointAnglesDeg *near,
+                               MpPiece *out, float *total_len) {
+  MpPiece trial[MP_MAX_PIECES];
+  float len = 0.0f;
+
+  // Straight chord when it clears the physical keep-out.
+  if (seg_dist_origin(sx, sy, ex, ey) >= MT4_KEEPOUT_RADIUS_MM - 0.25f) {
+    len = mp_piece_line(&trial[0], sx, sy, ex, ey);
+    if (route_joints_feasible(trial, 1, len, z0, z1, j4_ws0, j4_ws1, hold_ws,
+                              near)) {
+      out[0] = trial[0];
+      *total_len = len;
+      return 1;
+    }
+  }
+
+  for (uint8_t i = 0; i < MT4_ROUTE_RADIUS_COUNT; ++i) {
+    const float R = MT4_ROUTE_RADIUS_MM[i];
+    const uint8_t n = plan_cylinder_path(sx, sy, ex, ey, R, trial, &len);
+    if (n == 0) {
+      continue;
+    }
+    if (route_joints_feasible(trial, n, len, z0, z1, j4_ws0, j4_ws1, hold_ws,
+                              near)) {
+      for (uint8_t k = 0; k < n; ++k) {
+        out[k] = trial[k];
+      }
+      *total_len = len;
+      return n;
+    }
+  }
+  return 0;
 }
 
 static void angles_to_joint_steps(const JointAnglesDeg *q,
@@ -905,8 +1033,13 @@ bool start_absolute_move(float x, float y, float z, float j4_deg, long g,
   mt4_fk_tcp(&near, &start_tcp);
 
   float xy_len = 0.0f;
-  const uint8_t num_pieces =
-      plan_keepout_path(start_tcp.x, start_tcp.y, x, y, mp_path.pieces, &xy_len);
+  const uint8_t num_pieces = plan_mp_xy_route(
+      start_tcp.x, start_tcp.y, x, y, start_tcp.z, z, ws_j4_now, j4_deg,
+      hold_ws_orient, &near, mp_path.pieces, &xy_len);
+  if (num_pieces == 0) {
+    Serial.println(F("err mp route"));
+    return false;
+  }
 
   const float dz = z - start_tcp.z;
   const float cart_dist = sqrtf(xy_len * xy_len + dz * dz);
