@@ -31,6 +31,7 @@ from jog import (
     VK,
     clear_active_motion,
     drain_async,
+    flush_console_input,
     gripper_key_state,
     gripper_sweep_close,
     gripper_sweep_open,
@@ -405,4 +406,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        _exit_code = main()
+    finally:
+        flush_console_input()
+    raise SystemExit(_exit_code)

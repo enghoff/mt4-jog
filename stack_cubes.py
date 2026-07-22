@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
+from jog import flush_console_input
 from mt4_jog.client import Mt4Client, Mt4ClientError
 from mt4_jog.kinematics import JointAnglesDeg, ik_position
 from mt4_vision.calib import DEFAULT_CALIB_PATH, CalibrationError, load_calibration
@@ -524,4 +525,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        _exit_code = main()
+    finally:
+        flush_console_input()
+    raise SystemExit(_exit_code)

@@ -33,6 +33,7 @@ from jog import (
     DEFAULT_SPEED_US,
     VK,
     drain_async,
+    flush_console_input,
     j4_roll_state,
     key_down,
     run_home,
@@ -251,4 +252,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        _exit_code = main()
+    finally:
+        flush_console_input()
+    raise SystemExit(_exit_code)

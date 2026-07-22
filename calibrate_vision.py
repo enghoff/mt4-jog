@@ -31,6 +31,7 @@ from jog import (
     VK,
     clear_active_motion,
     drain_async,
+    flush_console_input,
     gripper_sweep_close,
     gripper_sweep_open,
     gripper_sweep_stop,
@@ -96,17 +97,6 @@ def print_help(*, gamepad: bool) -> None:
         print("  Start   finish: fit calibration and save")
         print("  Back    quit without saving")
     print()
-
-
-def flush_console_input() -> None:
-    """Drop keystrokes typed during the jog session so they don't leak into
-    the input() prompts afterwards."""
-    if sys.platform != "win32":
-        return
-    import msvcrt
-
-    while msvcrt.kbhit():
-        msvcrt.getwch()
 
 
 def prompt_float(label: str, default: float) -> float:
@@ -543,4 +533,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        _exit_code = main()
+    finally:
+        flush_console_input()
+    raise SystemExit(_exit_code)

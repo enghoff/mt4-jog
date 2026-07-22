@@ -165,6 +165,22 @@ def key_down(key: str) -> bool:
     return vk is not None and bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
 
 
+def flush_console_input() -> None:
+    """Drop keystrokes typed during a jog session so they don't leak into the
+    shell prompt after the script exits.
+
+    key_down polls GetAsyncKeyState, which is global and never consumes the
+    console's own input buffer -- every key pressed while jogging still lands
+    there and would otherwise replay into the shell once the process exits.
+    """
+    if sys.platform != "win32":
+        return
+    import msvcrt
+
+    while msvcrt.kbhit():
+        msvcrt.getwch()
+
+
 def _process_parents() -> dict[int, int]:
     """pid -> parent pid for every running process (Toolhelp32 snapshot)."""
     import ctypes
@@ -695,4 +711,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        _exit_code = main()
+    finally:
+        flush_console_input()
+    raise SystemExit(_exit_code)
