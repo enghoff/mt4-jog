@@ -436,62 +436,82 @@ def main() -> int:
                 )
                 break
 
-            scene = snap_scene()
-            # Drop stack-top phantoms behind the site along the camera LOS
-            # (they appear once level 1+ is built).
-            shadowed = []
-            behind_u = (
-                stack_shadow_behind_unit(calib, sx, sy) if built > 0 else None
-            )
-            if behind_u is not None:
-                for c in scene.pickable(scene.cubes):
-                    if dist_mm(float(c.x), float(c.y), sx, sy) < SITE_CLEAR_MM:
-                        continue
-                    if in_stack_camera_shadow(
-                        float(c.x), float(c.y), sx, sy, behind_u,
-                        stack_levels=built,
-                    ):
-                        shadowed.append(c)
-            if shadowed:
-                print(
-                    "Ignoring stack-shadow phantom(s): "
-                    + ", ".join(
-                        f"{c.color}({c.x:.0f},{c.y:.0f})" for c in shadowed
+            # Inner loop: resume after "no cubes" re-snaps the same level.
+            quit_stack = False
+            while True:
+                scene = snap_scene()
+                # Drop stack-top phantoms behind the site along the camera LOS
+                # (they appear once level 1+ is built).
+                shadowed = []
+                behind_u = (
+                    stack_shadow_behind_unit(calib, sx, sy) if built > 0 else None
+                )
+                if behind_u is not None:
+                    for c in scene.pickable(scene.cubes):
+                        if dist_mm(float(c.x), float(c.y), sx, sy) < SITE_CLEAR_MM:
+                            continue
+                        if in_stack_camera_shadow(
+                            float(c.x), float(c.y), sx, sy, behind_u,
+                            stack_levels=built,
+                        ):
+                            shadowed.append(c)
+                if shadowed:
+                    print(
+                        "Ignoring stack-shadow phantom(s): "
+                        + ", ".join(
+                            f"{c.color}({c.x:.0f},{c.y:.0f})" for c in shadowed
+                        )
                     )
+                cands = stack_candidates(
+                    scene, sx, sy, calib=calib, stack_levels=built,
                 )
-            cands = stack_candidates(
-                scene, sx, sy, calib=calib, stack_levels=built,
-            )
-            if not cands:
-                print(f"level {level}: no reachable cube outside site -- done")
-                break
-            cube = cands[0]
-            print(
-                f"\nLevel {level}: align-pick {cube.color} at "
-                f"({cube.x:.1f},{cube.y:.1f}) yaw={cube.yaw_deg}"
-            )
-            try:
-                pick_centered(
-                    client, calib, float(cube.x), float(cube.y),
-                    yaw_deg=cube.yaw_deg,
-                )
+                if not cands:
+                    print(f"level {level}: no reachable cube outside site")
+                    try:
+                        reply = input(
+                            "Move cubes into arm reach, then Enter to resume "
+                            "(q to quit): "
+                        ).strip().lower()
+                    except EOFError:
+                        quit_stack = True
+                        break
+                    if reply in ("q", "quit"):
+                        quit_stack = True
+                        break
+                    print("Resuming...")
+                    continue
+
+                cube = cands[0]
                 print(
-                    f"  placing at marker ({sx:.1f},{sy:.1f}) "
-                    f"release_z={rz:.1f} travel_z={tz:.1f}"
+                    f"\nLevel {level}: align-pick {cube.color} at "
+                    f"({cube.x:.1f},{cube.y:.1f}) yaw={cube.yaw_deg:.0f}"
                 )
-                place(
-                    client, calib, sx, sy,
-                    release_z=rz,
-                    travel_z=tz,
-                    along_arm=True,
-                    # No XYZ diagonal inside this radius of the stack axis.
-                    axis_clear_mm=STACK_AXIS_CLEAR_MM,
-                )
-            except Mt4ClientError as exc:
-                print(f"  level {level} failed: {exc}", file=sys.stderr)
-                return 1
-            built = level
-            print(f"  placed level {level}")
+                try:
+                    pick_centered(
+                        client, calib, float(cube.x), float(cube.y),
+                        yaw_deg=cube.yaw_deg,
+                    )
+                    print(
+                        f"  placing at marker ({sx:.1f},{sy:.1f}) "
+                        f"release_z={rz:.1f} travel_z={tz:.1f}"
+                    )
+                    place(
+                        client, calib, sx, sy,
+                        release_z=rz,
+                        travel_z=tz,
+                        along_arm=True,
+                        # No XYZ diagonal inside this radius of the stack axis.
+                        axis_clear_mm=STACK_AXIS_CLEAR_MM,
+                    )
+                except Mt4ClientError as exc:
+                    print(f"  level {level} failed: {exc}", file=sys.stderr)
+                    return 1
+                built = level
+                print(f"  placed level {level}")
+                break
+
+            if quit_stack:
+                break
 
         print(f"\nBuilt {built} level(s) on marker {marker.marker_id}")
         retreat_for_camera(client, calib)
