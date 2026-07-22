@@ -166,13 +166,17 @@ void do_home(uint16_t j1_center, uint16_t j2_pull) {
 
   stop_jog();
   step_pin = 0;
-  // Preserve J4's step counter across the J1–J3 zeroing: J4 has no limit
-  // switch, and `j4zero` (operator jaw alignment) would otherwise be wiped.
-  // Homing never drives J4 above, so the counter stays physically meaningful.
+  // J2/J3 angle constants are at the limit/interference reference
+  // (steps=0). After pull-off the counters sit at +pull so FK matches the
+  // tape-fit park pose. Preserve J4 across the J1–J3 rewrite: J4 has no
+  // limit switch, and `j4zero` would otherwise be wiped. Homing never
+  // drives J4 above, so the counter stays physically meaningful.
   const long j4_keep = joint_steps[3];
   reset_joint_steps();
   {
-    long steps[MT4_NUM_JOINTS] = {0, 0, 0, j4_keep};
+    long steps[MT4_NUM_JOINTS] = {0, static_cast<long>(j2_pull),
+                                  static_cast<long>(J3_HOME_PULL_DEFAULT),
+                                  j4_keep};
     dda_set_joint_steps(steps);
   }
   motion_apply_home_soft_limits(j1_center, j2_pull, J3_HOME_PULL_DEFAULT);

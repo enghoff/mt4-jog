@@ -62,15 +62,19 @@ void motion_init() {
 
 void motion_apply_home_soft_limits(uint16_t j1_center, uint16_t j2_pull,
                                    uint16_t j3_pull) {
-  (void)j3_pull;  // J3 interference is not a hard stop; envelope bounds apply.
+  // Pull-offs only set post-home park counters (see do_home); J2/J3 soft
+  // limits are limit-referenced and come from the envelope defaults.
+  (void)j2_pull;
+  (void)j3_pull;
   for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
     joint_soft_min[i] = MT4_JOINT_SOFT_MIN_DEFAULT[i];
     joint_soft_max[i] = MT4_JOINT_SOFT_MAX_DEFAULT[i];
   }
-  // Home seek uses DIR high (negative step counts). Pull-off returns to
-  // steps=0, so the switch sits at -pull_steps.
+  // J1: home seek uses DIR high (negative counts); park at steps=0 after
+  // centering, so the switch sits at -j1_center.
+  // J2: counters are limit-referenced (steps=0 at the switch).
   joint_soft_min[0] = -static_cast<int32_t>(j1_center);
-  joint_soft_min[1] = -static_cast<int32_t>(j2_pull);
+  joint_soft_min[1] = 0;
 
   Serial.print(F("home limits J1="));
   Serial.print(joint_soft_min[0]);

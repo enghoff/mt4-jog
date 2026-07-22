@@ -178,13 +178,13 @@ angle, J3 sets the forearm absolute angle through the link rods (independent
 of J2), and the head platform stays level. The model uses EEPROM link/offset
 geometry (L1 130, L2 150, base 45/140, head 35/14.43).
 
-The homed pose (step counters = 0) is **q2 = 107.0°, q3 = −9.3°** — tape-fit
-2026-07-21 from measured home TCP (shoulder 140 mm, wrist 240 mm, pads
-≈226 mm, radial ≈190 mm). That replaced the 2026-07-06 clinometer pair
-(103°, 4.7°), which over-reported home as (200.2, 0, 264.6). FK at the
-current homes reports **(190.0, 0, 225.6)**. Soft desk floor
-`GROUND_Z_MM` is **115** (was 136 in the old frame). J1 keep-out cylinder
-is **140 mm** (was 170).
+The post-home park pose is **q2 = 107.0°, q3 = −9.3°** at step counters
+**(0, j2_pull, j3_pull, ·)** — tape-fit 2026-07-21 from measured home TCP
+(shoulder 140 mm, wrist 240 mm, pads ≈226 mm, radial ≈190 mm). J2/J3 model
+angles are zeroed at the **limit/interference reference** (≈135.57° /
+−23.59°), so changing pull-off does not invalidate that fit. FK at the park
+pose reports **(190.0, 0, 225.6)**. Soft desk floor `GROUND_Z_MM` is **115**
+(was 136 in the old frame). J1 keep-out cylinder is **140 mm** (was 170).
 
 Per-joint steps/deg are from direct measurement (phone clinometer for
 J2–J4, direct yaw for J1): J1/J2/J3 = 35, J4 = 45 — still a z-walk
@@ -199,8 +199,8 @@ together, flash, then re-run `calibrate_vision.py` / `calibrate_height.py`
 Homing seeks J1/J2's limit switches directly. J3 has no switch of its own,
 so it's homed indirectly by driving it into mechanical interference with J2
 until that displaces J2 enough to release J2's own limit switch. Defaults:
-J1 center **4580** steps, J2/J3 pull-off **1000** steps (override with
-`--j1-center` / `--j2-pull` on the clients).
+J1 center **4580** steps, J2 pull-off **1000**, J3 pull-off **500**
+(override J1/J2 with `--j1-center` / `--j2-pull` on the clients).
 
 ### Pin map
 

@@ -9,7 +9,8 @@
  *    does NOT rotate when J2 moves.
  *  - The head platform stays level: HEAD_OFFSET is horizontal (radially out),
  *    HEAD_HEIGHT drops the TCP below the wrist pivot.
- * Home pose q = (0, 107.0, -9.3): tape-fit 2026-07-21 (see kinematics.h).
+ * Park pose after home ≈ (0, 107.0, -9.3) at steps (0, j2_pull, j3_pull);
+ * J2/J3 angle zeros are at the limit/interference reference (see kinematics.h).
  */
 static const float LINKAGE1 = 130.0f;      /* shoulder -> elbow */
 static const float LINKAGE2 = 150.0f;      /* elbow -> wrist pivot */

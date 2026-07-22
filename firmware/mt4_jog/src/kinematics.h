@@ -19,14 +19,19 @@ extern "C" {
 #define MT4_J3_STEP_SIGN 1.0f
 #define MT4_J4_STEP_SIGN 1.0f
 
-/* Model angles at the homed pose (step counters = 0). Refit 2026-07-21 from
- * tape at home: shoulder 140mm, wrist 240mm, TCP 226mm, radial ~190mm --
- * solved via the two-link geometry for (r, zw)=(190, 240). Replaces the
- * 2026-07-06 clinometer pair (103, 4.7), which over-reported home TCP as
- * (200.2, 0, 264.6). FK at (107.0, -9.3) reports TCP (190.0, 0, 225.6). */
+/* Model angles at step-counter zero. J1/J4 zero at the post-home park
+ * (J1 centered; J4 jaws-along-arm after j4zero). J2/J3 zero at the
+ * limit/interference reference so pull-off changes do not invalidate the
+ * angle fit: after do_home(), counters sit at +(j2_pull, j3_pull).
+ *
+ * J2/J3 values derived from the 2026-07-21 tape-fit park pose (107.0°,
+ * −9.3°) under the pull-offs then in effect (1000 / 500 steps):
+ *   ref = park - SIGN * pull / SPD
+ * FK at park still reports TCP ≈ (190.0, 0, 225.6). The 1000/500 literals
+ * below are frozen fit provenance — do not retie to J*_HOME_PULL_DEFAULT. */
 #define MT4_HOME_J1_DEG 0.0f
-#define MT4_HOME_J2_DEG 107.0f
-#define MT4_HOME_J3_DEG (-9.3f)
+#define MT4_HOME_J2_DEG (107.0f + 1000.0f / 35.0f) /* ≈135.571° at J2 switch */
+#define MT4_HOME_J3_DEG (-9.3f - 500.0f / 35.0f)   /* ≈−23.586° at J3 interfer */
 #define MT4_HOME_J4_DEG 0.0f
 
 extern const float MT4_STEPS_PER_DEG[MT4_NUM_JOINTS];

@@ -46,22 +46,26 @@ static const float MT4_KEEPOUT_RADIUS_MM = 140.0f;
  * frame (2026-07-19); after 2026-07-21 home refit (107/−9.3) the same desk
  * contact reports ~127mm, so floor lowered to leave headroom. */
 static const float MT4_GROUND_Z_MM = 115.0f;
-/* Soft joint step limits (counters after home = 0). Switch-side ends for
- * J1/J2 are overwritten at the end of do_home() from the pull-off distance
- * (limit switch = -pull_steps). Opposite ends and J3/J4 both ends come from
- * the measured envelope (in-range samples, 2026-07-19). */
+/* Soft joint step limits. J2/J3 counters are relative to the
+ * limit/interference reference (steps=0 at switch / J3 fold-into-J2).
+ * Envelope maxima measured 2026-07-19 in the old park-zero frame were
+ * shifted by +(1000, 500) when the reference moved to the limit
+ * (same physical poses). J1 switch-side min is overwritten at do_home()
+ * from the center distance (limit = -j1_center); J2 switch-side min is
+ * forced to 0. */
 static const int32_t MT4_JOINT_SOFT_MIN_DEFAULT[MT4_NUM_JOINTS] = {
-    -4800L, -1000L, -2050L, -8100L};
+    -4800L, 0L, -1550L, -8100L};
 static const int32_t MT4_JOINT_SOFT_MAX_DEFAULT[MT4_NUM_JOINTS] = {
-    4580L, 2950L, 1150L, 8100L};
-/* Coupled J2+J3 extension limit (step counters). Because J2 and J3 have
- * opposite step signs, j2_deg - j3_deg = const - (j2_steps + j3_steps)/spd,
- * so a *minimum* link-angle difference at full stretch is a *maximum* on
- * j2_steps + j3_steps. In-sample max sum was 2910 (r≈352mm, j2−j3≈15.2°);
- * over-extension outs sit at 2961–3108. Soft min on the sum is loose —
- * the folded extreme is gated by J3 min + ground Z. */
-static const int32_t MT4_J2_J3_SUM_MAX = 2910L;
-static const int32_t MT4_J2_J3_SUM_MIN = -1700L;
+    4580L, 3950L, 1650L, 8100L};
+/* Coupled J2+J3 extension limit (step counters, limit-referenced).
+ * Because J2 and J3 have opposite step signs, j2_deg - j3_deg =
+ * const - (j2_steps + j3_steps)/spd, so a *minimum* link-angle difference
+ * at full stretch is a *maximum* on j2_steps + j3_steps. Old park-zero
+ * in-sample max sum was 2910; +1500 for the (1000+500) reference shift
+ * → 4410. Soft min on the sum is loose — the folded extreme is gated by
+ * J3 min + ground Z. */
+static const int32_t MT4_J2_J3_SUM_MAX = 4410L;
+static const int32_t MT4_J2_J3_SUM_MIN = -200L;
 /* Max path pieces for a routed `mp` move: radial escape (when starting
  * inside the cylinder) + entry tangent + arc + exit tangent. */
 static const uint8_t MP_MAX_PIECES = 4;

@@ -27,8 +27,8 @@
  * targets inside the cylinder ("err mp keepout") and automatically routes
  * paths that would cross it around the boundary (entry tangent, shortest
  * arc, exit tangent); a start inside the cylinder first escapes radially.
- * Soft joint limits (envelope + home limit-switch pull-offs) and ground
- * plane MT4_GROUND_Z_MM also reject/clamp out-of-range jog and `mp`.
+ * Soft joint limits (envelope; J2/J3 limit-referenced) and ground plane
+ * MT4_GROUND_Z_MM also reject/clamp out-of-range jog and `mp`.
  * Joint-space moves (`m`, homing) are NOT covered -- they command raw steps.
  *   orient on|off          J4 wrist unwind when J1 moves (default on, 1:1)
  *   pos                      print joint step counters (since last home),
@@ -77,12 +77,13 @@
  *                     I21, return to center), seek J2 to its raw I20
  *                     trigger, drive J3 into interference with J2 until I20
  *                     releases (J3's indirect end-of-travel reference, since
- *                     it has no limit switch of its own), then pull J2 and
- *                     J3 both off by the same amount (default/arg j2), then
- *                     rotate J4 to its calibrated zero (step counter → 0;
+ *                     it has no limit switch of its own), then pull J2/J3
+ *                     off (arg/default j2; J3 uses its own shorter default),
+ *                     set J2/J3 counters to +pull (limit-referenced zeros),
+ *                     and rotate J4 to its calibrated zero (step counter → 0;
  *                     after `j4zero` that is jaws-along-arm / world J4=0 at
  *                     the homed pose). J4's counter is preserved across the
- *                     J1–J3 zeroing so this move is meaningful.
+ *                     J1–J3 rewrite so this move is meaningful.
  *   g o | g c | g stop   gripper sweep open/close (S120–S285 on device)
  *   g <120-285>           set S clamped to limits (manual)
  *   ? | s           status / limits

@@ -17,15 +17,18 @@ CENCER_HEIGHT = 140.0  # shoulder pivot height
 HEAD_OFFSET = 35.0  # wrist pivot -> TCP, horizontal (head stays level)
 HEAD_HEIGHT = 14.43  # TCP below wrist pivot
 
-# Model angles at the homed pose (firmware step counters = 0). Refit
-# 2026-07-21 from tape at home: shoulder pivot 140mm (CENCER_HEIGHT), wrist
-# pivot 240mm, TCP pads 226mm, J1-axis to pad center ~190mm -- solved via the
-# two-link geometry for (r, zw) = (190, 240). Replaces the 2026-07-06
-# clinometer pair (103, 4.7), which over-reported home TCP as (200.2, 0, 264.6).
-# FK at (107.0, -9.3) reports TCP (190.0, 0, 225.6).
+# Model angles at step-counter zero. J1/J4 zero at the post-home park
+# (J1 centered; J4 jaws-along-arm after j4zero). J2/J3 zero at the
+# limit/interference reference so pull-off changes do not invalidate the
+# angle fit: after home, counters sit at +(J2_PULL, J3_PULL).
+#
+# J2/J3 derived from the 2026-07-21 tape-fit park pose (107.0°, −9.3°) under
+# the pull-offs then in effect (1000 / 500): ref = park - SIGN * pull / SPD.
+# FK at park still reports TCP ≈ (190.0, 0, 225.6). The 1000/500 literals are
+# frozen fit provenance — do not retie to J*_HOME_PULLOFF_STEPS.
 HOME_J1_DEG = 0.0
-HOME_J2_DEG = 107.0
-HOME_J3_DEG = -9.3
+HOME_J2_DEG = 107.0 + 1000.0 / 35.0  # ≈135.571° at J2 limit switch
+HOME_J3_DEG = -9.3 - 500.0 / 35.0  # ≈−23.586° at J3 interference
 HOME_J4_DEG = 0.0
 
 # All four measured 2026-07-06 (J2-J4 with a phone clinometer against the
