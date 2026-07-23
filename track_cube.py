@@ -78,7 +78,7 @@ from mt4_vision.calib import (
 from mt4_vision.camera import DEFAULT_CAMERA_INDEX, CameraError, FrameStream
 from mt4_vision.detect import CubeDetection, detect_cubes
 from mt4_vision.pickplace import ensure_homed
-from mt4_vision.preview import draw_outlined_text
+from mt4_vision.preview import VideoRecorder, draw_cube_marker, draw_lock_ring, draw_outlined_text
 from mt4_vision.workspace import KEEPOUT_RADIUS_MM, MAX_REACH_MM
 
 DEFAULT_HOVER_MM = 50.0
@@ -294,15 +294,9 @@ def draw_preview(
     out = frame.copy()
     for det in detections:
         bgr = COLOR_BGR.get(det.color, UNKNOWN_COLOR_BGR)
-        cv2.circle(out, (int(det.px), int(det.py)), 8, bgr, 2)
-        cv2.putText(
-            out, det.color, (int(det.px) + 10, int(det.py) - 10),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, bgr, 1, cv2.LINE_AA,
-        )
+        draw_cube_marker(out, det.px, det.py, bgr, det.color)
     if match is not None:
-        cx, cy = int(match.px), int(match.py)
-        cv2.circle(out, (cx, cy), 18, LOCK_BGR, 2)
-        cv2.drawMarker(out, (cx, cy), LOCK_BGR, cv2.MARKER_CROSS, 16, 2)
+        draw_lock_ring(out, match.px, match.py, LOCK_BGR)
 
     state = "LOST" if lost_since is not None else "tracking"
     state_bgr = LOST_BGR if lost_since is not None else LOCK_BGR
@@ -330,6 +324,7 @@ def run_tracking_loop(
     verbose: bool,
     deadline: float | None = None,
     preview: bool = False,
+    recorder: VideoRecorder | None = None,
 ) -> None:
     buf: list[str] = [""]
     _t0, x0, y0 = seed
@@ -380,7 +375,10 @@ def run_tracking_loop(
                 new_tcp = report_firmware_lines(ser, buf, verbose)
                 if new_tcp is not None:
                     current_tcp_x, current_tcp_y, current_tcp_z = new_tcp.x, new_tcp.y, new_tcp.z
-                if preview and _show_preview(frame, detections, match, color, lost_since, None):
+                if _emit_preview(
+                    frame, detections, match, color, lost_since, None,
+                    preview=preview, recorder=recorder,
+                ):
                     print("Preview window closed (q/Esc) -- stopping.")
                     return
                 continue
@@ -451,7 +449,10 @@ def run_tracking_loop(
                     last_sent_error = (err_x, err_y, err_z)
                 jogging = True
 
-            if preview and _show_preview(frame, detections, match, color, lost_since, dist):
+            if _emit_preview(
+                frame, detections, match, color, lost_since, dist,
+                preview=preview, recorder=recorder,
+            ):
                 print("Preview window closed (q/Esc) -- stopping.")
                 return
 
@@ -469,21 +470,38 @@ def run_tracking_loop(
                 cv2.destroyWindow(PREVIEW_WINDOW)
             except cv2.error:
                 pass
+        if recorder is not None:
+            recorder.close()
 
 
-def _show_preview(
+def _emit_preview(
     frame: np.ndarray,
     detections: list[CubeDetection],
     match: CubeDetection | None,
     color: str,
     lost_since: float | None,
     dist: float | None,
+    *,
+    preview: bool,
+    recorder: VideoRecorder | None,
 ) -> bool:
-    """Render one preview frame; return True if the user asked to stop (q/Esc)."""
+    """Draw+record/show one frame if requested; True if the user hit q/Esc.
+
+    The tracking loop itself already runs at camera rate (~10Hz, paced by
+    ``stream.fresh()``), so recording just writes whatever this tick already
+    annotated -- no separate background feed is needed the way stack_cubes.py
+    needed one to keep updating through its multi-second blocking moves.
+    """
+    if not preview and recorder is None:
+        return False
     annotated = draw_preview(
         frame, detections, match,
         color=color, lost_since=lost_since, dist=dist,
     )
+    if recorder is not None:
+        recorder.write(annotated)
+    if not preview:
+        return False
     cv2.imshow(PREVIEW_WINDOW, annotated)
     key = cv2.waitKey(1) & 0xFF
     return key in (27, ord("q"))
@@ -510,6 +528,16 @@ def main() -> int:
     parser.add_argument(
         "--preview", action="store_true",
         help="show a live annotated camera preview window (q or Esc to stop)",
+    )
+    parser.add_argument(
+        "--record",
+        default=None,
+        help="record the live annotated preview to this video path (e.g. track_run.mp4)",
+    )
+    parser.add_argument(
+        "--record-fps", type=float, default=10.0,
+        help="playback-rate metadata for --record (default 10, matching the "
+        "camera-paced tracking loop; does not change the loop's actual pace)",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
@@ -583,6 +611,11 @@ def _run(args: argparse.Namespace, calib: Calibration, stream: FrameStream) -> i
             except FirmwareNotReadyError as exc:
                 print(exc, file=sys.stderr)
                 return 1
+            recorder = (
+                VideoRecorder(video_path=args.record, fps=args.record_fps)
+                if args.record
+                else None
+            )
             try:
                 deadline = time.monotonic() + args.max_seconds if args.max_seconds else None
                 run_tracking_loop(
@@ -590,7 +623,7 @@ def _run(args: argparse.Namespace, calib: Calibration, stream: FrameStream) -> i
                     seed=seed, seed_tcp_xyz=seed_tcp_xyz, hover_z=hover_z,
                     deadband_mm=args.deadband_mm,
                     lost_grace_s=args.lost_grace_s, verbose=args.verbose,
-                    deadline=deadline, preview=args.preview,
+                    deadline=deadline, preview=args.preview, recorder=recorder,
                 )
             except KeyboardInterrupt:
                 print()

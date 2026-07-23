@@ -63,6 +63,34 @@ def draw_outlined_text(
     cv2.putText(img, text, org, font, scale, color, 1, cv2.LINE_AA)
 
 
+def draw_cube_marker(
+    img: np.ndarray,
+    px: float,
+    py: float,
+    color_bgr: tuple[int, int, int],
+    label: str,
+) -> None:
+    """Circle + outlined label at a cube's pixel position.
+
+    The one shared per-cube-blob style every preview in this repo draws,
+    whether the color encodes "this cube's actual color" (track_cube.py,
+    verifying color detection) or "pick-quality vs phantom" (annotate_scene,
+    verifying planner state).
+    """
+    cv2.circle(img, (int(px), int(py)), 8, color_bgr, 2)
+    draw_outlined_text(img, label, (int(px) + 10, int(py)), scale=0.6, color=color_bgr)
+
+
+def draw_lock_ring(img: np.ndarray, px: float, py: float, color_bgr: tuple[int, int, int]) -> None:
+    """Circle + cross marking whichever cube is currently the focus.
+
+    A pick/clear target in annotate_scene, a tracking lock in track_cube.py.
+    """
+    cx, cy = int(px), int(py)
+    cv2.circle(img, (cx, cy), 16, color_bgr, 2)
+    cv2.drawMarker(img, (cx, cy), color_bgr, cv2.MARKER_CROSS, 16, 2)
+
+
 def annotate_scene(
     frame: np.ndarray,
     scene: Scene,
@@ -78,11 +106,7 @@ def annotate_scene(
         is_pick = id(c) in pick_ids
         color = CUBE_BGR if is_pick else PHANTOM_BGR
         label = c.color if is_pick else f"{c.color}?"
-        cv2.circle(out, (int(c.px), int(c.py)), 8, color, 2)
-        cv2.putText(
-            out, label, (int(c.px) + 10, int(c.py)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA,
-        )
+        draw_cube_marker(out, c.px, c.py, color, label)
 
     occupied_ids = {m.marker_id for m, _c in scene.occupied}
     free_ids = {m.marker_id for m in scene.free_markers}
@@ -94,13 +118,12 @@ def annotate_scene(
         else:
             color = MARKER_UNKNOWN_BGR
         cv2.drawMarker(out, (int(m.px), int(m.py)), color, cv2.MARKER_CROSS, 18, 2)
-        cv2.putText(
-            out, str(m.marker_id), (int(m.px) + 10, int(m.py) - 10),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA,
+        draw_outlined_text(
+            out, str(m.marker_id), (int(m.px) + 10, int(m.py) - 10), scale=0.6, color=color,
         )
 
     if target is not None:
-        cv2.circle(out, (int(target.px), int(target.py)), 16, TARGET_BGR, 3)
+        draw_lock_ring(out, target.px, target.py, TARGET_BGR)
 
     for i, line in enumerate(status_lines or []):
         y = 24 + i * 22
