@@ -18,8 +18,6 @@ backed up and restorable, see [Restoring stock firmware](#restoring-stock-firmwa
 | `mt4_vision/` | Overhead-camera vision: ArUco calibration, cube detection, pick/place, shuffle |
 | `mt4_mcp/` | MCP server (HTTP or stdio) exposing status, motion, and vision pick/place tools |
 | `jog.py` | Keyboard + Xbox gamepad jog client (Cartesian + J4 roll + gripper) |
-| `map_envelope.py` | Jog and tag in/out-of-range poses into `envelope_samples.json` |
-| `goto_position.py` | Prompt-driven absolute-position client (firmware `mp`) |
 | `calibrate_vision.py` | Interactive jog-to-marker camera calibration |
 | `calibrate_height.py` | Auto probe-fit cube-top / pick-height correction after vision calibration |
 | `recalibrate_camera.py` | Camera-only homography refit when the camera moved but markers/base did not |
@@ -55,12 +53,6 @@ python flash_jog.py --port COM6
 
 # Jog interactively (focus the terminal, hold keys; gamepad works unfocused)
 python jog.py
-
-# Map operating envelope (D-pad Up/Down = in/out samples → envelope_samples.json)
-python map_envelope.py
-
-# One-shot absolute moves (prompts for x/y/z/j4/gripper; requires homing first)
-python goto_position.py
 
 # Vision: calibrate once, then pick/place/shuffle
 python -m mt4_vision markers        # verify the markers are seen
@@ -124,27 +116,6 @@ deadzone (default 9000).
 - Gripper and J4-roll commands resend on a ~50 ms timer while their key is
   held, so a single dropped serial line can't strand them mid-motion — the
   same fix applied to Cartesian jog's `cj` resend.
-- `goto_position.py` queries `pos` for the current TCP/J4/gripper state,
-  prompts for each field (blank = keep current), then sends `mp` and prints
-  the async completion line.
-
-### Envelope mapping
-
-`map_envelope.py` reuses jog controls and records tagged poses for expanding
-the allowed operating range (today's `MAX_REACH_MM` is conservative).
-
-| Control | Action |
-|---------|--------|
-| D-pad Up / `]` | Record **in-range** sample |
-| D-pad Down / `[` | Record **out-of-range** sample |
-| Backspace / LB | Undo last sample |
-| Enter / Start | Save JSON (keep jogging) |
-| ESC / Back | Save and quit |
-
-Each sample stores TCP `x/y/z/j4/grip` plus joint steps and degrees. The JSON
-`summary` tracks joint min/max over in-samples and Cartesian stats
-(`ground_z_mm`, `max_reach_xy_mm`, bbox). Default output:
-`envelope_samples.json`.
 
 ## Firmware
 

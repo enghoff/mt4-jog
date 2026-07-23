@@ -51,7 +51,7 @@ HOME_TIMEOUT_S = 180.0
 # in flight: do_home()'s serial_abort() reads and discards any line that
 # isn't "!"/"stop".
 HOME_ACK_RESEND_S = 5.0
-# Matches goto_position.py's MOVE_TIMEOUT_S for coordinated m/mp moves.
+# Timeout for coordinated m/mp moves to complete.
 MOVE_TIMEOUT_S = 30.0
 # Cap line collection so a chatty firmware stream cannot block forever.
 READ_HARD_LIMIT_S = 1.0
@@ -255,8 +255,7 @@ class Mt4Client:
         collected: list[str],
     ) -> dict[str, object]:
         """Poll for an async `<cmd> done ...` / `err ...` line after an `ok`
-        ack, matching the pattern goto_position.py's send_move() already uses
-        for `m`/`mp`. Returns a dict with "ok", "lines", and (on success) the
+        ack, for `m`/`mp` moves. Returns a dict with "ok", "lines", and (on success) the
         parsed final "tcp" pose if one was printed.
 
         `collected` may already contain the terminal line -- a no-op move
