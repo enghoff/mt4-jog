@@ -29,7 +29,7 @@ from jog import flush_console_input
 from mt4_jog.client import Mt4Client, Mt4ClientError
 from mt4_jog.kinematics import JointAnglesDeg, ik_position
 from mt4_vision.calib import DEFAULT_CALIB_PATH, CalibrationError, load_calibration
-from mt4_vision.camera import capture_frame
+from mt4_vision.camera import FrameStream, capture_frame
 from mt4_vision.detect import CubeDetection
 from mt4_vision.pickplace import (
     STACK_AXIS_CLEAR_MM,
@@ -39,6 +39,7 @@ from mt4_vision.pickplace import (
     place,
     retreat_for_camera,
 )
+from mt4_vision.preview import LiveFeed, PreviewStopped
 from mt4_vision.scene import Scene, capture_scene, within_pick_hull
 from mt4_vision.workspace import (
     MAX_REACH_MM,
@@ -314,6 +315,21 @@ def main() -> int:
         default=8,
         help="stop after this many levels (default 8)",
     )
+    parser.add_argument(
+        "--preview", action="store_true",
+        help="show a live annotated camera preview window (q or Esc to stop)",
+    )
+    parser.add_argument(
+        "--record",
+        default=None,
+        help="record a live annotated video to this path (e.g. stack_run.mp4)",
+    )
+    parser.add_argument(
+        "--feed-fps",
+        type=float,
+        default=10.0,
+        help="capture/annotate rate for --preview and --record (default 10)",
+    )
     args = parser.parse_args()
 
     try:
@@ -336,10 +352,37 @@ def main() -> int:
     cube_h = float(calib.cube_height_mm)
     home_q = JointAnglesDeg(0.0, 0.0, 0.0, 0.0)
 
-    def snap_scene() -> Scene:
+    # A live feed and this script's own "look now" captures can't both open
+    # the camera independently (one device, one owner) -- when either
+    # --preview or --record is on, both pull frames from this one shared
+    # stream instead of the default one-shot capture_frame() per look.
+    stream = FrameStream(**camera_kwargs) if (args.preview or args.record) else None
+    live_feed = (
+        LiveFeed(
+            calib=calib, stream=stream, fps=args.feed_fps,
+            video_path=args.record, show_preview=args.preview,
+        )
+        if stream is not None
+        else None
+    )
+
+    def snap_scene(stage: str) -> Scene:
+        if live_feed is not None:
+            if live_feed.stopped_by_user.is_set():
+                raise PreviewStopped()
+            live_feed.clear_target()
         retreat_for_camera(client, calib)
         time.sleep(CAMERA_SETTLE_S)
-        return capture_scene(calib, capture_frame(**camera_kwargs))
+        frame = stream.fresh(min_advance=2) if stream is not None else capture_frame(**camera_kwargs)
+        scene = capture_scene(calib, frame)
+        if live_feed is not None:
+            live_feed.set_status([stage, scene.summary_line()])
+        return scene
+
+    def snap_decision(target: CubeDetection, stage: str) -> None:
+        if live_feed is not None:
+            live_feed.set_target(target.color, float(target.x), float(target.y))
+            live_feed.set_status([stage])
 
     try:
         client.ensure_connected()
@@ -367,7 +410,7 @@ def main() -> int:
 
         # --- Clear cubes near the stack marker ---------------------------------
         for attempt in range(1, SITE_CLEAR_ATTEMPTS + 1):
-            scene = snap_scene()
+            scene = snap_scene(f"Clearing site (attempt {attempt}/{SITE_CLEAR_ATTEMPTS})")
             near = cubes_near_site(scene, sx, sy)
             if not near:
                 print("Site clear")
@@ -406,6 +449,10 @@ def main() -> int:
                 f"-> ({dest[0]:.0f},{dest[1]:.0f}) "
                 f"[attempt {attempt}/{SITE_CLEAR_ATTEMPTS}]"
             )
+            snap_decision(
+                target,
+                f"Clearing {target.color} -> ({dest[0]:.0f},{dest[1]:.0f})",
+            )
             try:
                 pick(
                     client, calib, float(target.x), float(target.y),
@@ -416,7 +463,7 @@ def main() -> int:
                 print(f"  clear failed: {exc}", file=sys.stderr)
                 return 1
         else:
-            scene = snap_scene()
+            scene = snap_scene("Verifying site clear")
             still = cubes_near_site(scene, sx, sy)
             if still:
                 print(
@@ -440,7 +487,7 @@ def main() -> int:
             # Inner loop: resume after "no cubes" re-snaps the same level.
             quit_stack = False
             while True:
-                scene = snap_scene()
+                scene = snap_scene(f"Level {level}/{args.max_levels}: scanning")
                 # Drop stack-top phantoms behind the site along the camera LOS
                 # (they appear once level 1+ is built).
                 shadowed = []
@@ -487,6 +534,9 @@ def main() -> int:
                     f"\nLevel {level}: align-pick {cube.color} at "
                     f"({cube.x:.1f},{cube.y:.1f}) yaw={cube.yaw_deg:.0f}"
                 )
+                snap_decision(
+                    cube, f"Level {level}/{args.max_levels}: picking {cube.color}",
+                )
                 try:
                     pick_centered(
                         client, calib, float(cube.x), float(cube.y),
@@ -520,8 +570,18 @@ def main() -> int:
     except Mt4ClientError as exc:
         print(exc, file=sys.stderr)
         return 1
+    except PreviewStopped:
+        print("Preview window closed (q/Esc) -- stopping.")
+        retreat_for_camera(client, calib)
+        return 0
     finally:
         client.close()
+        if live_feed is not None:
+            live_feed.close()
+        if stream is not None:
+            stream.close()
+        if args.record:
+            print(f"Recording saved to {args.record}")
 
 
 if __name__ == "__main__":
