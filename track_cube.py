@@ -57,8 +57,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from jog import console_focused, key_down, run_home
 from mt4_jog.client import Mt4Client, Mt4ClientError
-from mt4_jog.joints import DEFAULT_BAUD, JOG_SPEED_MIN_US
+from mt4_jog.joints import (
+    DEFAULT_BAUD,
+    J1_HOME_CENTER_STEPS,
+    J2_HOME_PULLOFF_STEPS,
+    JOG_SPEED_MIN_US,
+)
 from mt4_jog.serial import (
     FirmwareNotReadyError,
     SerialGoneError,
@@ -325,6 +331,8 @@ def run_tracking_loop(
     deadline: float | None = None,
     preview: bool = False,
     recorder: VideoRecorder | None = None,
+    j1_center: int = J1_HOME_CENTER_STEPS,
+    j2_pull: int = J2_HOME_PULLOFF_STEPS,
 ) -> None:
     buf: list[str] = [""]
     _t0, x0, y0 = seed
@@ -341,6 +349,18 @@ def run_tracking_loop(
             if deadline is not None and time.monotonic() >= deadline:
                 print("Reached --max-seconds, stopping.")
                 return
+            if console_focused() and key_down("h"):
+                if jogging:
+                    send_quick(ser, "stop")
+                    jogging = False
+                    last_sent_error = None
+                print("Homing (h)...")
+                run_home(ser, buf, j1_center, j2_pull, verbose)
+                new_tcp = report_firmware_lines(ser, buf, verbose)
+                if new_tcp is not None:
+                    current_tcp_x, current_tcp_y, current_tcp_z = new_tcp.x, new_tcp.y, new_tcp.z
+                lost_since = time.monotonic()
+                continue
             # min_advance=1 (not FrameStream's default of 2): the camera
             # only delivers ~10fps here, and the default requires waiting
             # for 2 full new frames past the call, which halves our
@@ -521,6 +541,8 @@ def main() -> int:
     )
     parser.add_argument("--deadband-mm", type=float, default=DEADBAND_MM)
     parser.add_argument("--lost-grace-s", type=float, default=LOST_GRACE_S)
+    parser.add_argument("--j1-center", type=int, default=J1_HOME_CENTER_STEPS)
+    parser.add_argument("--j2-pull", type=int, default=J2_HOME_PULLOFF_STEPS)
     parser.add_argument(
         "--max-seconds", type=float, default=None,
         help="exit cleanly (stop + close) after this many seconds; default runs until Ctrl+C",
@@ -600,7 +622,7 @@ def _run(args: argparse.Namespace, calib: Calibration, stream: FrameStream) -> i
     port = args.port
     baud = args.baud
 
-    print("Switching to direct jog control for tracking. Ctrl+C to stop.")
+    print("Switching to direct jog control for tracking. Ctrl+C to stop, H (this window/terminal focused) to re-home.")
     try:
         with open_serial(port, baud) as ser:
             try:
@@ -624,6 +646,7 @@ def _run(args: argparse.Namespace, calib: Calibration, stream: FrameStream) -> i
                     deadband_mm=args.deadband_mm,
                     lost_grace_s=args.lost_grace_s, verbose=args.verbose,
                     deadline=deadline, preview=args.preview, recorder=recorder,
+                    j1_center=args.j1_center, j2_pull=args.j2_pull,
                 )
             except KeyboardInterrupt:
                 print()

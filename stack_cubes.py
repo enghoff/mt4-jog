@@ -20,12 +20,13 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import threading
 import time
 from pathlib import Path
 
 import numpy as np
 
-from jog import flush_console_input
+from jog import console_focused, flush_console_input, key_down
 from mt4_jog.client import Mt4Client, Mt4ClientError
 from mt4_jog.kinematics import JointAnglesDeg, ik_position
 from mt4_vision.calib import DEFAULT_CALIB_PATH, CalibrationError, load_calibration
@@ -84,6 +85,82 @@ def marker_by_id(calib, marker_id: int) -> MarkerSlot:
     raise SystemExit(
         f"marker {marker_id} not in calibration; known ids: {known}"
     )
+
+
+class _HomeKeyWatcher:
+    """Catch a tap of H (same binding as jog.py) on a background thread and
+    abort whatever the arm is doing right now (same mechanism shuffle.py
+    uses via ``Mt4Client.request_interrupt``).
+
+    ``key_down`` (GetAsyncKeyState) only reports the key at the instant it's
+    polled, and calling ``request_interrupt`` only helps if something polls
+    for it -- neither happens on its own inside stack_cubes.py's seconds-
+    apart loop checkpoints. This thread polls at 20Hz so a normal tap is
+    always caught, and calls ``request_interrupt`` immediately on the press
+    edge so an in-flight ``move_to``/``gripper`` call aborts within a
+    fraction of a second instead of running to completion first. Gated on
+    ``console_focused`` so an H press in another window doesn't re-home the
+    arm mid-stack.
+    """
+
+    def __init__(self, client: Mt4Client) -> None:
+        self._client = client
+        self._requested = threading.Event()
+        self._h_down = False
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="stack-home-key", daemon=True
+        )
+
+    def start(self) -> None:
+        if sys.platform == "win32":
+            self._thread.start()
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=0.3)
+
+    def consume(self) -> bool:
+        if self._requested.is_set():
+            self._requested.clear()
+            return True
+        return False
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            down = console_focused() and key_down("h")
+            if down and not self._h_down:
+                self._requested.set()
+                self._client.request_interrupt()
+            self._h_down = down
+            self._stop.wait(0.05)
+
+
+def _run_home(client: Mt4Client, watcher: _HomeKeyWatcher) -> None:
+    print("Homing (H)...")
+    watcher.consume()
+    client.clear_interrupt()
+    try:
+        client.stop()
+    except Mt4ClientError:
+        pass
+    home_arm(client)
+    print("Home ok")
+
+
+def _check_home(client: Mt4Client, watcher: _HomeKeyWatcher) -> bool:
+    """Checkpoint catch: an H tap that landed while no client call was in
+    flight, so there was no in-progress move for request_interrupt to abort."""
+    if not watcher.consume():
+        return False
+    _run_home(client, watcher)
+    return True
+
+
+def _home_requested(watcher: _HomeKeyWatcher, exc: Mt4ClientError) -> bool:
+    """True when a Mt4ClientError was this H-triggered abort, not a real failure."""
+    return watcher.consume() or "interrupted" in str(exc)
 
 
 def cubes_near_site(
@@ -351,6 +428,7 @@ def main() -> int:
     client = Mt4Client() if not args.port else Mt4Client(port=args.port)
     cube_h = float(calib.cube_height_mm)
     home_q = JointAnglesDeg(0.0, 0.0, 0.0, 0.0)
+    watcher: _HomeKeyWatcher | None = None
 
     # A live feed and this script's own "look now" captures can't both open
     # the camera independently (one device, one owner) -- when either
@@ -403,6 +481,9 @@ def main() -> int:
             f"Stack site: marker {marker.marker_id} at "
             f"({sx:.1f},{sy:.1f}), cube_height={cube_h:.1f}mm"
         )
+        print("Ctrl+C to stop, H (this window/terminal focused) to re-home before the next step.")
+        watcher = _HomeKeyWatcher(client)
+        watcher.start()
 
         all_markers = marker_slots_from_calibration(calib)
         behind_u = stack_shadow_behind_unit(calib, sx, sy)
@@ -410,67 +491,80 @@ def main() -> int:
 
         # --- Clear cubes near the stack marker ---------------------------------
         for attempt in range(1, SITE_CLEAR_ATTEMPTS + 1):
-            scene = snap_scene(f"Clearing site (attempt {attempt}/{SITE_CLEAR_ATTEMPTS})")
-            near = cubes_near_site(scene, sx, sy)
-            if not near:
-                print("Site clear")
-                break
-            # Prefer pickable detections; fall back to raw occupants.
-            pickable_near = [
-                c for c in scene.pickable(scene.cubes)
-                if dist_mm(float(c.x), float(c.y), sx, sy) < SITE_CLEAR_MM
-            ]
-            target = (pickable_near or near)[0]
-            occupied = [
-                (float(c.x), float(c.y))
-                for c in scene.raw_cubes
-                if c is not target and c.x is not None and c.y is not None
-            ]
-            dest = clear_aside_xy(
-                sx, sy, float(target.x), float(target.y), occupied,
-                markers=all_markers, behind_u=behind_u,
-                shadow_levels=shadow_levels,
-            )
-            if dest is None:
-                dest = choose_park_slot(
-                    scene, sx, sy, avoid=occupied,
+            if _check_home(client, watcher):
+                continue
+            try:
+                scene = snap_scene(f"Clearing site (attempt {attempt}/{SITE_CLEAR_ATTEMPTS})")
+                near = cubes_near_site(scene, sx, sy)
+                if not near:
+                    print("Site clear")
+                    break
+                # Prefer pickable detections; fall back to raw occupants.
+                pickable_near = [
+                    c for c in scene.pickable(scene.cubes)
+                    if dist_mm(float(c.x), float(c.y), sx, sy) < SITE_CLEAR_MM
+                ]
+                target = (pickable_near or near)[0]
+                occupied = [
+                    (float(c.x), float(c.y))
+                    for c in scene.raw_cubes
+                    if c is not target and c.x is not None and c.y is not None
+                ]
+                dest = clear_aside_xy(
+                    sx, sy, float(target.x), float(target.y), occupied,
                     markers=all_markers, behind_u=behind_u,
                     shadow_levels=shadow_levels,
                 )
-            if dest is None:
+                if dest is None:
+                    dest = choose_park_slot(
+                        scene, sx, sy, avoid=occupied,
+                        markers=all_markers, behind_u=behind_u,
+                        shadow_levels=shadow_levels,
+                    )
+                if dest is None:
+                    print(
+                        f"No reachable clear spot for {target.color} at "
+                        f"({target.x:.0f},{target.y:.0f})",
+                        file=sys.stderr,
+                    )
+                    return 1
                 print(
-                    f"No reachable clear spot for {target.color} at "
-                    f"({target.x:.0f},{target.y:.0f})",
-                    file=sys.stderr,
+                    f"Clearing {target.color} at ({target.x:.0f},{target.y:.0f}) "
+                    f"-> ({dest[0]:.0f},{dest[1]:.0f}) "
+                    f"[attempt {attempt}/{SITE_CLEAR_ATTEMPTS}]"
                 )
-                return 1
-            print(
-                f"Clearing {target.color} at ({target.x:.0f},{target.y:.0f}) "
-                f"-> ({dest[0]:.0f},{dest[1]:.0f}) "
-                f"[attempt {attempt}/{SITE_CLEAR_ATTEMPTS}]"
-            )
-            snap_decision(
-                target,
-                f"Clearing {target.color} -> ({dest[0]:.0f},{dest[1]:.0f})",
-            )
-            try:
+                snap_decision(
+                    target,
+                    f"Clearing {target.color} -> ({dest[0]:.0f},{dest[1]:.0f})",
+                )
                 pick(
                     client, calib, float(target.x), float(target.y),
                     yaw_deg=target.yaw_deg,
                 )
                 place(client, calib, dest[0], dest[1])
             except Mt4ClientError as exc:
+                if _home_requested(watcher, exc):
+                    _run_home(client, watcher)
+                    continue
                 print(f"  clear failed: {exc}", file=sys.stderr)
                 return 1
         else:
-            scene = snap_scene("Verifying site clear")
-            still = cubes_near_site(scene, sx, sy)
-            if still:
-                print(
-                    "Site still occupied after clear attempts: "
-                    + ", ".join(f"{c.color}({c.x:.0f},{c.y:.0f})" for c in still),
-                    file=sys.stderr,
-                )
+            try:
+                scene = snap_scene("Verifying site clear")
+                still = cubes_near_site(scene, sx, sy)
+                if still:
+                    print(
+                        "Site still occupied after clear attempts: "
+                        + ", ".join(f"{c.color}({c.x:.0f},{c.y:.0f})" for c in still),
+                        file=sys.stderr,
+                    )
+                    return 1
+            except Mt4ClientError as exc:
+                if _home_requested(watcher, exc):
+                    _run_home(client, watcher)
+                    print("Interrupted during final site-clear check -- rerun to build.", file=sys.stderr)
+                else:
+                    print(exc, file=sys.stderr)
                 return 1
 
         # --- Build the stack ---------------------------------------------------
@@ -487,57 +581,59 @@ def main() -> int:
             # Inner loop: resume after "no cubes" re-snaps the same level.
             quit_stack = False
             while True:
-                scene = snap_scene(f"Level {level}/{args.max_levels}: scanning")
-                # Drop stack-top phantoms behind the site along the camera LOS
-                # (they appear once level 1+ is built).
-                shadowed = []
-                behind_u = (
-                    stack_shadow_behind_unit(calib, sx, sy) if built > 0 else None
-                )
-                if behind_u is not None:
-                    for c in scene.pickable(scene.cubes):
-                        if dist_mm(float(c.x), float(c.y), sx, sy) < SITE_CLEAR_MM:
-                            continue
-                        if in_stack_camera_shadow(
-                            float(c.x), float(c.y), sx, sy, behind_u,
-                            stack_levels=built,
-                        ):
-                            shadowed.append(c)
-                if shadowed:
-                    print(
-                        "Ignoring stack-shadow phantom(s): "
-                        + ", ".join(
-                            f"{c.color}({c.x:.0f},{c.y:.0f})" for c in shadowed
-                        )
-                    )
-                cands = stack_candidates(
-                    scene, sx, sy, calib=calib, stack_levels=built,
-                )
-                if not cands:
-                    print(f"level {level}: no reachable cube outside site")
-                    try:
-                        reply = input(
-                            "Move cubes into arm reach, then Enter to resume "
-                            "(q to quit): "
-                        ).strip().lower()
-                    except EOFError:
-                        quit_stack = True
-                        break
-                    if reply in ("q", "quit"):
-                        quit_stack = True
-                        break
-                    print("Resuming...")
+                if _check_home(client, watcher):
                     continue
-
-                cube = cands[0]
-                print(
-                    f"\nLevel {level}: align-pick {cube.color} at "
-                    f"({cube.x:.1f},{cube.y:.1f}) yaw={cube.yaw_deg:.0f}"
-                )
-                snap_decision(
-                    cube, f"Level {level}/{args.max_levels}: picking {cube.color}",
-                )
                 try:
+                    scene = snap_scene(f"Level {level}/{args.max_levels}: scanning")
+                    # Drop stack-top phantoms behind the site along the camera LOS
+                    # (they appear once level 1+ is built).
+                    shadowed = []
+                    behind_u = (
+                        stack_shadow_behind_unit(calib, sx, sy) if built > 0 else None
+                    )
+                    if behind_u is not None:
+                        for c in scene.pickable(scene.cubes):
+                            if dist_mm(float(c.x), float(c.y), sx, sy) < SITE_CLEAR_MM:
+                                continue
+                            if in_stack_camera_shadow(
+                                float(c.x), float(c.y), sx, sy, behind_u,
+                                stack_levels=built,
+                            ):
+                                shadowed.append(c)
+                    if shadowed:
+                        print(
+                            "Ignoring stack-shadow phantom(s): "
+                            + ", ".join(
+                                f"{c.color}({c.x:.0f},{c.y:.0f})" for c in shadowed
+                            )
+                        )
+                    cands = stack_candidates(
+                        scene, sx, sy, calib=calib, stack_levels=built,
+                    )
+                    if not cands:
+                        print(f"level {level}: no reachable cube outside site")
+                        try:
+                            reply = input(
+                                "Move cubes into arm reach, then Enter to resume "
+                                "(q to quit): "
+                            ).strip().lower()
+                        except EOFError:
+                            quit_stack = True
+                            break
+                        if reply in ("q", "quit"):
+                            quit_stack = True
+                            break
+                        print("Resuming...")
+                        continue
+
+                    cube = cands[0]
+                    print(
+                        f"\nLevel {level}: align-pick {cube.color} at "
+                        f"({cube.x:.1f},{cube.y:.1f}) yaw={cube.yaw_deg:.0f}"
+                    )
+                    snap_decision(
+                        cube, f"Level {level}/{args.max_levels}: picking {cube.color}",
+                    )
                     pick_centered(
                         client, calib, float(cube.x), float(cube.y),
                         yaw_deg=cube.yaw_deg,
@@ -555,6 +651,9 @@ def main() -> int:
                         axis_clear_mm=STACK_AXIS_CLEAR_MM,
                     )
                 except Mt4ClientError as exc:
+                    if _home_requested(watcher, exc):
+                        _run_home(client, watcher)
+                        continue
                     print(f"  level {level} failed: {exc}", file=sys.stderr)
                     return 1
                 built = level
@@ -565,7 +664,13 @@ def main() -> int:
                 break
 
         print(f"\nBuilt {built} level(s) on marker {marker.marker_id}")
-        retreat_for_camera(client, calib)
+        try:
+            retreat_for_camera(client, calib)
+        except Mt4ClientError as exc:
+            if _home_requested(watcher, exc):
+                _run_home(client, watcher)
+            else:
+                print(exc, file=sys.stderr)
         return 0
     except Mt4ClientError as exc:
         print(exc, file=sys.stderr)
@@ -575,6 +680,8 @@ def main() -> int:
         retreat_for_camera(client, calib)
         return 0
     finally:
+        if watcher is not None:
+            watcher.close()
         client.close()
         if live_feed is not None:
             live_feed.close()
