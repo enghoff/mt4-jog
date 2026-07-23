@@ -9,6 +9,12 @@ drive the arm — "put the red cube next to the blue one".
 The stock Grbl-derived firmware is replaced entirely (original images are
 backed up and restorable, see [Restoring stock firmware](#restoring-stock-firmware)).
 
+## Demo
+
+[Autonomous cube stacking](https://youtu.be/1H_cvyK35i8) — `stack_cubes.py`
+building a stack on a calibrated marker, with the live vision overlay
+(pick candidates, marker occupancy, current target) visible throughout.
+
 ## Repo layout
 
 | Path | Purpose |
