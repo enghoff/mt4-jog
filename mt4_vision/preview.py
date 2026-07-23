@@ -34,7 +34,7 @@ _OUTLINE_OFFSETS = [
 ]
 
 
-def _draw_outlined_text(
+def draw_outlined_text(
     img: np.ndarray,
     text: str,
     org: tuple[int, int],
@@ -104,7 +104,7 @@ def annotate_scene(
 
     for i, line in enumerate(status_lines or []):
         y = 24 + i * 22
-        _draw_outlined_text(out, line, (10, y), scale=0.6, color=(255, 255, 255))
+        draw_outlined_text(out, line, (10, y), scale=0.6, color=(255, 255, 255))
 
     return out
 

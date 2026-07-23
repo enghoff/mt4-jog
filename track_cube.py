@@ -78,6 +78,7 @@ from mt4_vision.calib import (
 from mt4_vision.camera import DEFAULT_CAMERA_INDEX, CameraError, FrameStream
 from mt4_vision.detect import CubeDetection, detect_cubes
 from mt4_vision.pickplace import ensure_homed
+from mt4_vision.preview import draw_outlined_text
 from mt4_vision.workspace import KEEPOUT_RADIUS_MM, MAX_REACH_MM
 
 DEFAULT_HOVER_MM = 50.0
@@ -311,8 +312,7 @@ def draw_preview(
     ]
     for i, line in enumerate(lines):
         y = 24 + i * 22
-        cv2.putText(out, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(out, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, state_bgr, 1, cv2.LINE_AA)
+        draw_outlined_text(out, line, (10, y), scale=0.6, color=state_bgr)
     return out
 
 
