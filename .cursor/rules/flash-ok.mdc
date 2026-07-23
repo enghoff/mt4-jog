@@ -8,5 +8,5 @@ alwaysApply: true
 It is always OK to build and flash the MT4 jog firmware (`python flash_jog.py`) without asking for confirmation.
 
 - Do it whenever firmware changes land, or when the user says "flash".
-- Free COM9 first if needed (stop `jog.py`, `map_envelope.py`, `mt4_mcp`, etc.) — only one process may own the serial port.
+- Free COM9 first if needed (stop `jog.py`, `mt4_mcp`, etc.) — only one process may own the serial port.
 - Prefer flashing over leaving unflashed firmware changes on disk.
