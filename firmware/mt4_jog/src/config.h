@@ -34,6 +34,24 @@ static const uint16_t CJ_REFRESH_MS = 40;
  * the number of segments per move (longer moves use a larger effective step). */
 static const float MP_CART_SEGMENT_MM = 2.0f;
 static const uint16_t MP_MAX_SEGMENTS = 250;
+/* Sampling spacing/cap for route_joints_feasible()'s upfront IK + soft-limit
+ * preflight check on a candidate route -- deliberately coarser than
+ * MP_CART_SEGMENT_MM (which governs the actually-executed segment
+ * granularity). This check is a fail-fast convenience, not the only safety
+ * net: every segment's target is independently re-checked against soft
+ * limits at execution time (motion.cpp's mp_execute_segment), and every
+ * individual step is guarded again in the Timer1 ISR
+ * (motion_step_allowed) -- so a coarser preflight can't let anything
+ * through that isn't still caught (safely aborting the move) at execution
+ * time. Soft-limit envelope violations are broad, slowly-varying regions
+ * (not needle-thin), so coarser sampling still catches them in practice.
+ * Measured live: at MP_CART_SEGMENT_MM's old 2mm/40-sample-cap density,
+ * every `mp` call cost 65-110ms of blocking IK time regardless of the
+ * move's actual complexity -- comparable to a tracker's own ~100ms tick
+ * period, causing commands to queue up faster than firmware could drain
+ * them. */
+static const float MP_FEASIBILITY_SAMPLE_MM = 8.0f;
+static const uint8_t MP_FEASIBILITY_MAX_SAMPLES = 20;
 /* Keep-out cylinder around the J1 axis (any Z): the TCP physically cannot
  * get closer to the base column than roughly this. `mp` targets inside it
  * are rejected; `mp` paths that would cross it are routed around it
