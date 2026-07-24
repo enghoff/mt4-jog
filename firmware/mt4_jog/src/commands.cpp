@@ -86,20 +86,33 @@ static bool parse_cj_vec(const char *arg, Vec3 *out, int8_t *j4_roll) {
   return false;
 }
 
-// Parses "<x> <y> <z> <j4> <g> [speed_us]" (mp command args) without relying
-// on sscanf's %f -- avr-libc's default sscanf doesn't support float conversion
-// unless linked against a non-default scanf flavor, which this build isn't.
-// strtod/strtol are always available. speed_us defaults to 0 (leave the current
-// jog/move step period unchanged); otherwise clamped to [700, 4000] us.
+// Parses "<x> <y> <z> <j4|h|w> <g> [speed_us]" (mp/mq command args) without
+// relying on sscanf's %f -- avr-libc's default sscanf doesn't support float
+// conversion unless linked against a non-default scanf flavor, which this
+// build isn't. strtod/strtol are always available. The j4 slot also accepts
+// the sentinels `h` (hold world yaw) / `w` (hold wrist joint) -- see
+// Mt4J4Mode in motion.h; *j4 is left 0 for those. speed_us defaults to 0
+// (leave the current jog/move step period unchanged); otherwise clamped to
+// [700, 4000] us.
 static bool parse_mp_args(char *arg, float *x, float *y, float *z, float *j4,
-                          long *g, long *speed_us) {
+                          uint8_t *j4_mode, long *g, long *speed_us) {
   float vals[4];
+  uint8_t mode = MT4_J4_EXPLICIT;
   for (uint8_t i = 0; i < 4; ++i) {
     while (*arg == ' ') {
       ++arg;
     }
     if (!*arg) {
       return false;
+    }
+    if (i == 3 && (arg[1] == ' ' || arg[1] == '\0')) {
+      const char c = arg[0];
+      if (c == 'h' || c == 'H' || c == 'w' || c == 'W') {
+        mode = (c == 'h' || c == 'H') ? MT4_J4_HOLD : MT4_J4_WRIST;
+        vals[3] = 0.0f;
+        ++arg;
+        continue;
+      }
     }
     char *end = nullptr;
     vals[i] = strtod(arg, &end);
@@ -124,6 +137,7 @@ static bool parse_mp_args(char *arg, float *x, float *y, float *z, float *j4,
   *y = vals[1];
   *z = vals[2];
   *j4 = vals[3];
+  *j4_mode = mode;
   *g = gv;
   *speed_us = 0;
   while (*arg == ' ') {
@@ -173,12 +187,21 @@ void handle_line(char *line) {
    * start_absolute_move() with jog_active still true so it can detect the
    * retarget and splice in the new path instead of hard-stopping first --
    * stop_jog() here would zero jog_active before start_absolute_move() ever
-   * gets a look, defeating the smoothing unconditionally. */
+   * gets a look, defeating the smoothing unconditionally. "mq " needs the
+   * same exemption: motion_queue_move() decides "queue this behind what's
+   * running" vs. "nothing's running, cold-start it now" from jog_active --
+   * stop_jog() here would zero that first and make every `mq` look idle,
+   * so nothing would ever actually get queued. "?"/"d" are pure status
+   * reads and must be passive like "pos" already is: a host polling
+   * progress (or resolving state) mid-path must not halt the path -- that
+   * un-exempted "?" is exactly what used to force clients to choose
+   * between knowing the arm's state and keeping it moving. */
   if (strcmp(line, "!") && strcmp(line, "stop") && strcmp(line, "j") &&
       strcmp(line, "jog") && strcmp(line, "home") && strcmp(line, "$H") &&
       strncmp(line, "home ", 5) && strncmp(line, "cj ", 3) &&
-      strncmp(line, "mp ", 3) &&
+      strncmp(line, "mp ", 3) && strncmp(line, "mq ", 3) &&
       strncmp(line, "speed ", 6) && strcmp(line, "pos") &&
+      strcmp(line, "?") && strcmp(line, "d") &&
       line[0] != 'g' && line[0] != 'G') {
     stop_jog();
   }
@@ -317,12 +340,25 @@ void handle_line(char *line) {
   if ((line[0] == 'm' || line[0] == 'M') && (line[1] == 'p' || line[1] == 'P') &&
       line[2] == ' ') {
     float x, y, z, j4;
+    uint8_t j4_mode;
     long g, speed_us;
-    if (!parse_mp_args(line + 3, &x, &y, &z, &j4, &g, &speed_us)) {
-      Serial.println(F("err mp <x> <y> <z> <j4> <g> [speed_us]"));
+    if (!parse_mp_args(line + 3, &x, &y, &z, &j4, &j4_mode, &g, &speed_us)) {
+      Serial.println(F("err mp <x> <y> <z> <j4|h|w> <g> [speed_us]"));
       return;
     }
-    start_absolute_move(x, y, z, j4, g, speed_us);
+    start_absolute_move(x, y, z, j4, j4_mode, g, speed_us);
+    return;
+  }
+  if ((line[0] == 'm' || line[0] == 'M') && (line[1] == 'q' || line[1] == 'Q') &&
+      line[2] == ' ') {
+    float x, y, z, j4;
+    uint8_t j4_mode;
+    long g, speed_us;
+    if (!parse_mp_args(line + 3, &x, &y, &z, &j4, &j4_mode, &g, &speed_us)) {
+      Serial.println(F("err mq <x> <y> <z> <j4|h|w> <g> [speed_us]"));
+      return;
+    }
+    motion_queue_move(x, y, z, j4, j4_mode, g, speed_us);
     return;
   }
   if ((line[0] == 'm' || line[0] == 'M') && line[1] == ' ') {
@@ -370,6 +406,7 @@ void handle_line(char *line) {
   }
   if (!strcmp(line, "all f")) {
     stop_jog();
+    motion_cancel_move();  // drop any in-flight/queued mp/mq path too
     apply_all(PIN_FLOAT);
     drivers_enabled = false;
     clear_jog_axes();

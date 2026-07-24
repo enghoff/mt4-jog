@@ -139,6 +139,24 @@ bool dda_remove_axis_by_pin(uint8_t pin) {
 }
 
 bool dda_arm(int32_t master, const int32_t deltas[MT4_NUM_JOINTS], bool track_move) {
+  // dda_master/dda_delta/dda_accum/move_remaining are int32_t -- multi-byte
+  // writes on an 8-bit AVR, so each one is several non-atomic store
+  // instructions. When the timer's stopped (the common case: every `mp`
+  // segment boundary goes through motion_poll_move_done()'s dda_stop()
+  // first) the Timer1 ISR can't fire mid-update, so this was never a
+  // problem in practice. But a live splice (an in-flight `mp` retarget, or
+  // an `mq` queue-pop continuation -- see mp_execute_segment's jog_active
+  // branch) deliberately calls this WITHOUT stopping the timer first, so
+  // the ISR keeps ticking on the OLD state while this function is mid-write
+  // to the NEW state. Caught live: an `mp` retarget arriving mid-flight
+  // left the arm permanently stalled with axes still shown armed (STEP=..)
+  // but JOG=off and no further "mp done"/"err" -- consistent with the ISR
+  // reading a torn dda_accum/move_remaining and driving dda_axis_mask into
+  // a state nothing thereafter could complete. cli()/sei() around the
+  // mutation (mirroring dda_set_ramp/dda_continue_ramp's own guard on their
+  // multi-byte ramp state) makes the whole re-arm atomic from the ISR's
+  // point of view.
+  cli();
   dda_clear_axes();
   dda_master = master;
   move_mode = track_move;
@@ -155,7 +173,9 @@ bool dda_arm(int32_t master, const int32_t deltas[MT4_NUM_JOINTS], bool track_mo
     }
     dda_axis_mask |= static_cast<uint8_t>(1 << i);
   }
-  return dda_axis_mask != 0;
+  const bool armed = dda_axis_mask != 0;
+  sei();
+  return armed;
 }
 
 static void apply_jog_speed() {

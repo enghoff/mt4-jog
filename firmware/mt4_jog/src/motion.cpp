@@ -226,6 +226,51 @@ static bool mp_drivers_ready = false;
 static void angles_to_joint_steps(const JointAnglesDeg *q,
                                   long out[MT4_NUM_JOINTS]);
 
+/* A single raw `mq`-queued waypoint: same fields `mp`/`mq` parse off the
+ * wire, kept unplanned until its turn comes (see mq_queue below). j4_mode
+ * (Mt4J4Mode) rides along raw too: the `h`/`w` sentinels resolve against
+ * the pose the leg PLANS from, which for a queued leg doesn't exist until
+ * the leg ahead of it finishes. */
+typedef struct {
+  float x, y, z, j4;
+  uint8_t j4_mode;
+  long g;
+  long speed_us;
+} MpWaypoint;
+
+/* `mq` pending queue: legs behind whatever `mp_path` is currently executing.
+ * Raw (unplanned) waypoints -- each is only turned into a route/segment plan
+ * (mp_path) when its turn actually comes, since planning needs the pose the
+ * arm will be AT when that leg starts, which isn't known until the leg
+ * ahead of it finishes. */
+static MpWaypoint mq_queue[MQ_QUEUE_CAPACITY];
+static uint8_t mq_head = 0;
+static uint8_t mq_count = 0;
+
+static void mq_queue_clear() {
+  mq_head = 0;
+  mq_count = 0;
+}
+
+static bool mq_queue_push(const MpWaypoint &wp) {
+  if (mq_count >= MQ_QUEUE_CAPACITY) {
+    return false;
+  }
+  mq_queue[(mq_head + mq_count) % MQ_QUEUE_CAPACITY] = wp;
+  ++mq_count;
+  return true;
+}
+
+static bool mq_queue_pop(MpWaypoint *out) {
+  if (mq_count == 0) {
+    return false;
+  }
+  *out = mq_queue[mq_head];
+  mq_head = static_cast<uint8_t>((mq_head + 1) % MQ_QUEUE_CAPACITY);
+  --mq_count;
+  return true;
+}
+
 static void mp_path_cancel() {
   mp_path.active = false;
   mp_path.hold_ws_orient = false;
@@ -234,6 +279,10 @@ static void mp_path_cancel() {
   mp_path.num_pieces = 0;
   mp_path.route_radius_idx = -1;
   mp_drivers_ready = false;
+  // A path that's ending (whether completed or aborted) invalidates
+  // whatever was queued behind it too -- the queue only makes sense as a
+  // continuation of the path currently in flight.
+  mq_queue_clear();
 }
 
 static float wrap_2pi_f(float a) {
@@ -648,6 +697,157 @@ static int32_t mp_estimate_path_ticks(const JointAnglesDeg *target) {
   return master;
 }
 
+/* Argument/state validation shared by `mp` and `mq`: everything that's
+ * cheap and doesn't depend on the arm's pose when this leg actually starts
+ * (so it's safe to run at `mq` enqueue time, even while queued behind other
+ * legs, not just when a leg is about to be planned). Prints its own
+ * "err mp ..." on failure, matching start_absolute_move()'s existing wire
+ * format (queued legs share the same error vocabulary as immediate ones). */
+static bool validate_mp_request(float x, float y, float z, long g,
+                                long speed_us) {
+  if (!mt4_homed) {
+    Serial.println(F("err not homed"));
+    return false;
+  }
+  if (g != 0 && !gripperSValid(g)) {
+    Serial.print(F("err mp grip "));
+    Serial.print(GRIPPER_S_OPEN);
+    Serial.print('-');
+    Serial.println(GRIPPER_S_CLOSED);
+    return false;
+  }
+  if (speed_us != 0 &&
+      (speed_us < JOG_STEP_PERIOD_MIN_US || speed_us > JOG_STEP_PERIOD_MAX_US)) {
+    Serial.print(F("err mp speed "));
+    Serial.print(JOG_STEP_PERIOD_MIN_US);
+    Serial.print('-');
+    Serial.println(JOG_STEP_PERIOD_MAX_US);
+    return false;
+  }
+  if (sqrtf(x * x + y * y) < MT4_KEEPOUT_RADIUS_MM - 0.5f) {
+    Serial.println(F("err mp keepout"));
+    return false;
+  }
+  if (z < mt4_ground_z_mm - 0.05f) {
+    Serial.print(F("err mp ground z<"));
+    Serial.println(mt4_ground_z_mm, 1);
+    return false;
+  }
+  return true;
+}
+
+/* Plans and arms one Cartesian-linear leg into mp_path -- the shared core of
+ * `mp` (cold start or live retarget) and `mq` (cold start or queue-pop
+ * continuation). Caller has already validated via validate_mp_request() and
+ * decided:
+ *   splice           -- continue without stopping (dda_continue_ramp, reuse
+ *                        whatever's already applied) vs. a fresh cold start
+ *                        (dda_set_ramp, ramps up from MP_ACCEL_START_US).
+ *   full_feasibility  -- run the full keep-out/soft-limit route feasibility
+ *                        sweep (cold starts, and every `mq` leg) vs. skip it
+ *                        the way a live `mp` retarget does (small
+ *                        incremental corrections from a tracker, where the
+ *                        cost of resweeping every tick would outrun the
+ *                        runway -- see plan_mp_xy_route's own comment).
+ * Prints "err mp ..." and returns false on IK/limit/route failure; does NOT
+ * print "ok mp"/"ok mq" or start stepping -- the caller does that. */
+static bool plan_mp_leg(float x, float y, float z, float j4_deg,
+                        uint8_t j4_mode, long g, long speed_us, bool splice,
+                        bool full_feasibility) {
+  if (speed_us != 0) {
+    dda_set_speed_us_quiet(speed_us);
+  }
+
+  const JointAnglesDeg near = angles_from_steps();
+  const float ws_j4_now = mt4_ws_j4_deg(&near);
+
+  JointAnglesDeg target;
+  if (!mt4_ik_position(&near, x, y, z, 0.0f, &target)) {
+    Serial.println(F("err mp unreachable"));
+    return false;
+  }
+  // Sentinel J4 modes resolve HERE, against the pose this leg actually
+  // plans from -- for a queued leg that's wherever the previous leg ended,
+  // which is the whole reason they can't be resolved host-side up front.
+  if (j4_mode == MT4_J4_HOLD) {
+    j4_deg = ws_j4_now;
+  } else if (j4_mode == MT4_J4_WRIST) {
+    // Keep the J4 *joint* angle across the leg's J1 swing: world yaw
+    // follows the base, so joint J4 = (world - j1) stays put instead of
+    // being driven toward a soft limit the way a world-yaw hold would on
+    // a large swing (firmware-native j4_preserve_wrist()).
+    j4_deg = ws_j4_now + (target.j1 - near.j1);
+  }
+  const bool hold_ws_orient = fabsf(j4_deg - ws_j4_now) < 0.1f;
+  target.j4 = j4_deg - target.j1;
+  {
+    long target_steps[MT4_NUM_JOINTS];
+    angles_to_joint_steps(&target, target_steps);
+    if (!motion_joints_within_soft_limits(target_steps)) {
+      Serial.println(F("err mp joints"));
+      return false;
+    }
+  }
+
+  Vec3 start_tcp;
+  mt4_fk_tcp(&near, &start_tcp);
+
+  const bool skip_sweep = !full_feasibility;
+  float xy_len = 0.0f;
+  int8_t route_radius_idx = -1;
+  const uint8_t num_pieces = plan_mp_xy_route(
+      start_tcp.x, start_tcp.y, x, y, start_tcp.z, z, ws_j4_now, j4_deg,
+      hold_ws_orient, &near, skip_sweep,
+      skip_sweep ? mp_path.route_radius_idx : -1, &route_radius_idx,
+      mp_path.pieces, &xy_len);
+  if (num_pieces == 0) {
+    Serial.println(F("err mp route"));
+    return false;
+  }
+
+  const float dz = z - start_tcp.z;
+  const float cart_dist = sqrtf(xy_len * xy_len + dz * dz);
+
+  uint16_t num_segments =
+      static_cast<uint16_t>(ceilf(cart_dist / MP_CART_SEGMENT_MM));
+  if (num_segments < 1) {
+    num_segments = 1;
+  }
+  if (num_segments > MP_MAX_SEGMENTS) {
+    num_segments = MP_MAX_SEGMENTS;
+  }
+
+  mp_path.sz = start_tcp.z;
+  mp_path.sj4_ws = ws_j4_now;
+  mp_path.ez = z;
+  mp_path.ej4_ws = j4_deg;
+  mp_path.hold_ws_orient = hold_ws_orient;
+  mp_path.num_pieces = num_pieces;
+  mp_path.route_radius_idx = route_radius_idx;
+  mp_path.total_xy_len = xy_len;
+  mp_path.num_segments = num_segments;
+
+  const int32_t master_total = mp_estimate_path_ticks(&target);
+  if (splice) {
+    dda_continue_ramp(dda_get_speed_us(), MP_ACCEL_START_US, master_total,
+                      MP_ACCEL_RAMP_TICKS);
+  } else {
+    dda_set_ramp(MP_ACCEL_START_US, dda_get_speed_us(), master_total,
+                 MP_ACCEL_RAMP_TICKS);
+  }
+
+  cart_jog_mode = false;
+  move_done_is_mp = true;
+
+  mp_path.next_seg = 1;
+  mp_path.active = true;
+
+  if (g != 0) {
+    gripperSweepToS(g);
+  }
+  return true;
+}
+
 /* Arm one Cartesian-linear `mp` segment (seg is 1..num_segments). Returns
  * false on IK/delta failure. When the segment needs no joint motion, returns
  * true with move_mode left false so the caller can chain immediately. */
@@ -694,24 +894,48 @@ static bool mp_execute_segment(uint16_t seg) {
   return true;
 }
 
-/* Run pending `mp` segments until one needs async stepping or the path ends.
- * On success with async motion in flight, leaves mp_path.active true. On
- * completion, clears mp_path and emits "mp done pos ...". */
+/* Run pending `mp`/`mq` segments until one needs async stepping or the
+ * whole queue ends. On success with async motion in flight, leaves
+ * mp_path.active true. On completion (queue drained), clears mp_path and
+ * emits "mp done pos ...".
+ *
+ * When the currently-armed leg's segments run out, this doesn't stop: if
+ * mq_queue has a waypoint behind it, that leg is planned and armed right
+ * here (plan_mp_leg with splice=true, same no-stop continuation an in-flight
+ * `mp` retarget uses) and the outer loop falls straight through to stepping
+ * it -- no dda_stop(), no host round trip. A leg that fails to plan (target
+ * went unreachable/infeasible from wherever the arm actually ended up)
+ * aborts the whole remaining queue, not just that leg: the queue was
+ * planned as one sequence against an assumed pose, so once reality has
+ * diverged enough to break one leg the rest can't be trusted either. */
 static bool mp_continue_path() {
-  while (mp_path.active && mp_path.next_seg <= mp_path.num_segments) {
-    if (!mp_execute_segment(mp_path.next_seg)) {
+  for (;;) {
+    while (mp_path.active && mp_path.next_seg <= mp_path.num_segments) {
+      if (!mp_execute_segment(mp_path.next_seg)) {
+        mp_path_cancel();
+        Serial.println(F("err mp segment"));
+        return false;
+      }
+      ++mp_path.next_seg;
+      if (move_mode) {
+        return true;
+      }
+    }
+    mp_path.active = false;
+    MpWaypoint wp;
+    if (!mq_queue_pop(&wp)) {
+      mp_path_cancel();
+      report_move_done();
+      return true;
+    }
+    if (!plan_mp_leg(wp.x, wp.y, wp.z, wp.j4, wp.j4_mode, wp.g, wp.speed_us,
+                     /*splice=*/true, /*full_feasibility=*/true)) {
       mp_path_cancel();
       Serial.println(F("err mp segment"));
       return false;
     }
-    ++mp_path.next_seg;
-    if (move_mode) {
-      return true;
-    }
+    // mp_path is now active for the queued leg; loop back and step it.
   }
-  mp_path_cancel();
-  report_move_done();
-  return true;
 }
 
 static void report_move_done() {
@@ -780,6 +1004,8 @@ void print_status() {
   if (jog_active && dda_axis_mask != 0) {
     Serial.print(F(" T1"));
   }
+  Serial.print(F("  MQ="));
+  Serial.print(mq_count);
   Serial.print(F("  LIM "));
   print_limits();
   Serial.print(F("  GRIP S="));
@@ -1023,25 +1249,9 @@ void start_relative_move(const long d[MT4_NUM_JOINTS], long dg) {
  * like `orient on`); otherwise J4 is interpolated linearly to the target.
  * The path is split into short segments; each segment solves IK and runs
  * a coordinated joint DDA move. Refused unless the arm has homed this session. */
-bool start_absolute_move(float x, float y, float z, float j4_deg, long g,
-                         long speed_us) {
-  if (!mt4_homed) {
-    Serial.println(F("err not homed"));
-    return false;
-  }
-  if (g != 0 && !gripperSValid(g)) {
-    Serial.print(F("err mp grip "));
-    Serial.print(GRIPPER_S_OPEN);
-    Serial.print('-');
-    Serial.println(GRIPPER_S_CLOSED);
-    return false;
-  }
-  if (speed_us != 0 &&
-      (speed_us < JOG_STEP_PERIOD_MIN_US || speed_us > JOG_STEP_PERIOD_MAX_US)) {
-    Serial.print(F("err mp speed "));
-    Serial.print(JOG_STEP_PERIOD_MIN_US);
-    Serial.print('-');
-    Serial.println(JOG_STEP_PERIOD_MAX_US);
+bool start_absolute_move(float x, float y, float z, float j4_deg,
+                         uint8_t j4_mode, long g, long speed_us) {
+  if (!validate_mp_request(x, y, z, g, speed_us)) {
     return false;
   }
 
@@ -1056,102 +1266,59 @@ bool start_absolute_move(float x, float y, float z, float j4_deg, long g,
   // interrupting `cj`/`m`) is untouched: it still stops and ramps from
   // MP_ACCEL_START_US exactly as before.
   const bool retarget_in_flight = mp_path.active && jog_active;
-  if (!retarget_in_flight) {
+  if (retarget_in_flight) {
+    // `mp` always means "go here now" -- it supersedes whatever's in
+    // flight, including any `mq` legs still queued behind it. Those legs
+    // were planned as a sequence leading somewhere else; keeping them
+    // around after an unrelated `mp` override would silently resume into a
+    // stale plan once this new target is reached.
+    mq_queue_clear();
+  } else {
     motion_cancel_move();
     dda_stop();
   }
 
-  if (speed_us != 0) {
-    dda_set_speed_us_quiet(speed_us);
-  }
-
-  if (sqrtf(x * x + y * y) < MT4_KEEPOUT_RADIUS_MM - 0.5f) {
-    Serial.println(F("err mp keepout"));
+  if (!plan_mp_leg(x, y, z, j4_deg, j4_mode, g, speed_us, retarget_in_flight,
+                   /*full_feasibility=*/!retarget_in_flight)) {
     return false;
-  }
-  if (z < mt4_ground_z_mm - 0.05f) {
-    Serial.print(F("err mp ground z<"));
-    Serial.println(mt4_ground_z_mm, 1);
-    return false;
-  }
-
-  const JointAnglesDeg near = angles_from_steps();
-  const float ws_j4_now = mt4_ws_j4_deg(&near);
-  const bool hold_ws_orient = fabsf(j4_deg - ws_j4_now) < 0.1f;
-
-  JointAnglesDeg target;
-  if (!mt4_ik_position(&near, x, y, z, 0.0f, &target)) {
-    Serial.println(F("err mp unreachable"));
-    return false;
-  }
-  target.j4 = j4_deg - target.j1;
-  {
-    long target_steps[MT4_NUM_JOINTS];
-    angles_to_joint_steps(&target, target_steps);
-    if (!motion_joints_within_soft_limits(target_steps)) {
-      Serial.println(F("err mp joints"));
-      return false;
-    }
-  }
-
-  Vec3 start_tcp;
-  mt4_fk_tcp(&near, &start_tcp);
-
-  float xy_len = 0.0f;
-  int8_t route_radius_idx = -1;
-  const uint8_t num_pieces = plan_mp_xy_route(
-      start_tcp.x, start_tcp.y, x, y, start_tcp.z, z, ws_j4_now, j4_deg,
-      hold_ws_orient, &near, retarget_in_flight,
-      retarget_in_flight ? mp_path.route_radius_idx : -1, &route_radius_idx,
-      mp_path.pieces, &xy_len);
-  if (num_pieces == 0) {
-    Serial.println(F("err mp route"));
-    return false;
-  }
-
-  const float dz = z - start_tcp.z;
-  const float cart_dist = sqrtf(xy_len * xy_len + dz * dz);
-
-  uint16_t num_segments =
-      static_cast<uint16_t>(ceilf(cart_dist / MP_CART_SEGMENT_MM));
-  if (num_segments < 1) {
-    num_segments = 1;
-  }
-  if (num_segments > MP_MAX_SEGMENTS) {
-    num_segments = MP_MAX_SEGMENTS;
-  }
-
-  mp_path.sz = start_tcp.z;
-  mp_path.sj4_ws = ws_j4_now;
-  mp_path.ez = z;
-  mp_path.ej4_ws = j4_deg;
-  mp_path.hold_ws_orient = hold_ws_orient;
-  mp_path.num_pieces = num_pieces;
-  mp_path.route_radius_idx = route_radius_idx;
-  mp_path.total_xy_len = xy_len;
-  mp_path.num_segments = num_segments;
-
-  const int32_t master_total = mp_estimate_path_ticks(&target);
-  if (retarget_in_flight) {
-    dda_continue_ramp(dda_get_speed_us(), MP_ACCEL_START_US, master_total,
-                      MP_ACCEL_RAMP_TICKS);
-  } else {
-    dda_set_ramp(MP_ACCEL_START_US, dda_get_speed_us(), master_total,
-                 MP_ACCEL_RAMP_TICKS);
-  }
-
-  cart_jog_mode = false;
-  move_done_is_mp = true;
-
-  mp_path.next_seg = 1;
-  mp_path.active = true;
-
-  if (g != 0) {
-    gripperSweepToS(g);
   }
 
   Serial.println(F("ok mp"));
   return mp_continue_path();
+}
+
+/* "mq" command -- see motion.h for the full contract. */
+bool motion_queue_move(float x, float y, float z, float j4_deg,
+                       uint8_t j4_mode, long g, long speed_us) {
+  if (!validate_mp_request(x, y, z, g, speed_us)) {
+    return false;
+  }
+
+  const bool busy = mp_path.active && jog_active;
+  if (!busy) {
+    // Nothing in flight: behaves exactly like a fresh `mp` cold start
+    // (same stop/settle/full-sweep/ramp-from-rest), just acknowledged
+    // "ok mq" -- the eventual completion is still "mp done ..." once
+    // whatever gets queued behind it (if anything, before then) drains.
+    motion_cancel_move();
+    dda_stop();
+    if (!plan_mp_leg(x, y, z, j4_deg, j4_mode, g, speed_us, /*splice=*/false,
+                     /*full_feasibility=*/true)) {
+      return false;
+    }
+    Serial.println(F("ok mq"));
+    return mp_continue_path();
+  }
+
+  const MpWaypoint wp{x, y, z, j4_deg, j4_mode, g, speed_us};
+  if (!mq_queue_push(wp)) {
+    Serial.print(F("err mq full "));
+    Serial.println(MQ_QUEUE_CAPACITY);
+    return false;
+  }
+  Serial.print(F("ok mq queued "));
+  Serial.println(mq_count);
+  return true;
 }
 
 void motion_poll_move_done() {

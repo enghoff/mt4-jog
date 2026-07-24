@@ -87,6 +87,11 @@ static const int32_t MT4_J2_J3_SUM_MIN = -200L;
 /* Max path pieces for a routed `mp` move: radial onto a route cylinder +
  * entry tangent + arc + exit tangent (+ optional radial in). */
 static const uint8_t MP_MAX_PIECES = 5;
+/* `mq` waypoint queue: pending legs behind whatever is currently executing
+ * (an `mp`/`mq` leg already in flight). Sized well above a typical
+ * pick/stack cycle (roughly 4-6 legs); each entry is a handful of bytes, so
+ * this is cheap on SRAM even at this headroom. */
+static const uint8_t MQ_QUEUE_CAPACITY = 8;
 /* When the keep-out arc at R=140 would violate soft joint limits (common
  * at high Z), `mp` retries the same tangent-arc-tangent topology at these
  * larger radii until a joint-feasible route is found. */

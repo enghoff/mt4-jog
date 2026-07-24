@@ -16,6 +16,7 @@ from mt4_jog.joints import (
     J2_HOME_PULLOFF_STEPS,
     JOG_SPEED_MAX_US,
     JOG_SPEED_MIN_US,
+    MQ_QUEUE_CAPACITY,
 )
 from mt4_jog.serial import (
     FirmwareNotReadyError,
@@ -62,6 +63,28 @@ POLL_WAIT_S = 0.3
 
 class Mt4ClientError(Exception):
     """Raised when the arm is unreachable or returns an unexpected response."""
+
+
+def _j4_wire_token(j4: float | str | None) -> str:
+    """Wire form of a move's J4 field: a number, or a firmware sentinel.
+
+    None / "hold" -> `h`: hold the world yaw the arm has when the leg is
+    planned. "wrist" -> `w`: hold the J4 *joint* angle across the leg's J1
+    swing (what big base swings need -- a world hold there drives joint
+    J4 = world - j1 past its soft limits; firmware-native version of
+    pickplace.j4_preserve_wrist). Both resolve firmware-side at leg-plan
+    time, so no `?` status probe is needed and queued legs resolve against
+    wherever the previous leg actually ended.
+    """
+    if j4 is None or j4 == "hold":
+        return "h"
+    if j4 == "wrist":
+        return "w"
+    if isinstance(j4, str):
+        raise Mt4ClientError(
+            f"j4 must be a number, None, 'hold', or 'wrist' (got {j4!r})"
+        )
+    return f"{float(j4):.2f}"
 
 
 class Mt4Client:
@@ -372,17 +395,23 @@ class Mt4Client:
         x: float,
         y: float,
         z: float,
-        j4: float | None = None,
+        j4: float | str | None = None,
         grip: int = 0,
         speed_us: int = 0,
         timeout: float = MOVE_TIMEOUT_S,
     ) -> dict[str, object]:
         """Absolute Cartesian move (`mp`). Requires homing this session.
 
-        `grip=0` leaves the gripper unchanged (firmware convention). When
-        `j4` is left as None, it defaults to the arm's *current* world-frame
-        yaw, which makes the firmware hold gripper orientation fixed during
-        the move (same as `orient on`).
+        `grip=0` leaves the gripper unchanged (firmware convention). `j4`
+        is a world-frame yaw in degrees, or a firmware-resolved sentinel:
+        None / "hold" keeps the current world yaw through the move (same
+        as `orient on`); "wrist" keeps the J4 *joint* angle across the J1
+        swing (use for large base swings, where a world hold would drive
+        joint J4 past its soft limits). The sentinels resolve on the
+        firmware at plan time, so no `?` status probe round trip is spent
+        here -- homing is validated by the firmware itself ("err not
+        homed" is re-raised as Mt4ClientError to keep this method's
+        pre-flight contract).
         """
         if speed_us and not JOG_SPEED_MIN_US <= speed_us <= JOG_SPEED_MAX_US:
             raise Mt4ClientError(
@@ -396,25 +425,15 @@ class Mt4Client:
             raise Mt4ClientError(
                 f"z={z:.1f} is below ground plane ({GROUND_Z_MM:.1f}mm)"
             )
+        j4_token = _j4_wire_token(j4)
 
         with self._lock:
-            status = self._get_status_unlocked(retries=3)
-            if not status.homed:
-                raise Mt4ClientError(
-                    "Arm has not homed this session -- call home() first"
-                )
-            if j4 is None:
-                if status.tcp is None:
-                    raise Mt4ClientError(
-                        "Could not read current TCP pose to default j4"
-                    )
-                j4 = status.tcp.j4
-
+            self._ensure_connected_unlocked()
             # Firmware line_buf is 64 bytes; full Python float repr of
             # detection XY + j4 + speed easily overflows and truncates mid-
             # token (parse fails with the usage string). Match the firmware's
             # own 0.1mm / 0.1deg reporting precision.
-            cmd = f"mp {x:.2f} {y:.2f} {z:.2f} {j4:.2f} {int(grip)}"
+            cmd = f"mp {x:.2f} {y:.2f} {z:.2f} {j4_token} {int(grip)}"
             if speed_us:
                 cmd += f" {int(speed_us)}"
             if len(cmd) >= 64:
@@ -422,9 +441,253 @@ class Mt4Client:
                     f"mp command exceeds 64-byte firmware line buffer: {cmd!r}"
                 )
             collected = self._send_and_collect(cmd, wait=1.0)
+            if any(line.startswith("err not homed") for line in collected):
+                raise Mt4ClientError(
+                    "Arm has not homed this session -- call home() first"
+                )
             return self._await_completion(
                 done_prefix="mp done", timeout=timeout, collected=collected
             )
+
+    def move_path(
+        self,
+        waypoints: list[tuple[float, float, float]],
+        j4: float | str | None = None,
+        grip: int = 0,
+        speed_us: int = 0,
+        timeout: float = MOVE_TIMEOUT_S,
+    ) -> dict[str, object]:
+        """Move through a sequence of Cartesian waypoints as one continuous
+        firmware-side path, instead of a blocking `move_to()` per point.
+
+        EVERY waypoint (the last included) goes out as `mq`: the first
+        cold-starts if the arm is idle, the rest queue behind it and splice
+        in without the per-waypoint stop/settle/reaccel cycle (see the `mq`
+        protocol doc in firmware/mt4_jog/src/main.cpp for what is and isn't
+        smoothed -- each leg still ramps down near its own end). The last
+        leg must NOT be an `mp`: firmware `mp` mid-flight is an immediate
+        override that drops every still-queued leg and cuts straight from
+        wherever the arm is to its own target -- exactly the corner the
+        queued route exists to avoid.
+
+        Completion: the firmware emits one "mp done pos ..." each time its
+        queue drains -- normally once, at the very end, but a short leg can
+        finish before the next `mq` lands, draining the queue early; that
+        next `mq` then cold-starts a fresh path (acked "ok mq" instead of
+        "ok mq queued N"). So this counts cold-start acks and waits for
+        that many "mp done" lines; anything less risks returning while the
+        arm is still moving (and poisoning the next camera capture).
+
+        `j4` is a world-frame yaw in degrees applied to every leg, or a
+        firmware-resolved sentinel: None / "hold" holds world yaw, "wrist"
+        holds the J4 *joint* angle leg-by-leg across each J1 swing (the
+        firmware resolves either at each leg's OWN plan time, from
+        wherever the previous leg actually ended -- true per-leg wrist
+        behavior, which no up-front host-side value could reproduce; use
+        "wrist" for transit routes with big base swings). No `?` status
+        probe is sent: the firmware validates homing on every `mq` itself
+        ("err not homed" comes back in the failure dict), which also makes
+        this safe to use as the awaited finisher after raw `queue_move()`
+        calls.
+
+        `grip` (if nonzero) fires on the FIRST leg only, matching a single
+        `move_to()` call's semantics -- for a gripper action partway through
+        a route, call `gripper()` directly between `move_path()` calls
+        rather than threading it through here.
+        """
+        if not waypoints:
+            raise Mt4ClientError("move_path: at least one waypoint is required")
+        if len(waypoints) > MQ_QUEUE_CAPACITY + 1:
+            # Worst case (no leg completes while the rest are being sent)
+            # needs len-1 firmware queue slots behind the executing leg.
+            raise Mt4ClientError(
+                f"move_path: at most {MQ_QUEUE_CAPACITY + 1} waypoints per "
+                f"call (firmware `mq` queue holds {MQ_QUEUE_CAPACITY})"
+            )
+        if speed_us and not JOG_SPEED_MIN_US <= speed_us <= JOG_SPEED_MAX_US:
+            raise Mt4ClientError(
+                f"speed_us must be 0 or {JOG_SPEED_MIN_US}-{JOG_SPEED_MAX_US}"
+            )
+        if grip and not GRIPPER_S_OPEN <= grip <= GRIPPER_S_CLOSED:
+            raise Mt4ClientError(
+                f"grip must be 0 (unchanged) or {GRIPPER_S_OPEN}-{GRIPPER_S_CLOSED}"
+            )
+        for x, y, z in waypoints:
+            if z < GROUND_Z_MM - 0.05:
+                raise Mt4ClientError(
+                    f"z={z:.1f} is below ground plane ({GROUND_Z_MM:.1f}mm)"
+                )
+
+        j4_token = _j4_wire_token(j4)
+
+        with self._lock:
+            self._ensure_connected_unlocked()
+
+            def build_cmd(x: float, y: float, z: float, g: int) -> str:
+                cmd = f"mq {x:.2f} {y:.2f} {z:.2f} {j4_token} {int(g)}"
+                if speed_us:
+                    cmd += f" {int(speed_us)}"
+                if len(cmd) >= 64:
+                    raise Mt4ClientError(
+                        f"mq command exceeds 64-byte firmware line buffer: {cmd!r}"
+                    )
+                return cmd
+
+            collected: list[str] = []
+            cold_starts = 0
+            dones = 0
+            saw_ack = False
+            joined_existing = False
+
+            def scan(batch: list[str]) -> str | None:
+                """Fold a batch into the ack/done counters; return an err line."""
+                nonlocal cold_starts, dones, saw_ack, joined_existing
+                for line in batch:
+                    if line.startswith("err"):
+                        return line
+                    if line == "ok mq":
+                        saw_ack = True
+                        cold_starts += 1
+                    elif line.startswith("ok mq queued"):
+                        if not saw_ack:
+                            # Our first waypoint queued behind a path that
+                            # was already in flight before this call (raw
+                            # queue_move() usage); that combined path ends
+                            # with one extra "mp done" of its own.
+                            joined_existing = True
+                        saw_ack = True
+                    elif line.startswith("mp done"):
+                        # A done seen before any ack of ours belongs to a
+                        # pre-existing path draining as we arrived -- our
+                        # first waypoint then cold-starts and its ack (which
+                        # firmware prints synchronously, always before any
+                        # done that could include it) hasn't shown up yet.
+                        if saw_ack:
+                            dones += 1
+                return None
+
+            def expected_dones() -> int:
+                n = cold_starts + (1 if joined_existing else 0)
+                # All acks lost to serial noise: best effort, wait for one
+                # drain rather than returning with the arm still moving.
+                return n if n else 1
+
+            def fail_stopped(error: str) -> dict[str, object]:
+                # Deterministic failure state: `stop` cancels the in-flight
+                # path AND the pending queue without emitting "mp done"
+                # (commands.cpp: stop_jog + motion_cancel_move), so no stray
+                # completion line is left to confuse the next command.
+                collected.extend(self._send_and_collect("stop", wait=COMMAND_WAIT_S))
+                return {"ok": False, "error": error, "lines": collected}
+
+            for i, (x, y, z) in enumerate(waypoints):
+                cmd = build_cmd(x, y, z, grip if i == 0 else 0)
+                batch = self._send_and_collect(cmd, wait=0.5)
+                collected.extend(batch)
+                err = scan(batch)
+                if err is not None:
+                    return fail_stopped(err)
+
+            ser = self._require_serial()
+            deadline = time.monotonic() + timeout
+            while dones < expected_dones():
+                if time.monotonic() > deadline:
+                    return fail_stopped(
+                        f"Timed out waiting for {expected_dones()}x 'mp done'"
+                    )
+                aborted = self._abort_if_interrupted_unlocked(collected)
+                if aborted is not None:
+                    return aborted
+                try:
+                    lines = read_lines(
+                        ser, POLL_WAIT_S, hard_limit=POLL_WAIT_S + READ_HARD_LIMIT_S
+                    )
+                except SerialGoneError as exc:
+                    self._mark_gone_unlocked(exc)
+                    raise
+                collected.extend(lines)
+                err = scan(lines)
+                if err is not None:
+                    return fail_stopped(err)
+
+            # The final pose's "tcp x=..." line trails the last "mp done" by
+            # a few ms and may not have been read yet; grab it so the last
+            # parseable tcp line in `collected` is the final pose, not an
+            # intermediate drain's.
+            try:
+                collected.extend(read_lines(ser, 0.25, hard_limit=0.5))
+            except SerialGoneError as exc:
+                self._mark_gone_unlocked(exc)
+                raise
+            tcp = None
+            for line in reversed(collected):
+                tcp = parse_tcp_line(line)
+                if tcp is not None:
+                    break
+            return {
+                "ok": True,
+                "lines": collected,
+                "tcp": tcp.as_dict() if tcp else None,
+            }
+
+    def queue_move(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        j4: float | str | None = None,
+        grip: int = 0,
+        speed_us: int = 0,
+    ) -> dict[str, object]:
+        """Enqueue one Cartesian waypoint (`mq`) without waiting for it (or
+        anything queued ahead of it) to finish -- the raw primitive
+        `move_path()` is built on. Returns as soon as the firmware acks
+        ("ok mq" / "ok mq queued N" / "err ...").
+
+        `j4` accepts the same field as `move_to()`: a world yaw in degrees,
+        or None/"hold"/"wrist" -- sentinels the firmware resolves when the
+        leg is planned (for a queued leg: from wherever the leg ahead of it
+        ended), so no status probe is sent and an unhomed arm surfaces as
+        {"ok": False, "error": "err not homed"} rather than a raised
+        Mt4ClientError.
+
+        To finish and await a hand-built queue, end with a `move_path()`
+        call (a single-waypoint one works: its leg just queues behind yours
+        and it counts queue-drain completions). Do NOT end with
+        `move_to()`: firmware `mp` sent mid-flight is an immediate override
+        that drops every still-queued leg and cuts straight from wherever
+        the arm is to its own target. An `mq` queue left dangling with
+        nothing awaiting it just sits there, and its eventual "mp done"
+        lands unread in the serial buffer.
+        """
+        if speed_us and not JOG_SPEED_MIN_US <= speed_us <= JOG_SPEED_MAX_US:
+            raise Mt4ClientError(
+                f"speed_us must be 0 or {JOG_SPEED_MIN_US}-{JOG_SPEED_MAX_US}"
+            )
+        if grip and not GRIPPER_S_OPEN <= grip <= GRIPPER_S_CLOSED:
+            raise Mt4ClientError(
+                f"grip must be 0 (unchanged) or {GRIPPER_S_OPEN}-{GRIPPER_S_CLOSED}"
+            )
+        if z < GROUND_Z_MM - 0.05:
+            raise Mt4ClientError(
+                f"z={z:.1f} is below ground plane ({GROUND_Z_MM:.1f}mm)"
+            )
+        j4_token = _j4_wire_token(j4)
+
+        with self._lock:
+            self._ensure_connected_unlocked()
+            cmd = f"mq {x:.2f} {y:.2f} {z:.2f} {j4_token} {int(grip)}"
+            if speed_us:
+                cmd += f" {int(speed_us)}"
+            if len(cmd) >= 64:
+                raise Mt4ClientError(
+                    f"mq command exceeds 64-byte firmware line buffer: {cmd!r}"
+                )
+            lines = self._send_and_collect(cmd, wait=0.5)
+            for line in lines:
+                if line.startswith("err"):
+                    return {"ok": False, "error": line, "lines": lines}
+            return {"ok": True, "lines": lines}
 
     def set_speed(self, speed_us: int) -> dict[str, object]:
         """Set the shared jog/`m`/`mp` step period (`speed <us>`)."""

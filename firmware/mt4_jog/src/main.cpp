@@ -57,22 +57,55 @@
  *       left ENABLED (holding) after the move.
  *
  * Absolute move (bounded, coordinated, Cartesian-linear):
- *   mp <x> <y> <z> <j4> <g> [speed_us]
+ *   mp <x> <y> <z> <j4|h|w> <g> [speed_us]
  *       Move to an absolute TCP position in mm (origin at the base, under
- *       J1's pivot) with a world-frame J4 gripper yaw in degrees and an
- *       absolute gripper S (0 = leave the gripper alone). Optional speed_us
- *       sets the shared step period for the move (700-4000 us, same units as
- *       `speed`; 0 or omitted = leave the current period unchanged). TCP xyz is
- *       interpolated along straight world-frame lines in short segments;
- *       each segment solves closed-form IK (nearest branch to the current
- *       pose) and runs a coordinated joint DDA move. When the commanded J4
- *       matches the pose at move start, gripper yaw is held fixed in
- *       world space (J4 counters J1 1:1, like `orient on`); otherwise J4
- *       is interpolated linearly to the target. Rejected with
- *       "err not homed" unless `home`/`$H` has completed successfully this
- *       session -- absolute coordinates are meaningless against an
- *       unreferenced step counter. Same "ok mp" / async "mp done pos ..."
- *       reply convention as `m`.
+ *       J1's pivot) with a J4 field and an absolute gripper S (0 = leave
+ *       the gripper alone). The J4 field is a world-frame gripper yaw in
+ *       degrees, or one of two sentinels resolved at leg-plan time (see
+ *       Mt4J4Mode in motion.h): `h` holds the world yaw the arm has when
+ *       the leg is planned (continuous orientation hold, no host probe
+ *       needed); `w` holds the J4 *joint* angle across the leg's J1 swing
+ *       (world yaw follows the base -- what big swings need, since a
+ *       world hold there drives joint J4 = world - j1 past soft limits).
+ *       Optional speed_us sets the shared step period for the move
+ *       (700-4000 us, same units as `speed`; 0 or omitted = leave the
+ *       current period unchanged). TCP xyz is interpolated along straight
+ *       world-frame lines in short segments; each segment solves
+ *       closed-form IK (nearest branch to the current pose) and runs a
+ *       coordinated joint DDA move. When the resolved J4 matches the pose
+ *       at move start, gripper yaw is held fixed in world space (J4
+ *       counters J1 1:1, like `orient on`); otherwise J4 is interpolated
+ *       linearly to the target. Rejected with "err not homed" unless
+ *       `home`/`$H` has completed successfully this session -- absolute
+ *       coordinates are meaningless against an unreferenced step counter.
+ *       Same "ok mp" / async "mp done pos ..." reply convention as `m`.
+ *
+ * Queued absolute move (multi-waypoint path, no per-waypoint round trip):
+ *   mq <x> <y> <z> <j4|h|w> <g> [speed_us]
+ *       Same arguments/validation as `mp` (sentinel J4 modes included --
+ *       for a queued leg they resolve when the leg is POPPED and planned,
+ *       against wherever the previous leg actually ended, which is what
+ *       makes per-leg wrist behavior possible without host round trips). If the arm is idle this behaves
+ *       exactly like `mp` (cold start), just acknowledged "ok mq". If an
+ *       `mp`/`mq` move is already executing, the waypoint is appended to a
+ *       small pending queue instead (MQ_QUEUE_CAPACITY deep; "err mq full
+ *       N" beyond that, "ok mq queued N" on accept) and picked up -- without
+ *       stopping -- the moment the leg currently running finishes its
+ *       segments, the same no-stop splice `mp`'s in-flight retarget uses.
+ *       Unlike a live `mp` retarget, each queued leg gets the *full*
+ *       keep-out/soft-limit route feasibility check a cold-start `mp` runs
+ *       (queued waypoints are host-planned jumps, e.g. routing around a
+ *       cube stack, not a live tracker's small corrections); a leg that
+ *       fails that check aborts the whole remaining queue, not just itself.
+ *       Every leg still ramps down near its own end before ramping back up
+ *       for the next (no flat single cruise across the whole queue yet) --
+ *       what this removes is the per-waypoint stop/settle/reaccel cycle and
+ *       serial round trip, executing exactly the route the host queued
+ *       instead of the firmware re-deriving its own chord mid-flight. `mp`
+ *       sent while a queue is in flight keeps its existing override
+ *       behavior (retarget to the new target immediately) and drops
+ *       whatever was still queued. The whole queue's completion reuses
+ *       "mp done pos ...", same as a plain `mp`.
  *
  *   home [j1 j2]    widen J2/J3 off their min-angle extremes, home J1 (seek
  *                     I21, return to center), seek J2 to its raw I20

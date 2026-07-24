@@ -73,21 +73,17 @@ def j4_preserve_wrist(
     return j1_to + (from_j4 - j1_from)
 
 
-def _resolve_travel_j4(
-    client: Mt4Client,
-    x: float,
-    y: float,
-    j4: float | None,
-) -> float:
-    """Explicit j4, or wrist-preserving world yaw from the current TCP."""
-    if j4 is not None:
-        return float(j4)
-    tcp = client.get_tcp()
-    if tcp is None:
-        raise Mt4ClientError("Could not read TCP to resolve wrist-safe j4")
-    return j4_preserve_wrist(
-        x, y, from_x=float(tcp.x), from_y=float(tcp.y), from_j4=float(tcp.j4)
-    )
+def _resolve_travel_j4(j4: float | str | None) -> float | str:
+    """Explicit j4 passes through; None becomes the firmware `w` sentinel.
+
+    `w` holds the J4 *joint* angle across the leg's J1 swing, resolved
+    on-device at leg-plan time -- the firmware-native version of the old
+    host-side TCP probe + j4_preserve_wrist() computation (kept above for
+    reference and tests), with identical endpoint behavior, one less serial
+    round trip per travel, and correct per-leg resolution on queued
+    (`mq`/move_path) waypoints.
+    """
+    return "wrist" if j4 is None else float(j4)
 
 
 def _check(result: dict[str, object], step: str) -> dict[str, object]:
@@ -107,12 +103,12 @@ def _travel(
     z: float,
     step: str,
     *,
-    j4: float | None = None,
+    j4: float | str | None = None,
 ) -> dict[str, object]:
     """Horizontal or lift move at safe travel speed (firmware mp ramp active)."""
     return _check(
         client.move_to(
-            x, y, z, j4=_resolve_travel_j4(client, x, y, j4),
+            x, y, z, j4=_resolve_travel_j4(j4),
             speed_us=calib.travel_speed_us,
         ),
         step,
@@ -161,7 +157,12 @@ def travel_orthogonal(
     *,
     j4: float | None = None,
 ) -> None:
-    """Reach (x, y, z) via vertical-then-horizontal segments (no XYZ diagonal)."""
+    """Reach (x, y, z) via vertical-then-horizontal segments (no XYZ diagonal).
+
+    When both segments are needed they go out as one queued firmware path
+    (move_path) -- same orthogonal track, no stop/settle/reaccel or serial
+    round trip at the corner.
+    """
     tcp = client.get_tcp()
     if tcp is None:
         raise Mt4ClientError(f"{step}: could not read TCP")
@@ -169,12 +170,22 @@ def travel_orthogonal(
     same_z = abs(float(tcp.z) - z) < _Z_EPS_MM
     if same_xy and same_z:
         return
+    if not same_z and not same_xy:
+        _check(
+            client.move_path(
+                [(float(tcp.x), float(tcp.y), z), (x, y, z)],
+                j4=_resolve_travel_j4(j4),
+                speed_us=calib.travel_speed_us,
+            ),
+            step,
+        )
+        return
     if not same_z:
         _travel(
             client, calib, float(tcp.x), float(tcp.y), z,
             f"{step}: vertical", j4=j4,
         )
-    if not same_xy:
+    else:
         _travel(client, calib, x, y, z, f"{step}: horizontal", j4=j4)
 
 
@@ -186,12 +197,12 @@ def _approach(
     z: float,
     step: str,
     *,
-    j4: float | None = None,
+    j4: float | str | None = None,
 ) -> dict[str, object]:
     """Slow final descent near the table (firmware ramp off)."""
     return _check(
         client.move_to(
-            x, y, z, j4=_resolve_travel_j4(client, x, y, j4),
+            x, y, z, j4=_resolve_travel_j4(j4),
             speed_us=calib.approach_speed_us,
         ),
         step,
@@ -219,25 +230,30 @@ def near_camera_park(x: float, y: float) -> bool:
 def retreat_for_camera(client: Mt4Client, calib: Calibration) -> dict[str, object]:
     """Move the TCP to the camera-clear park pose (post-move capture prep).
 
-    Uses vertical-then-horizontal segments so a depart from over a stack
-    cannot clip the column on a diagonal ``mp``.
+    Same orthogonal lift / traverse / drop track as always (a depart from
+    over a stack must never diagonal into the column), but sent as ONE
+    queued firmware path: one TCP read, one blocking call, no
+    stop/settle/reaccel at the two corners -- this used to be up to three
+    probe+move round trips per capture, on the hottest path in every
+    vision loop.
     """
     tcp = client.get_tcp()
     if tcp is None:
         raise Mt4ClientError("retreat to camera park: could not read TCP")
-    z_hi = max(float(tcp.z), CAMERA_PARK_Z, float(calib.safe_z))
-    travel_orthogonal(
-        client, calib, float(tcp.x), float(tcp.y), z_hi,
-        "retreat: lift clear",
-    )
-    travel_orthogonal(
-        client, calib, CAMERA_PARK_X, CAMERA_PARK_Y, z_hi,
-        "retreat: over park",
-    )
-    travel_orthogonal(
-        client, calib, CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z,
-        "retreat: park height",
-    )
+    cx, cy, cz = float(tcp.x), float(tcp.y), float(tcp.z)
+    z_hi = max(cz, CAMERA_PARK_Z, float(calib.safe_z))
+    wps: list[tuple[float, float, float]] = []
+    if z_hi - cz > _Z_EPS_MM:
+        wps.append((cx, cy, z_hi))
+    if math.hypot(cx - CAMERA_PARK_X, cy - CAMERA_PARK_Y) > _XY_EPS_MM:
+        wps.append((CAMERA_PARK_X, CAMERA_PARK_Y, z_hi))
+    if z_hi - CAMERA_PARK_Z > _Z_EPS_MM:
+        wps.append((CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z))
+    if wps:
+        _check(
+            client.move_path(wps, j4="wrist", speed_us=calib.travel_speed_us),
+            "retreat to camera park",
+        )
     return {"ok": True, "parked_at": [CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z]}
 
 

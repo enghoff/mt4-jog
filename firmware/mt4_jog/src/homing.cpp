@@ -109,6 +109,10 @@ static void back_off(uint8_t drive, uint8_t dir, bool home_dir_high, uint32_t n)
 
 void do_home(uint16_t j1_center, uint16_t j2_pull) {
   stop_jog();
+  // Homing rewrites the joint step counters from scratch; a stale
+  // in-flight/queued mp/mq path planned against the pre-home counters must
+  // not be allowed to resume afterward.
+  motion_cancel_move();
   homing_active = true;
   Serial.println(F("home start"));
 

@@ -46,6 +46,10 @@ GRIPPER_S_CLOSED = 285
 JOG_SPEED_MIN_US = 700
 JOG_SPEED_MAX_US = 4000
 
+# Mirror firmware config.h MQ_QUEUE_CAPACITY: pending `mq` waypoints the
+# firmware holds behind the leg currently executing.
+MQ_QUEUE_CAPACITY = 8
+
 
 @dataclass(frozen=True)
 class Joint:

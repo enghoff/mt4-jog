@@ -508,7 +508,17 @@ def routed_travel(
     j4: float | None = None,
     step: str = "stack transit",
 ) -> None:
-    """Travel to (x, y, z) along a StackPlanner route (direct when safe)."""
+    """Travel to (x, y, z) along a StackPlanner route (direct when safe).
+
+    The whole route goes out as one firmware-side `mq` waypoint queue
+    (Mt4Client.move_path()) -- no stop/re-accelerate between waypoints
+    (see the `mq` protocol doc in firmware/mt4_jog/src/main.cpp for what
+    that does and doesn't smooth out). `j4=None` maps to the firmware `w`
+    sentinel: the wrist *joint* angle is held leg-by-leg across each J1
+    swing, resolved on-device from wherever the previous leg actually
+    ended -- the per-leg behavior the old per-waypoint _travel() fallback
+    loop existed to emulate.
+    """
     tcp = client.get_tcp()
     if tcp is None:
         raise Mt4ClientError(f"{step}: could not read TCP")
@@ -521,11 +531,13 @@ def routed_travel(
             f"{step}: no stack-safe route from "
             f"({a[0]:.0f},{a[1]:.0f},{a[2]:.0f}) to ({x:.0f},{y:.0f},{z:.0f})"
         )
-    for i, (wx, wy, wz) in enumerate(wps):
-        _travel(
-            client, calib, wx, wy, wz,
-            f"{step} [{i + 1}/{len(wps)}]", j4=j4,
-        )
+    _check(
+        client.move_path(
+            wps, j4=j4 if j4 is not None else "wrist",
+            speed_us=calib.travel_speed_us,
+        ),
+        step,
+    )
 
 
 def go_camera_park(
