@@ -10,9 +10,17 @@ with the calibrate_height centering
 sequence (yaw-pick → release → lift → rotate J4 90° → re-grip) via
 ``pick_centered``, then placed at the marker's calibrated XY by dead
 reckoning. Placement Z steps by ``cube_height_mm`` from the calibration;
-there is no visual alignment or post-place verification. Stack place/retreat
-moves are vertical-then-horizontal within ``STACK_AXIS_CLEAR_MM`` of the
-site so the gripper cannot clip the growing column on a diagonal ``mp``.
+there is no visual alignment or post-place verification.
+
+Stack motion is planned by ``mt4_vision.stackpath.StackPlanner``: transits
+route the gripper *and* forearm around the growing column, the carry lifts
+diagonally to a stage point beside the stack and hops over the top at a
+hover height fitted under the joint-limit z ceiling (~315mm at the marker
+radii), and the retreat lifts the fingers free of the placed cube while the
+ceiling allows it, switching to a slide-out perpendicular to the jaw axis
+for the top level(s). That slide is what makes level 9 buildable: lifting
+the fingers clear of a 9th cube needs ~324mm of TCP height, which the J3
+soft limit cannot reach.
 """
 
 from __future__ import annotations
@@ -28,13 +36,22 @@ import numpy as np
 
 from jog import console_focused, flush_console_input, key_down
 from mt4_jog.client import Mt4Client, Mt4ClientError
-from mt4_jog.kinematics import JointAnglesDeg, ik_position
 from mt4_vision.calib import DEFAULT_CALIB_PATH, CalibrationError, load_calibration
 from mt4_vision.camera import FrameStream, capture_frame
 from mt4_vision.detect import CubeDetection
+
+# _travel/_approach/_check are pickplace's single-segment movers; the stack
+# executor below sequences them along StackPlanner routes.
 from mt4_vision.pickplace import (
-    STACK_AXIS_CLEAR_MM,
+    CAMERA_PARK_X,
+    CAMERA_PARK_Y,
+    CAMERA_PARK_Z,
+    _approach,
+    _check,
+    _travel,
     home_arm,
+    j4_for_face_align,
+    near_camera_park,
     pick,
     pick_centered,
     place,
@@ -42,6 +59,7 @@ from mt4_vision.pickplace import (
 )
 from mt4_vision.preview import LiveFeed, PreviewStopped
 from mt4_vision.scene import Scene, capture_scene, within_pick_hull
+from mt4_vision.stackpath import StackPlanner
 from mt4_vision.workspace import (
     MAX_REACH_MM,
     MarkerSlot,
@@ -59,18 +77,25 @@ CLEAR_MARGIN_MM = 40.0
 CLEAR_PARK_MM = SITE_CLEAR_MM + CLEAR_MARGIN_MM  # 110mm from marker
 # Finger clearance from other cubes when parking a cleared cube.
 CLEAR_SEP_MM = 45.0
-# Transit clearance above the current release height when carrying over the
-# growing stack (safe_z alone is only ~34mm above the table).
-TRAVEL_ABOVE_MM = 35.0
+# Cleared cubes must stay visible: the parked arm occludes a strip over the
+# J1 keep-out, so a cube dropped near it vanishes from later scans (field
+# case 2026-07-24: a clear to (134,49) at r=143 was never seen again and the
+# build stalled "no reachable cube" with the cube sitting right there).
+CLEAR_MIN_RADIUS_MM = 170.0
 # Settle after retreat before a fresh scene capture.
 CAMERA_SETTLE_S = 0.8
 SITE_CLEAR_ATTEMPTS = 6
 # Camera line-of-sight shadow behind the stack: raised stack tops map
 # (via the 1-cube cube-top homography) to phantom table cubes further from
 # the camera than the site. Ignore pick candidates in that corridor.
-# Measured 2026-07-21 on marker 3: true (179,180) → phantoms ~(115,227)
-# (~79mm along the away-from-camera axis).
-STACK_SHADOW_LATERAL_MM = 45.0
+# Measured 2026-07-21 on marker 3, level 4: true (179,180) -> phantom
+# ~(115,227) (~79mm along, ~8mm lateral). The phantom spreads laterally as
+# well as along as the stack grows, not just along -- field case 2026-07-24
+# marker 2 level 6 put a phantom at ~49mm lateral, past the old fixed 45mm
+# cutoff, and it slipped through as a real pick candidate. Both axes now
+# scale with stack height.
+STACK_SHADOW_LATERAL_MIN_MM = 45.0
+STACK_SHADOW_LATERAL_PER_LEVEL_MM = 10.0
 STACK_SHADOW_ALONG_MIN_MM = 25.0
 STACK_SHADOW_ALONG_PER_LEVEL_MM = 35.0
 STACK_SHADOW_ALONG_FLOOR_MM = 90.0
@@ -189,7 +214,8 @@ def _clear_landing_ok(
     """True when a clear drop should remain a later pick candidate."""
     if not is_mp_reachable_xy(tx, ty):
         return False
-    if math.hypot(tx, ty) > MAX_REACH_MM:
+    r = math.hypot(tx, ty)
+    if r > MAX_REACH_MM or r < CLEAR_MIN_RADIUS_MM:
         return False
     if any(dist_mm(tx, ty, ox, oy) < CLEAR_SEP_MM for ox, oy in occupied):
         return False
@@ -318,11 +344,85 @@ def in_stack_camera_shadow(
         STACK_SHADOW_ALONG_FLOOR_MM,
         stack_levels * STACK_SHADOW_ALONG_PER_LEVEL_MM,
     )
+    lateral_max = max(
+        STACK_SHADOW_LATERAL_MIN_MM,
+        stack_levels * STACK_SHADOW_LATERAL_PER_LEVEL_MM,
+    )
     return (
         along >= STACK_SHADOW_ALONG_MIN_MM
         and along <= along_max
-        and lateral <= STACK_SHADOW_LATERAL_MM
+        and lateral <= lateral_max
     )
+
+
+# Off-corridor detections this close to the site mid-build mean a cube is
+# lying beside / leaning against the column. Closer readings are the stack's
+# own base; corridor-aligned ones are mapped side faces of the stacked cubes
+# themselves (levels 1..built each cast one, at ~26mm/level along the
+# camera LOS) and must never be treated as fallen -- they hold perfectly
+# still as the stack grows, unlike the top phantom. A "static in corridor
+# means fallen" rule was tried 2026-07-24 and false-positived on exactly
+# those side faces; only the off-corridor test is trustworthy.
+NEAR_SITE_MIN_MM = 25.0
+CORRIDOR_ALIGN_COS = math.cos(math.radians(35.0))
+
+
+def stack_integrity_issues(
+    scene: Scene,
+    sx: float,
+    sy: float,
+    behind_u: tuple[float, float] | None,
+) -> list[str]:
+    """Evidence that the column shed a cube: a detection beside the site
+    that is not corridor-aligned (i.e. cannot be the stack's own mapped
+    side faces)."""
+    issues: list[str] = []
+    for c in scene.raw_cubes:
+        if c.x is None or c.y is None:
+            continue
+        dx, dy = float(c.x) - sx, float(c.y) - sy
+        d = math.hypot(dx, dy)
+        if not (NEAR_SITE_MIN_MM <= d < SITE_CLEAR_MM):
+            continue
+        aligned = (
+            behind_u is not None
+            and (dx * behind_u[0] + dy * behind_u[1]) / max(d, 1e-6)
+            >= CORRIDOR_ALIGN_COS
+        )
+        if not aligned:
+            issues.append(
+                f"{c.color} cube {d:.0f}mm from the site at "
+                f"({c.x:.0f},{c.y:.0f}) -- likely shed from the stack"
+            )
+    return issues
+
+
+# A pick "succeeded" but a same-color cube still sits within this radius of
+# the pick spot on the next scan: the grab missed (edge-of-hull vision skew
+# or lost steps) and usually just shoved the cube. Pick targets require
+# 45mm clearance from every other cube, so a same-color detection this
+# close can only be the target itself. Missed picks correlate with lost
+# steps, so recovery is a re-home before retrying.
+PICK_FAIL_RADIUS_MM = 30.0
+PICK_FAIL_MAX_RETRIES = 3
+
+
+def pick_missed(
+    scene: Scene, last_pick: tuple[str, float, float] | None
+) -> tuple[float, float] | None:
+    """XY of the not-actually-picked cube, or None when the pick took."""
+    if last_pick is None:
+        return None
+    color, px, py = last_pick
+    for c in scene.raw_cubes:
+        if (
+            c.color == color
+            and c.x is not None
+            and c.y is not None
+            and dist_mm(float(c.x), float(c.y), px, py) <= PICK_FAIL_RADIUS_MM
+        ):
+            return (float(c.x), float(c.y))
+    return None
 
 
 def stack_candidates(
@@ -389,15 +489,124 @@ def release_z_for_level(calib, level: int) -> float:
 
     Stack top before placing ``level`` (1-based) is the top of the uppermost
     cube already seated -- ``pick_z + (level-1)*cube_height_mm`` in the same
-    TCP frame as table grips (empty marker when level==1).
+    TCP frame as table grips (empty marker when level==1). Mirrors
+    ``StackPlanner.release_z``.
     """
     stack_top = float(calib.pick_z) + (level - 1) * float(calib.cube_height_mm)
     return stack_top + 4.0
 
 
-def travel_z_for_level(calib, level: int) -> float:
-    rz = release_z_for_level(calib, level)
-    return max(float(calib.safe_z), rz + TRAVEL_ABOVE_MM)
+def routed_travel(
+    client: Mt4Client,
+    calib,
+    planner: StackPlanner,
+    x: float,
+    y: float,
+    z: float,
+    levels: int,
+    *,
+    j4: float | None = None,
+    step: str = "stack transit",
+) -> None:
+    """Travel to (x, y, z) along a StackPlanner route (direct when safe)."""
+    tcp = client.get_tcp()
+    if tcp is None:
+        raise Mt4ClientError(f"{step}: could not read TCP")
+    a = (float(tcp.x), float(tcp.y), float(tcp.z))
+    if math.dist(a, (x, y, z)) < 1.0:
+        return
+    wps = planner.route(a, (x, y, z), levels)
+    if wps is None:
+        raise Mt4ClientError(
+            f"{step}: no stack-safe route from "
+            f"({a[0]:.0f},{a[1]:.0f},{a[2]:.0f}) to ({x:.0f},{y:.0f},{z:.0f})"
+        )
+    for i, (wx, wy, wz) in enumerate(wps):
+        _travel(
+            client, calib, wx, wy, wz,
+            f"{step} [{i + 1}/{len(wps)}]", j4=j4,
+        )
+
+
+def go_camera_park(
+    client: Mt4Client, calib, planner: StackPlanner, levels: int
+) -> None:
+    """Move to the camera park pose; column-aware once the stack exists."""
+    if levels > 0:
+        routed_travel(
+            client, calib, planner,
+            CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z, levels,
+            step="park transit",
+        )
+    else:
+        retreat_for_camera(client, calib)
+
+
+def place_on_stack(
+    client: Mt4Client,
+    calib,
+    planner: StackPlanner,
+    level: int,
+    *,
+    park_xy: tuple[float, float],
+) -> None:
+    """Carry the held cube to the site and seat it as ``level``.
+
+    Assumes ``level - 1`` cubes are already stacked and the cube is held at
+    the pick location around ``safe_z``. Sequence:
+
+    1. carry: routed (usually one diagonal ``mp``) to a stage point
+       STAGE_OFFSET_MM beside the stack, arriving at hover height
+    2. hop over the stack top at hover, slow descend, release
+    3. retreat: lift free when the z ceiling allows the fingertips above
+       the placed cube (levels <= ~8), else lift a few mm and slide out
+       perpendicular to the jaw axis so the open fingers sweep off the
+       cube faces without pushing it (level 9's only option)
+    """
+    sx, sy = planner.sx, planner.sy
+    built = level - 1
+    rz = planner.release_z(level)
+    hz = planner.hover_z(level)
+    if hz is None:
+        raise Mt4ClientError(f"level {level}: hover height unreachable")
+    # Same axis-square wrist as the old along-arm place (assumes j4zero).
+    j4 = j4_for_face_align(0.0, current_j4_deg=None, x=sx, y=sy)
+    tcp = client.get_tcp()
+    if tcp is None:
+        raise Mt4ClientError("stack place: could not read TCP")
+    stage = planner.stage_point(
+        hz, built, prefer_xy=(float(tcp.x), float(tcp.y))
+    )
+    if stage is None:
+        raise Mt4ClientError(f"level {level}: no reachable hover stage")
+    routed_travel(
+        client, calib, planner, stage[0], stage[1], hz, built,
+        j4=j4, step=f"level {level} carry",
+    )
+    _travel(client, calib, sx, sy, hz, "hover over stack", j4=j4)
+    _approach(client, calib, sx, sy, rz, "descend to stack release", j4=j4)
+    _check(client.gripper(calib.grip_open_s), "stack release")
+    fz = planner.free_retreat_z(level)
+    if fz is not None:
+        _travel(client, calib, sx, sy, fz, "retreat lift", j4=j4)
+        exit_pt = planner.stage_point(fz, level, prefer_xy=park_xy)
+        if exit_pt is not None:
+            _travel(
+                client, calib, exit_pt[0], exit_pt[1], fz,
+                "retreat clear", j4=j4,
+            )
+    else:
+        sz = planner.slide_z(level)
+        exits = planner.slide_exits(j4, level, prefer_xy=park_xy)
+        if not exits:
+            raise Mt4ClientError(f"level {level}: no jaw-safe slide retreat")
+        if sz > rz + 0.5:
+            _travel(client, calib, sx, sy, sz, "slide lift", j4=j4)
+        # Slow and wrist-locked: the fingers still straddle the placed cube.
+        _approach(
+            client, calib, exits[0][0], exits[0][1], sz,
+            "slide clear of stack", j4=j4,
+        )
 
 
 def main() -> int:
@@ -416,8 +625,19 @@ def main() -> int:
     parser.add_argument(
         "--max-levels",
         type=int,
-        default=8,
-        help="stop after this many levels (default 8)",
+        default=9,
+        help="stop after this many levels (default 9; capped by the "
+        "joint-limit z ceiling at the site)",
+    )
+    parser.add_argument(
+        "--resume",
+        type=int,
+        default=0,
+        metavar="N",
+        help="a stack of N levels already stands on the marker: skip the "
+        "site-clear phase and continue with level N+1 (the operator is "
+        "trusted about N -- a wrong value will crash the gripper into or "
+        "release cubes above the real stack)",
     )
     parser.add_argument(
         "--preview", action="store_true",
@@ -450,11 +670,28 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    if near_camera_park(sx, sy):
+        print(
+            f"marker {marker.marker_id} at ({sx:.1f},{sy:.1f}) sits under the "
+            f"camera park ({CAMERA_PARK_X:.0f},{CAMERA_PARK_Y:.0f}) -- the arm "
+            "parks there between moves and would hit the stack; use another "
+            "marker",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.resume < 0 or args.resume >= args.max_levels:
+        print(
+            f"--resume {args.resume} must be in 0..{args.max_levels - 1}",
+            file=sys.stderr,
+        )
+        return 1
 
     camera_kwargs = {} if args.camera is None else {"index": args.camera}
     client = Mt4Client() if not args.port else Mt4Client(port=args.port)
     cube_h = float(calib.cube_height_mm)
-    home_q = JointAnglesDeg(0.0, 0.0, 0.0, 0.0)
+    planner = StackPlanner(calib, sx, sy)
+    built = int(args.resume)
     watcher: _HomeKeyWatcher | None = None
 
     # A live feed and this script's own "look now" captures can't both open
@@ -476,7 +713,7 @@ def main() -> int:
             if live_feed.stopped_by_user.is_set():
                 raise PreviewStopped()
             live_feed.clear_target()
-        retreat_for_camera(client, calib)
+        go_camera_park(client, calib, planner, built)
         time.sleep(CAMERA_SETTLE_S)
         frame = stream.fresh(min_advance=2) if stream is not None else capture_frame(**camera_kwargs)
         scene = capture_scene(calib, frame)
@@ -508,20 +745,68 @@ def main() -> int:
             f"Stack site: marker {marker.marker_id} at "
             f"({sx:.1f},{sy:.1f}), cube_height={cube_h:.1f}mm"
         )
+
+        # Joint-limit preflight: how many levels fit under the z ceiling
+        # here, and from which level the retreat must slide instead of lift.
+        target_levels = 0
+        first_slide: int | None = None
+        for level in range(1, args.max_levels + 1):
+            if planner.hover_z(level) is None:
+                break
+            if first_slide is None and planner.free_retreat_z(level) is None:
+                first_slide = level
+            target_levels = level
+        if target_levels == 0:
+            print(
+                f"joint z ceiling at this site is {planner.site_max_z:.0f}mm "
+                "-- cannot even hover level 1",
+                file=sys.stderr,
+            )
+            return 1
+        retreat_note = (
+            "lift-free retreats"
+            if first_slide is None
+            else f"slide retreat from level {first_slide}"
+        )
+        cap_note = (
+            ""
+            if target_levels == args.max_levels
+            else f" (z ceiling caps requested {args.max_levels})"
+        )
+        print(
+            f"Plan: {target_levels} level(s), z ceiling "
+            f"{planner.site_max_z:.0f}mm, {retreat_note}{cap_note}"
+        )
         print("Ctrl+C to stop, H (this window/terminal focused) to re-home before the next step.")
         watcher = _HomeKeyWatcher(client)
         watcher.start()
 
         all_markers = marker_slots_from_calibration(calib)
         behind_u = stack_shadow_behind_unit(calib, sx, sy)
-        shadow_levels = max(1, int(args.max_levels))
+        shadow_levels = max(1, int(target_levels))
 
         # --- Clear cubes near the stack marker ---------------------------------
+        if built > 0:
+            print(
+                f"Resuming with {built} level(s) standing -- skipping site clear"
+            )
+        last_clear: tuple[str, float, float] | None = None
         for attempt in range(1, SITE_CLEAR_ATTEMPTS + 1):
+            if built > 0:
+                break  # resuming onto a standing stack; skips the else too
             if _check_home(client, watcher):
                 continue
             try:
                 scene = snap_scene(f"Clearing site (attempt {attempt}/{SITE_CLEAR_ATTEMPTS})")
+                miss = pick_missed(scene, last_clear)
+                last_clear = None
+                if miss is not None:
+                    print(
+                        f"  clear pick missed -- cube still at "
+                        f"({miss[0]:.0f},{miss[1]:.0f}); homing before retry"
+                    )
+                    _run_home(client, watcher)
+                    continue
                 near = cubes_near_site(scene, sx, sy)
                 if not near:
                     print("Site clear")
@@ -569,6 +854,7 @@ def main() -> int:
                     yaw_deg=target.yaw_deg,
                 )
                 place(client, calib, dest[0], dest[1])
+                last_clear = (target.color, float(target.x), float(target.y))
             except Mt4ClientError as exc:
                 if _home_requested(watcher, exc):
                     _run_home(client, watcher)
@@ -595,117 +881,173 @@ def main() -> int:
                 return 1
 
         # --- Build the stack ---------------------------------------------------
-        built = 0
+        # Single loop keyed off ``built``: each pass scans, verifies the
+        # previous pick actually took its cube (homing + retrying the level
+        # when it missed -- a miss usually means lost steps), then picks and
+        # places ``built + 1``. The loop runs one extra pass after the last
+        # placement so the final level is verified too.
         current_color: str | None = None
-        for level in range(1, args.max_levels + 1):
-            tz = travel_z_for_level(calib, level)
-            rz = release_z_for_level(calib, level)
-            if ik_position(sx, sy, tz, near=home_q) is None:
-                print(
-                    f"level {level}: travel height {tz:.0f}mm unreachable -- stopping"
+        integrity_failed = False
+        last_pick: tuple[str, float, float] | None = None
+        pick_fail_streak = 0
+        while built < target_levels or last_pick is not None:
+            level = built + 1
+            if _check_home(client, watcher):
+                continue
+            try:
+                stage_label = (
+                    "Final verification"
+                    if built >= target_levels
+                    else f"Level {level}/{target_levels}: scanning"
                 )
-                break
+                scene = snap_scene(stage_label)
 
-            # Inner loop: resume after "no cubes" re-snaps the same level.
-            quit_stack = False
-            while True:
-                if _check_home(client, watcher):
-                    continue
-                try:
-                    scene = snap_scene(f"Level {level}/{args.max_levels}: scanning")
-                    # Drop stack-top phantoms behind the site along the camera LOS
-                    # (they appear once level 1+ is built).
-                    shadowed = []
-                    behind_u = (
-                        stack_shadow_behind_unit(calib, sx, sy) if built > 0 else None
+                # Did the previous pick actually take its cube?
+                miss = pick_missed(scene, last_pick)
+                if miss is not None:
+                    missed_color = last_pick[0]
+                    last_pick = None
+                    built -= 1
+                    pick_fail_streak += 1
+                    print(
+                        f"level {built + 1}: pick of {missed_color} missed -- "
+                        f"cube still at ({miss[0]:.0f},{miss[1]:.0f}); homing "
+                        f"and retrying "
+                        f"({pick_fail_streak}/{PICK_FAIL_MAX_RETRIES})",
+                        file=sys.stderr,
                     )
-                    if behind_u is not None:
-                        for c in scene.pickable(scene.cubes):
-                            if dist_mm(float(c.x), float(c.y), sx, sy) < SITE_CLEAR_MM:
-                                continue
-                            if in_stack_camera_shadow(
-                                float(c.x), float(c.y), sx, sy, behind_u,
-                                stack_levels=built,
-                            ):
-                                shadowed.append(c)
-                    if shadowed:
+                    if pick_fail_streak >= PICK_FAIL_MAX_RETRIES:
                         print(
-                            "Ignoring stack-shadow phantom(s): "
-                            + ", ".join(
-                                f"{c.color}({c.x:.0f},{c.y:.0f})" for c in shadowed
-                            )
+                            "Too many missed picks in a row -- stopping.",
+                            file=sys.stderr,
                         )
-                    cands = stack_candidates(
-                        scene, sx, sy, calib=calib, stack_levels=built,
-                    )
-                    if not cands:
-                        print(f"level {level}: no reachable cube outside site")
-                        try:
-                            reply = input(
-                                "Move cubes into arm reach, then Enter to resume "
-                                "(q to quit): "
-                            ).strip().lower()
-                        except EOFError:
-                            quit_stack = True
-                            break
-                        if reply in ("q", "quit"):
-                            quit_stack = True
-                            break
-                        print("Resuming...")
-                        continue
+                        break
+                    _run_home(client, watcher)
+                    continue
+                last_pick = None
+                pick_fail_streak = 0
+                if built >= target_levels:
+                    break
 
-                    cube, current_color = select_stack_cube(cands, current_color)
-                    print(
-                        f"\nLevel {level}: align-pick {cube.color} at "
-                        f"({cube.x:.1f},{cube.y:.1f}) yaw={cube.yaw_deg:.0f}"
-                    )
-                    snap_decision(
-                        cube, f"Level {level}/{args.max_levels}: picking {cube.color}",
-                    )
-                    pick_centered(
-                        client, calib, float(cube.x), float(cube.y),
-                        yaw_deg=cube.yaw_deg,
-                    )
-                    print(
-                        f"  placing at marker ({sx:.1f},{sy:.1f}) "
-                        f"release_z={rz:.1f} travel_z={tz:.1f}"
-                    )
-                    place(
-                        client, calib, sx, sy,
-                        release_z=rz,
-                        travel_z=tz,
-                        along_arm=True,
-                        # No XYZ diagonal inside this radius of the stack axis.
-                        axis_clear_mm=STACK_AXIS_CLEAR_MM,
-                    )
-                except Mt4ClientError as exc:
-                    if _home_requested(watcher, exc):
-                        _run_home(client, watcher)
-                        continue
-                    print(f"  level {level} failed: {exc}", file=sys.stderr)
-                    return 1
-                built = level
-                print(f"  placed level {level}")
-                break
+                rz = planner.release_z(level)
+                hz = planner.hover_z(level)
+                if hz is None:  # preflight guarantees this; belt and braces
+                    print(f"level {level}: hover height unreachable -- stopping")
+                    break
 
-            if quit_stack:
-                break
+                # Drop stack-top phantoms behind the site along the camera LOS
+                # (they appear once level 1+ is built).
+                shadowed = []
+                behind_u = (
+                    stack_shadow_behind_unit(calib, sx, sy) if built > 0 else None
+                )
+                if built > 0:
+                    issues = stack_integrity_issues(scene, sx, sy, behind_u)
+                    if issues:
+                        print(
+                            "Stack integrity check failed:\n  "
+                            + "\n  ".join(issues),
+                            file=sys.stderr,
+                        )
+                        print(
+                            f"Stopping -- the stack likely shed a cube "
+                            f"around level {built}; the physical stack "
+                            "may be shorter than reported.",
+                            file=sys.stderr,
+                        )
+                        integrity_failed = True
+                        break
+                if behind_u is not None:
+                    for c in scene.pickable(scene.cubes):
+                        if dist_mm(float(c.x), float(c.y), sx, sy) < SITE_CLEAR_MM:
+                            continue
+                        if in_stack_camera_shadow(
+                            float(c.x), float(c.y), sx, sy, behind_u,
+                            stack_levels=built,
+                        ):
+                            shadowed.append(c)
+                if shadowed:
+                    print(
+                        "Ignoring stack-shadow phantom(s): "
+                        + ", ".join(
+                            f"{c.color}({c.x:.0f},{c.y:.0f})" for c in shadowed
+                        )
+                    )
+                cands = stack_candidates(
+                    scene, sx, sy, calib=calib, stack_levels=built,
+                )
+                if not cands:
+                    print(f"level {level}: no reachable cube outside site")
+                    try:
+                        reply = input(
+                            "Move cubes into arm reach, then Enter to resume "
+                            "(q to quit): "
+                        ).strip().lower()
+                    except EOFError:
+                        break
+                    if reply in ("q", "quit"):
+                        break
+                    print("Resuming...")
+                    continue
+
+                cube, current_color = select_stack_cube(cands, current_color)
+                print(
+                    f"\nLevel {level}: align-pick {cube.color} at "
+                    f"({cube.x:.1f},{cube.y:.1f}) yaw={cube.yaw_deg:.0f}"
+                )
+                snap_decision(
+                    cube, f"Level {level}/{target_levels}: picking {cube.color}",
+                )
+                if built > 0:
+                    # Column-aware transit to the pick before descending.
+                    routed_travel(
+                        client, calib, planner,
+                        float(cube.x), float(cube.y), calib.safe_z,
+                        built, step="approach pick",
+                    )
+                pick_centered(
+                    client, calib, float(cube.x), float(cube.y),
+                    yaw_deg=cube.yaw_deg,
+                )
+                print(
+                    f"  placing at marker ({sx:.1f},{sy:.1f}) "
+                    f"release_z={rz:.1f} hover_z={hz:.1f}"
+                )
+                place_on_stack(
+                    client, calib, planner, level,
+                    park_xy=(CAMERA_PARK_X, CAMERA_PARK_Y),
+                )
+            except Mt4ClientError as exc:
+                if _home_requested(watcher, exc):
+                    _run_home(client, watcher)
+                    continue
+                print(f"  level {level} failed: {exc}", file=sys.stderr)
+                return 1
+            last_pick = (cube.color, float(cube.x), float(cube.y))
+            built = level
+            print(f"  placed level {level}")
 
         print(f"\nBuilt {built} level(s) on marker {marker.marker_id}")
+        if integrity_failed:
+            print(
+                "Warning: stack integrity was compromised -- the physical "
+                "stack is likely shorter than the built count.",
+                file=sys.stderr,
+            )
         try:
-            retreat_for_camera(client, calib)
+            go_camera_park(client, calib, planner, built)
         except Mt4ClientError as exc:
             if _home_requested(watcher, exc):
                 _run_home(client, watcher)
             else:
                 print(exc, file=sys.stderr)
-        return 0
+        return 1 if integrity_failed else 0
     except Mt4ClientError as exc:
         print(exc, file=sys.stderr)
         return 1
     except PreviewStopped:
         print("Preview window closed (q/Esc) -- stopping.")
-        retreat_for_camera(client, calib)
+        go_camera_park(client, calib, planner, built)
         return 0
     finally:
         if watcher is not None:

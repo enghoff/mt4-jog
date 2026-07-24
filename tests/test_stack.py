@@ -19,7 +19,6 @@ from stack_cubes import (
     release_z_for_level,
     stack_candidates,
     stack_shadow_behind_unit,
-    travel_z_for_level,
 )
 
 
@@ -87,6 +86,18 @@ def test_clear_aside_skips_stack_shadow_corridor():
     )
 
 
+def test_clear_aside_stays_out_of_arm_occlusion_strip():
+    """Clears must not land near the keep-out where the parked arm hides
+    them from the camera (field case: (134,49) vanished from scans)."""
+    from stack_cubes import CLEAR_MIN_RADIUS_MM
+
+    # Cube on the base side of marker 3: the straight push aims at the
+    # occlusion strip, so an alternative landing must be chosen.
+    dest = clear_aside_xy(153.6, 156.9, 120.0, 120.0, occupied=[])
+    assert dest is not None
+    assert math.hypot(dest[0], dest[1]) >= CLEAR_MIN_RADIUS_MM
+
+
 def test_choose_park_slot_requires_clear_margin():
     # (200, 60) is ~70mm from marker 4 -- inside CLEAR_PARK_MM, must reject.
     scene = SimpleNamespace(
@@ -134,14 +145,77 @@ def test_stack_shadow_rejects_marker3_phantom():
     assert real in cands
 
 
-def test_release_and_travel_z_step_by_cube_height():
+def test_stack_shadow_lateral_widens_with_level():
+    """Field case 2026-07-24, marker 2 level 6: true site (161.9,-149.6),
+    phantom read at (4.4,-203.7) -- 49mm lateral, past the old fixed 45mm
+    corridor width (calibrated from an 8mm lateral offset at level 4). The
+    tolerance must widen with stack height on both axes, not just along."""
+    from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
+
+    calib = load_calibration(DEFAULT_CALIB_PATH)
+    sx, sy = 161.9, -149.6
+    behind = stack_shadow_behind_unit(calib, sx, sy)
+    assert behind is not None
+    assert in_stack_camera_shadow(4.4, -203.7, sx, sy, behind, stack_levels=6)
+    # At low levels the old narrow corridor still applies -- a cube this far
+    # laterally off the LOS at level 1 is a real, pickable cube.
+    assert not in_stack_camera_shadow(4.4, -203.7, sx, sy, behind, stack_levels=1)
+
+
+def test_stack_integrity_flags_fallen_cubes_not_side_faces():
+    """Field cases 2026-07-24: a blue lying 41mm off-corridor beside marker
+    3 was a fallen cube (flag); the stack's own corridor-aligned side-face
+    detections -- static forever as the stack grows -- must never be
+    flagged (a static-in-corridor rule false-positived on exactly those,
+    marker 2 level 5: red read at (142,-164), 25mm corridor-aligned)."""
+    from mt4_vision.calib import DEFAULT_CALIB_PATH, load_calibration
+    from stack_cubes import stack_integrity_issues
+
+    calib = load_calibration(DEFAULT_CALIB_PATH)
+
+    # Off-corridor cube beside the site (fallen against the column).
+    sx, sy = 153.6, 156.9
+    behind = stack_shadow_behind_unit(calib, sx, sy)
+    assert behind is not None
+    beside = SimpleNamespace(x=189.0, y=136.0, color="blue")
+    assert stack_integrity_issues(
+        SimpleNamespace(raw_cubes=[beside]), sx, sy, behind,
+    )
+
+    # Marker 2: corridor-aligned near-site side face of the stack's own
+    # low levels, plus a far corridor phantom -- both fine.
+    sx2, sy2 = 161.9, -149.6
+    behind2 = stack_shadow_behind_unit(calib, sx2, sy2)
+    assert behind2 is not None
+    side_face = SimpleNamespace(x=142.0, y=-164.0, color="red")
+    far_phantom = SimpleNamespace(x=56.0, y=-182.0, color="blue")
+    assert stack_integrity_issues(
+        SimpleNamespace(raw_cubes=[side_face, far_phantom]), sx2, sy2, behind2,
+    ) == []
+
+
+def test_pick_missed_detects_shoved_cube():
+    """Field case 2026-07-24: pick at (55.8,195) shoved the red to (68,203)
+    instead of gripping -- the same-color detection near the pick spot is
+    the miss signature. A same-color cube 45mm+ away (another cube's legal
+    clearance) must not trigger it."""
+    from stack_cubes import pick_missed
+
+    shoved = SimpleNamespace(x=68.1, y=202.7, color="red")
+    other = SimpleNamespace(x=110.0, y=195.0, color="red")
+    scene = SimpleNamespace(raw_cubes=[shoved, other])
+    assert pick_missed(scene, ("red", 55.8, 195.0)) == (68.1, 202.7)
+    assert pick_missed(scene, ("blue", 55.8, 195.0)) is None
+    assert pick_missed(SimpleNamespace(raw_cubes=[other]), ("red", 55.8, 195.0)) is None
+    assert pick_missed(scene, None) is None
+
+
+def test_release_z_steps_by_cube_height():
     calib = SimpleNamespace(pick_z=150.0, safe_z=185.0, cube_height_mm=20.0)
     # 4mm above stack top: empty / 1-cube / 2-cube
     assert release_z_for_level(calib, 1) == 154.0
     assert release_z_for_level(calib, 2) == 174.0
     assert release_z_for_level(calib, 3) == 194.0
-    assert travel_z_for_level(calib, 1) == 189.0  # 154+35
-    assert travel_z_for_level(calib, 3) == 229.0  # 194+35 > safe_z
 
 
 def test_stack_clear_xy_prefers_approach_ray():
