@@ -178,8 +178,7 @@ void handle_line(char *line) {
       strcmp(line, "jog") && strcmp(line, "home") && strcmp(line, "$H") &&
       strncmp(line, "home ", 5) && strncmp(line, "cj ", 3) &&
       strncmp(line, "mp ", 3) &&
-      strncmp(line, "speed ", 6) && strncmp(line, "cjspeed ", 8) &&
-      strncmp(line, "cjramp ", 7) && strcmp(line, "pos") &&
+      strncmp(line, "speed ", 6) && strcmp(line, "pos") &&
       line[0] != 'g' && line[0] != 'G') {
     stop_jog();
   }
@@ -286,34 +285,6 @@ void handle_line(char *line) {
       return;
     }
     motion_set_speed_us(us);
-    return;
-  }
-  if (!strncmp(line, "cjspeed ", 8)) {
-    const char *arg = line + 8;
-    while (*arg == ' ') {
-      ++arg;
-    }
-    char *end = nullptr;
-    long us = strtol(arg, &end, 10);
-    if (end == arg || *end != '\0') {
-      Serial.println(F("err cjspeed <us>"));
-      return;
-    }
-    motion_set_cj_target_speed_us(us);
-    return;
-  }
-  if (!strncmp(line, "cjramp ", 7)) {
-    const char *arg = line + 7;
-    while (*arg == ' ') {
-      ++arg;
-    }
-    char *end = nullptr;
-    long us = strtol(arg, &end, 10);
-    if (end == arg || *end != '\0') {
-      Serial.println(F("err cjramp <us>"));
-      return;
-    }
-    motion_set_cj_ramp_step_us(us);
     return;
   }
   if (!strncmp(line, "orient ", 7)) {

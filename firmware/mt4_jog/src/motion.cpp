@@ -828,14 +828,6 @@ void motion_set_speed_us(long us) {
   dda_set_speed_us(us);
 }
 
-void motion_set_cj_target_speed_us(long us) {
-  dda_set_cj_target_speed_us(us);
-}
-
-void motion_set_cj_ramp_step_us(long us) {
-  dda_set_cj_ramp_step_us(us);
-}
-
 static void normalize_vec3(Vec3 *v) {
   const float n = sqrtf(v->x * v->x + v->y * v->y + v->z * v->z);
   if (n < 1e-6f) {
@@ -970,7 +962,6 @@ void refresh_cartesian_jog_if_due() {
     return;
   }
   cart_refresh_ms = now;
-  dda_tick_cj_speed_ramp();
   if (!setup_cartesian_jog(&cart_dir_active)) {
     // Soft-limit / keep-out / ground: stop the jog quietly. Returning false
     // here is expected at the envelope edge, not a solver failure.

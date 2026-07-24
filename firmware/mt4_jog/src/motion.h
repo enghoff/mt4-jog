@@ -86,10 +86,4 @@ bool start_absolute_move(float x, float y, float z, float j4_deg, long g,
  * accepted value. */
 void motion_set_speed_us(long us);
 
-/* "cjspeed <us>" / "cjramp <us>": see dda.h for the cj speed-ramp this
- * feeds -- opt-in and fully inert (identical to instant `speed`) until
- * cjramp is set nonzero. */
-void motion_set_cj_target_speed_us(long us);
-void motion_set_cj_ramp_step_us(long us);
-
 #endif // MT4_MOTION_H
