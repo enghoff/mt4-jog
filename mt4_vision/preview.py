@@ -172,7 +172,7 @@ class LivePreview:
     closed with q/Esc.
     """
 
-    def __init__(self, window_name: str = "stack_cubes preview (q or Esc to stop)") -> None:
+    def __init__(self, window_name: str = "mt4 preview (q or Esc to stop)") -> None:
         self._window = window_name
 
     def show(self, frame: np.ndarray) -> None:

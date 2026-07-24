@@ -49,6 +49,7 @@ from mt4_vision.pickplace import (
     _approach,
     _check,
     _travel,
+    go_camera_park,
     home_arm,
     j4_for_face_align,
     near_camera_park,
@@ -56,6 +57,7 @@ from mt4_vision.pickplace import (
     pick_centered,
     place,
     retreat_for_camera,
+    routed_travel,
 )
 from mt4_vision.preview import LiveFeed, PreviewStopped
 from mt4_vision.scene import Scene, capture_scene, within_pick_hull
@@ -494,64 +496,6 @@ def release_z_for_level(calib, level: int) -> float:
     """
     stack_top = float(calib.pick_z) + (level - 1) * float(calib.cube_height_mm)
     return stack_top + 4.0
-
-
-def routed_travel(
-    client: Mt4Client,
-    calib,
-    planner: StackPlanner,
-    x: float,
-    y: float,
-    z: float,
-    levels: int,
-    *,
-    j4: float | None = None,
-    step: str = "stack transit",
-) -> None:
-    """Travel to (x, y, z) along a StackPlanner route (direct when safe).
-
-    The whole route goes out as one firmware-side `mq` waypoint queue
-    (Mt4Client.move_path()) -- no stop/re-accelerate between waypoints
-    (see the `mq` protocol doc in firmware/mt4_jog/src/main.cpp for what
-    that does and doesn't smooth out). `j4=None` maps to the firmware `w`
-    sentinel: the wrist *joint* angle is held leg-by-leg across each J1
-    swing, resolved on-device from wherever the previous leg actually
-    ended -- the per-leg behavior the old per-waypoint _travel() fallback
-    loop existed to emulate.
-    """
-    tcp = client.get_tcp()
-    if tcp is None:
-        raise Mt4ClientError(f"{step}: could not read TCP")
-    a = (float(tcp.x), float(tcp.y), float(tcp.z))
-    if math.dist(a, (x, y, z)) < 1.0:
-        return
-    wps = planner.route(a, (x, y, z), levels)
-    if wps is None:
-        raise Mt4ClientError(
-            f"{step}: no stack-safe route from "
-            f"({a[0]:.0f},{a[1]:.0f},{a[2]:.0f}) to ({x:.0f},{y:.0f},{z:.0f})"
-        )
-    _check(
-        client.move_path(
-            wps, j4=j4 if j4 is not None else "wrist",
-            speed_us=calib.travel_speed_us,
-        ),
-        step,
-    )
-
-
-def go_camera_park(
-    client: Mt4Client, calib, planner: StackPlanner, levels: int
-) -> None:
-    """Move to the camera park pose; column-aware once the stack exists."""
-    if levels > 0:
-        routed_travel(
-            client, calib, planner,
-            CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z, levels,
-            step="park transit",
-        )
-    else:
-        retreat_for_camera(client, calib)
 
 
 def place_on_stack(

@@ -10,6 +10,7 @@ from mt4_jog.joints import JOINT_SOFT_MAX_STEPS, JOINT_SOFT_MIN_STEPS, JOG_SPEED
 from mt4_jog.kinematics import STEPS_PER_DEG
 from mt4_vision.calib import Calibration
 from mt4_vision.detect import CubeDetection
+from mt4_vision.stackpath import StackPlanner
 from mt4_vision.workspace import KEEPOUT_RADIUS_MM, is_mp_reachable_xy
 
 
@@ -257,6 +258,68 @@ def retreat_for_camera(client: Mt4Client, calib: Calibration) -> dict[str, objec
     return {"ok": True, "parked_at": [CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z]}
 
 
+def routed_travel(
+    client: Mt4Client,
+    calib: Calibration,
+    planner: StackPlanner,
+    x: float,
+    y: float,
+    z: float,
+    levels: int,
+    *,
+    j4: float | None = None,
+    step: str = "stack transit",
+) -> None:
+    """Travel to (x, y, z) along a StackPlanner route (direct when safe).
+
+    The whole route goes out as one firmware-side `mq` waypoint queue
+    (Mt4Client.move_path()) -- no stop/re-accelerate between waypoints
+    (see the `mq` protocol doc in firmware/mt4_jog/src/main.cpp for what
+    that does and doesn't smooth out). `j4=None` maps to the firmware `w`
+    sentinel: the wrist *joint* angle is held leg-by-leg across each J1
+    swing, resolved on-device from wherever the previous leg actually
+    ended -- the per-leg behavior the old per-waypoint _travel() fallback
+    loop existed to emulate.
+
+    Shared by stack_cubes.py (levels grows as cubes are added) and
+    unstack_cubes.py (levels shrinks as cubes come off) -- both route
+    around the same column, so the safety model must stay identical.
+    """
+    tcp = client.get_tcp()
+    if tcp is None:
+        raise Mt4ClientError(f"{step}: could not read TCP")
+    a = (float(tcp.x), float(tcp.y), float(tcp.z))
+    if math.dist(a, (x, y, z)) < 1.0:
+        return
+    wps = planner.route(a, (x, y, z), levels)
+    if wps is None:
+        raise Mt4ClientError(
+            f"{step}: no stack-safe route from "
+            f"({a[0]:.0f},{a[1]:.0f},{a[2]:.0f}) to ({x:.0f},{y:.0f},{z:.0f})"
+        )
+    _check(
+        client.move_path(
+            wps, j4=j4 if j4 is not None else "wrist",
+            speed_us=calib.travel_speed_us,
+        ),
+        step,
+    )
+
+
+def go_camera_park(
+    client: Mt4Client, calib: Calibration, planner: StackPlanner, levels: int
+) -> dict[str, object]:
+    """Move to the camera park pose; column-aware once a stack exists."""
+    if levels > 0:
+        routed_travel(
+            client, calib, planner,
+            CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z, levels,
+            step="park transit",
+        )
+        return {"ok": True, "parked_at": [CAMERA_PARK_X, CAMERA_PARK_Y, CAMERA_PARK_Z]}
+    return retreat_for_camera(client, calib)
+
+
 def ensure_homed(client: Mt4Client) -> None:
     status = client.get_status()
     if not status.homed:
@@ -395,6 +458,7 @@ def place(
     on_released: Callable[[], None] | None = None,
     axis_align: bool = True,
     along_arm: bool = False,
+    j4: float | None = None,
     lift_after: bool = True,
     release_z: float | None = None,
     travel_z: float | None = None,
@@ -413,6 +477,11 @@ def place(
     after ``pick_centered``'s ±90° rotate, which otherwise leaves place at
     world ~90° (jaws across the arm).
 
+    ``j4`` overrides both of the above with an explicit world-frame angle
+    (e.g. a random landing orientation for unstack_cubes.py) -- the caller
+    is responsible for keeping it within joint-J4 soft limits at (x, y)
+    (see ``j4_for_face_align``).
+
     ``release_z`` overrides the table release height (stacking uses
     ``pick_z + (level-1)*cube_height_mm``). ``travel_z`` overrides the
     transit height (defaults to ``max(safe_z, release_z)``).
@@ -426,7 +495,9 @@ def place(
     """
     ensure_homed(client)
     _require_mp_reachable(x, y, "place target")
-    if along_arm:
+    if j4 is not None:
+        pass
+    elif along_arm:
         # Prefer world 0 (jaws along arm after j4zero), not nearest-to-current.
         j4 = j4_for_face_align(0.0, current_j4_deg=None, x=x, y=y)
     else:
