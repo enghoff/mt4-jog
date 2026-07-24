@@ -638,7 +638,12 @@ def _run(args: argparse.Namespace, calib: Calibration, stream: FrameStream) -> i
             f"Locked onto {target.color} cube at ({tx:.1f}, {ty:.1f}); "
             f"moving to hover at z={hover_z:.1f}"
         )
-        client.move_to(tx, ty, hover_z, speed_us=calib.approach_speed_us)
+        # travel_speed_us, not approach_speed_us: this is a lateral transit
+        # at hover height (nothing gripped, nothing near the work surface),
+        # so it gets the fast travel speed -- approach_speed_us is the
+        # deliberately slow pick/place descent speed and made this opening
+        # move crawl at 3.4x slower than the arm's max.
+        client.move_to(tx, ty, hover_z, speed_us=calib.travel_speed_us)
         tcp = client.get_tcp()
         seed_tcp_xyz = (tcp.x, tcp.y, tcp.z)
         seed_tcp_j4 = tcp.j4
