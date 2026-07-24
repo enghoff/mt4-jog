@@ -114,7 +114,14 @@ def find_mt4_port(*, baud: int = DEFAULT_BAUD, probe: bool = True) -> str | None
     if not candidates:
         return None
 
-    viable = [row for row in candidates if row[0] > -1000] or candidates
+    # Bluetooth SPP ports are scored -1000 specifically to be excluded here:
+    # probing one with nothing paired can hang well past probe_port()'s
+    # declared timeout at the Windows Bluetooth stack level (confirmed live
+    # -- 30s+ with no return), so unlike other low-scoring candidates they
+    # must never be a last-resort fallback.
+    viable = [row for row in candidates if row[0] > -1000]
+    if not viable:
+        return None
     preferred = [row for row in viable if row[0] >= 100]
     if len(preferred) == 1:
         return preferred[0][1]
