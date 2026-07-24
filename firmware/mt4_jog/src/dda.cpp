@@ -200,7 +200,17 @@ void dda_set_cj_target_speed_us(long us) {
     us = JOG_STEP_PERIOD_MAX_US;
   }
   cj_target_period_us = static_cast<uint16_t>(us);
-  if (cj_ramp_step_us == 0) {
+  // Ramping only smooths an *already-running* jog's speed transitions
+  // (dda_tick_cj_speed_ramp() only runs from refresh_cartesian_jog_if_due(),
+  // which itself only runs while jog_active). If jog isn't currently active
+  // -- e.g. the tick right after a deadband stop, before the next `cj`
+  // restarts it -- there's no in-progress motion to protect from a jump,
+  // and leaving the target unapplied until jog resumes would make the next
+  // jog start at whatever stale speed was last applied instead of the
+  // freshly requested one: exactly what produced the near-target hunting
+  // where the arm kept re-engaging at full speed and overshooting before
+  // the ramp caught up. Apply immediately whenever jog is idle.
+  if (cj_ramp_step_us == 0 || !jog_active) {
     jog_step_period_us = cj_target_period_us;
     apply_jog_speed();
   }
@@ -276,6 +286,76 @@ void dda_set_ramp(uint16_t start_us, uint16_t cruise_us, int32_t total_ticks,
   sei();
 }
 
+void dda_continue_ramp(uint16_t cruise_us, uint16_t end_us, int32_t total_ticks,
+                        uint16_t ramp_ticks) {
+  const uint16_t cruise_ticks =
+      static_cast<uint16_t>(cruise_us * TIMER_TICKS_PER_US);
+  // Continue from whatever's actually applied right now -- mid an existing
+  // ramp, or flat at jog_step_period_us if there wasn't one -- instead of
+  // dda_set_ramp()'s fixed start_us. This is the whole point: a retarget
+  // must not snap the timer back to a slow start.
+  const uint16_t cur_ticks =
+      (ramp_phase == RAMP_NONE)
+          ? static_cast<uint16_t>(jog_step_period_us * TIMER_TICKS_PER_US)
+          : ramp_current_ticks;
+  // Period the leg must have decelerated back to by the time its ticks run
+  // out -- the ISR's DECEL phase ramps toward ramp_start_ticks, so for a
+  // retargeted leg that must be the slow safe-stop period (the same one a
+  // cold start launches from), NOT the current speed. Seeding it with
+  // cur_ticks (as an earlier version did) meant a leg spliced in at full
+  // speed either skipped decel entirely (cur == cruise -> the old
+  // early-return below) or, worse, decelerated to the new slower cruise and
+  // then snapped BACK UP to the old fast period for the final ticks before
+  // the hard stop -- a speed-up jerk exactly at arrival, where a tracker
+  // spends most of its time. If the requested cruise is already as slow or
+  // slower than end_us, ending flat at cruise is already stop-safe.
+  uint16_t end_ticks = static_cast<uint16_t>(end_us * TIMER_TICKS_PER_US);
+  if (cruise_ticks > end_ticks) {
+    end_ticks = cruise_ticks;
+  }
+
+  const uint16_t span_accel = (cur_ticks > cruise_ticks)
+                                  ? (cur_ticks - cruise_ticks)
+                                  : (cruise_ticks - cur_ticks);
+  const uint16_t span_decel = end_ticks - cruise_ticks;
+  const uint16_t span = (span_accel > span_decel) ? span_accel : span_decel;
+
+  if (total_ticks < 4 || ramp_ticks == 0 || span == 0) {
+    // Too short a leg to plan a ramp, or already at cruise with a cruise
+    // that's already stop-safe: hold the current speed flat for this leg.
+    cli();
+    ramp_phase = RAMP_NONE;
+    sei();
+    jog_step_period_us =
+        static_cast<uint16_t>(cur_ticks / TIMER_TICKS_PER_US);
+    apply_jog_speed();
+    return;
+  }
+
+  uint16_t len = ramp_ticks;
+  if (static_cast<int32_t>(len) * 2 > total_ticks) {
+    len = static_cast<uint16_t>(total_ticks / 2);
+  }
+  if (len == 0) {
+    len = 1;
+  }
+  uint16_t step = static_cast<uint16_t>(span / len);
+  if (step == 0) {
+    step = 1;
+  }
+
+  cli();
+  ramp_start_ticks = end_ticks;  // decel-into-stop target, see above
+  ramp_cruise_ticks = cruise_ticks;
+  ramp_step_ticks = step;
+  ramp_decel_at = len;
+  ramp_remaining = total_ticks;
+  ramp_current_ticks = cur_ticks;  // no snap -- we're already here
+  OCR1A = static_cast<uint16_t>(ramp_current_ticks - 1);
+  ramp_phase = RAMP_ACCEL;  // the bidirectional branch below converges either way
+  sei();
+}
+
 void dda_init() {
   TCCR1A = 0;
   TCCR1B = 0;
@@ -325,10 +405,26 @@ ISR(TIMER1_COMPA_vect) {
   // that was all precomputed once in dda_set_ramp(), outside the ISR).
   if (ramp_phase != RAMP_NONE) {
     if (ramp_phase == RAMP_ACCEL) {
-      if (ramp_current_ticks > ramp_cruise_ticks + ramp_step_ticks) {
-        ramp_current_ticks -= ramp_step_ticks;
+      // Bidirectional: dda_set_ramp()'s cold start is always slower than
+      // cruise (ticks shrink toward cruise below), but dda_continue_ramp()'s
+      // retarget can ask for a cruise slower than what's currently applied
+      // (ticks must grow toward cruise instead) -- e.g. Python's distance
+      // schedule requesting a gentler speed for the final approach mid-leg.
+      if (ramp_current_ticks > ramp_cruise_ticks) {
+        if (ramp_current_ticks > ramp_cruise_ticks + ramp_step_ticks) {
+          ramp_current_ticks -= ramp_step_ticks;
+        } else {
+          ramp_current_ticks = ramp_cruise_ticks;
+          ramp_phase = RAMP_CRUISE;
+        }
+      } else if (ramp_current_ticks < ramp_cruise_ticks) {
+        if (ramp_current_ticks + ramp_step_ticks < ramp_cruise_ticks) {
+          ramp_current_ticks += ramp_step_ticks;
+        } else {
+          ramp_current_ticks = ramp_cruise_ticks;
+          ramp_phase = RAMP_CRUISE;
+        }
       } else {
-        ramp_current_ticks = ramp_cruise_ticks;
         ramp_phase = RAMP_CRUISE;
       }
     }

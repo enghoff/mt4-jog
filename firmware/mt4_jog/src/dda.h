@@ -56,9 +56,27 @@ void dda_tick_cj_speed_ramp();
  * segments. Only a fresh call to this function or dda_ramp_clear() changes
  * it. Falls back to plain constant-speed stepping (no ramp) if cruise_us is
  * already as slow or slower than start_us, or total_ticks is too short for
- * a meaningful ramp. */
+ * a meaningful ramp. Only ever called for a *cold-start* `mp` (the arm was
+ * idle); a live retarget of an already-moving `mp` uses dda_continue_ramp()
+ * below instead so the timer never snaps back to start_us. */
 void dda_set_ramp(uint16_t start_us, uint16_t cruise_us, int32_t total_ticks,
                    uint16_t ramp_ticks);
+/* Like dda_set_ramp(), but for retargeting an `mp` move that's already
+ * stepping (motion.cpp's start_absolute_move() detects this: the previous
+ * mp path is still active when a new one arrives). Seeds the ramp's
+ * "current" tick count from whatever is actually applied right now
+ * (mid-ramp or flat) instead of a fixed slow start, so the new leg picks up
+ * exactly where the old one left off -- no snap, no re-accelerate-from-rest.
+ * Because a retarget's new cruise can be faster OR slower than whatever
+ * speed is currently applied (unlike a cold start, which is always
+ * accelerating away from a deliberately-slow start), this always engages a
+ * ramp phase rather than falling back to a flat cruise -- see the
+ * now-bidirectional RAMP_ACCEL branch in the Timer1 ISR. end_us is the
+ * slow safe-stop period the leg decelerates back to before its ticks run
+ * out (callers pass MP_ACCEL_START_US, mirroring dda_set_ramp's start_us);
+ * a cruise already that slow or slower ends flat at cruise instead. */
+void dda_continue_ramp(uint16_t cruise_us, uint16_t end_us, int32_t total_ticks,
+                        uint16_t ramp_ticks);
 /* Disable ramping -- OCR1A stays fixed at whatever dda_set_speed_us() last
  * set. Call before starting any non-`mp` coordinated move (`m`, cj jog,
  * legacy jog) so a still-active `mp` ramp can't bleed into unrelated

@@ -166,10 +166,18 @@ void handle_line(char *line) {
    * as a non-blocking, non-disruptive status read (unlike "?", which also
    * dumps mode/limits/gripper and isn't polled in a hot loop) -- without
    * this exemption it silently killed the jog on the very next tick after
-   * every re-engage, which read as the tracker barely moving at all. */
+   * every re-engage, which read as the tracker barely moving at all.
+   * "mp " is exempted for the same reason "cj " is: a tracker that
+   * re-targets an absolute move every tick (see start_absolute_move's
+   * in-flight retarget path) needs those `mp` lines to reach
+   * start_absolute_move() with jog_active still true so it can detect the
+   * retarget and splice in the new path instead of hard-stopping first --
+   * stop_jog() here would zero jog_active before start_absolute_move() ever
+   * gets a look, defeating the smoothing unconditionally. */
   if (strcmp(line, "!") && strcmp(line, "stop") && strcmp(line, "j") &&
       strcmp(line, "jog") && strcmp(line, "home") && strcmp(line, "$H") &&
       strncmp(line, "home ", 5) && strncmp(line, "cj ", 3) &&
+      strncmp(line, "mp ", 3) &&
       strncmp(line, "speed ", 6) && strncmp(line, "cjspeed ", 8) &&
       strncmp(line, "cjramp ", 7) && strcmp(line, "pos") &&
       line[0] != 'g' && line[0] != 'G') {

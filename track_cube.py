@@ -14,13 +14,25 @@ Two phases:
      reachable cube, and move the TCP to hover directly above it. This
      reuses the well-tested absolute-move path for the one large motion in
      the whole run.
-  2. Tracking (raw serial, streaming `cj`): `Mt4Client.move_to()` is a
-     blocking point-to-point trajectory -- far too coarse-grained to chase a
-     moving target. The firmware's Cartesian jog (`cj dx dy dz`) is
-     direction-only but non-blocking and auto-refreshes on-device every
-     40ms, so it's driven directly the way `jog.py` does: this script closes
-     `Mt4Client` and opens its own serial connection for the loop, since
-     only one process may own the COM port at a time.
+  2. Tracking (raw serial, streaming `mp`): `Mt4Client.move_to()` blocks
+     until the whole move completes, so this script instead re-sends a
+     bounded absolute move (`mp x y z j4 g speed_us`) every tick, retargeting
+     it to the cube's latest position before the previous one finishes. This
+     used to be done with the firmware's Cartesian jog (`cj dx dy dz`)
+     instead -- direction-only, no notion of a destination, so *something*
+     external always has to decide when to stop it, and that something was
+     this host loop's ~100ms-stale glance at position: overshoot wasn't a
+     stepper coasting past the target (steppers don't coast), it was the
+     arm faithfully stepping in the last commanded direction for the entire
+     gap between one position sample and the next. `mp` moves the stop
+     decision into firmware, which tracks its own remaining step count and
+     halts exactly there, no host reaction time involved. The one thing that
+     took firmware work to support was retargeting *mid-flight* without an
+     abrupt stop -- see start_absolute_move()'s in-flight-retarget path in
+     motion.cpp -- so a moving cube gets a continuously updated destination
+     instead of finish-then-redirect. This script closes `Mt4Client` and
+     opens its own serial connection for the loop, since only one process
+     may own the COM port at a time.
 
 Each tick (paced by the camera, ~10Hz measured on this setup):
   - grab the freshest frame and detect cubes
@@ -31,19 +43,26 @@ Each tick (paced by the camera, ~10Hz measured on this setup):
   - request a fresh real TCP pose every tick (`pos`, fire-and-forget) and
     pick up the reply whenever it lands -- kept off the critical path so it
     never blocks the loop, but still only a tick or so stale
-  - jog the direction-only `cj` command toward the error vector, sending a
-    distance-scheduled target speed via `cjspeed` every tick -- the firmware
-    (opted in once via `cjramp`, see below) ramps toward it on its own 40ms
-    clock so the final approach doesn't overshoot the deadband at full speed
-    (this is bang-bang + a gain schedule, not PID -- there's no integral or
-    derivative term)
+  - re-send `mp` toward the target with a distance-scheduled speed_us (see
+    speed_for_distance), but only once the previous `mp` has actually been
+    acknowledged (see awaiting_mp_ack) -- this is bang-bang + a gain
+    schedule, not PID, there's no integral or derivative term -- the
+    firmware absorbs a resend's retargeting by ramping the applied step
+    rate toward whatever speed_us was just requested instead of snapping to
+    it, so a changing distance-to-target (and therefore a changing
+    requested speed) doesn't itself produce a jerk
+  - once inside the deadband, stop re-sending `mp` and let whatever move is
+    already in flight arrive and hold on its own -- no explicit `stop`,
+    since `mp` decelerates into its own destination and forcing a stop here
+    would trade that smooth arrival for an abrupt one
 
-If the cube is lost from view for longer than a short grace period, the
-arm stops and holds position, watching for the same cube to reappear
-anywhere in view -- it never switches to a different cube.
+If the cube is lost from view for longer than a short grace period, or Ctrl+C
+is hit, or a re-home is requested, the arm sends an explicit `stop` and holds
+position, watching for the same cube to reappear anywhere in view -- it never
+switches to a different cube.
 
 Ctrl+C (or any error) always sends `stop` before exiting -- there is no
-firmware watchdog that stops `cj` on its own if the host goes quiet.
+firmware watchdog that stops `mp` on its own if the host goes quiet.
 """
 
 from __future__ import annotations
@@ -71,7 +90,6 @@ from mt4_jog.serial import (
     await_firmware_alive,
     drain_lines,
     open_serial,
-    send,
     send_quick,
 )
 from mt4_jog.status import TcpPose, parse_tcp_line
@@ -88,9 +106,11 @@ from mt4_vision.preview import VideoRecorder, draw_cube_marker, draw_lock_ring, 
 from mt4_vision.workspace import KEEPOUT_RADIUS_MM, MAX_REACH_MM
 
 DEFAULT_HOVER_MM = 50.0
-# Extra margin beyond the firmware's own keep-out / max-reach checks --
-# `cj` (unlike `mp`) has no max-reach clamp, only a keep-out one, so the
-# *target* fed into the error computation is clamped defensively every tick.
+# Extra margin beyond the firmware's own keep-out check -- `mp` rejects a
+# target inside the keep-out cylinder outright ("err mp keepout"), but has
+# no analogous explicit max-reach clamp (an out-of-reach target just fails
+# IK feasibility, "err mp unreachable"), so both edges of the workspace are
+# clamped defensively here before ever sending a target.
 KEEPOUT_MARGIN_MM = 5.0
 REACH_MARGIN_MM = 5.0
 
@@ -123,60 +143,60 @@ DEADBAND_MM = 3.0  # inside this, stop rather than jitter
 # nothing about the motion logic changed, just how coarse each visible
 # correction segment became. The async version keeps the fast loop rate
 # and keeps the blind window short enough not to matter.
-# Jog speed ramps with distance-to-target: fast (the firmware's quickest
-# step rate) while far away, slower as it converges. This IS load-bearing,
-# confirmed by removing it: even with fresh per-tick TCP feedback, a
-# constant max-speed jog overshoots the 3mm deadband within a single ~100ms
-# tick (real linear speed at max jog covers more than that easily), and the
-# correction the next tick overshoots the other way -- a sustained
-# oscillation with no feedback-staleness involved at all, just velocity too
-# high relative to deadband width and tick period.
+# Requested speed ramps with distance-to-target: fast (the firmware's
+# quickest step rate) while far away, slower as it converges. This IS
+# load-bearing, confirmed by removing it: even with fresh per-tick TCP
+# feedback, a constant max-speed approach overshoots the 3mm deadband within
+# a single ~100ms tick (real linear speed at max jog covers more than that
+# easily), and the correction the next tick overshoots the other way -- a
+# sustained oscillation with no feedback-staleness involved at all, just
+# velocity too high relative to deadband width and tick period.
 #
-# `cj` jogging disables the firmware's own mp-style accel ramp (`speed <us>`
-# is one direct timer-register write, no smoothing) -- but unlike an earlier
-# version of this script, the ramp is no longer redone in Python. Smoothing
-# a distance-scheduled target speed by capping its change *per host tick*
-# ties the ramp rate to however fast (and however jittery) the camera loop
-# happens to be, which is exactly backwards: a stationary target still
-# produces a changing error vector as the arm itself converges, and batching
-# that drift into infrequent, larger corrections reads as jerks regardless of
-# the cap value (see track_cube's git history for the CJ_MIN_INTERVAL_S
-# diagnostic that made this visible). `cjspeed <us>` instead just tells the
-# firmware the current target speed every tick; `cjramp <us>` (sent once,
-# below) opts the firmware into ramping `cjspeed` targets toward each other
-# at a fixed rate on its own steady 40ms clock, immune to host loop jitter.
-# `cjramp 0` (the firmware's power-on default) is the instant rollback: it
-# makes `cjspeed` apply immediately, byte-for-byte the old un-ramped
-# `speed` write, with no reflash needed.
+# Each resend's requested speed_us comes from this schedule -- motion.cpp's
+# in-flight-retarget path (dda_continue_ramp) is what smooths the applied
+# step rate toward each newly requested speed_us on the firmware's own
+# clock, so a changing schedule value never itself produces a jerk, the
+# same way `cjramp` did for `cjspeed` before this script switched from `cj`
+# to `mp`. That smoothing is cheap -- but unlike `cj` (a direction+speed
+# re-arm), an `mp` call itself is NOT: it solves IK and plans a
+# keep-out-clear route (in-flight retargets now skip the route's IK
+# feasibility sweep, reusing the in-flight path's detour radius when the
+# chord doesn't clear -- see plan_mp_xy_route -- but target IK, route
+# geometry, and parsing remain), real work on an 8-bit AVR with no FPU. An earlier version of this constant gated resends
+# on target drift (skip unless the target moved >= 5mm since the last `mp`
+# actually sent) to protect against that cost -- confirmed necessary at the
+# time: resending every ~100ms tick regardless of whether the target moved
+# was blocking firmware's loop() long enough (55-420ms, scaling with
+# distance -- motion.cpp's mp_estimate_path_ticks() was solving IK once per
+# ~2mm segment of the whole path just to time the accel/decel ramp) that
+# the AVR's UART RX buffer filled and silently dropped bytes, corrupting
+# `mp` lines (`err mp <x> <y> <z> <j4> <g> [speed_us]`) or splicing two
+# lines together (`err unknown`). But gating on drift instead of just
+# eating the cost had its own failure mode, also confirmed live: it let the
+# arm coast to the end of its current (now slightly stale) target and sit
+# there -- since `mp` is a bounded move that finishes and holds on its own
+# once nothing new is sent -- until enough drift finally accumulated to
+# unblock the next send, which then had no in-flight move left to splice
+# onto and had to cold-start, seen as the arm stopping dead and jerking
+# forward again while being tracked continuously in one direction. Fixing
+# mp_estimate_path_ticks() to use a cheap straight joint-space chord
+# instead of a per-segment IK sum (see motion.cpp) cut the block to a flat
+# ~65-110ms independent of distance -- but that's still comparable to this
+# loop's own ~100ms tick, and send_quick never waits for a reply, so
+# resending unconditionally again just traded byte-loss for a different
+# problem: Python outpacing what firmware could actually drain, queuing up
+# an ever-growing backlog of already-stale targets that landed in an
+# uneven rhythm (confirmed live as tcp alternating small/big steps between
+# polls -- the arm executing whatever the queue caught up to, not the
+# current camera-fresh target). See awaiting_mp_ack in run_tracking_loop:
+# gating resends on the firmware's own ack self-paces to its real
+# throughput without an arbitrary constant, and unlike the drift gate it
+# never withholds a send once firmware is actually ready.
 SPEED_FAR_US = JOG_SPEED_MIN_US  # fastest, used beyond SPEED_FAR_MM
 SPEED_NEAR_US = 2400  # gentle final approach, used within SPEED_NEAR_MM
 SPEED_FAR_MM = 40.0
 SPEED_NEAR_MM = 8.0  # just outside DEADBAND_MM, so it's already slow by the time it stops
-# us per CJ_REFRESH_MS (40ms) firmware tick -- same ~800us/s net rate as the
-# old Python-side cap (80us per ~100ms tick), just applied on the firmware's
-# jitter-free clock instead of the camera-paced one.
-CJ_RAMP_STEP_US = 32
-# Skip resending `cj` unless the error vector has moved at least this much
-# (mm, tip-to-tip) since the last cj actually sent -- see the resend gate in
-# run_tracking_loop for why (every send re-arms the firmware's DDA and
-# resets step-accumulator phase, which the firmware's own 40ms auto-refresh
-# already does on its own for an unchanged direction).
-#
-# For a genuinely stationary target the arm closes on it in a straight
-# line, so the recomputed direction shouldn't meaningfully change between
-# ticks -- with this deadzone active, that means ~one cj send to start the
-# approach and one `stop` at the deadband, nothing in between, letting the
-# firmware's own unchanging 40ms auto-refresh carry the whole approach
-# instead of us re-arming the DDA (and handing it a slightly different
-# recomputed vector -- fresh vision + fresh `pos` + integer rounding, never
-# bit-for-bit identical) on every tick.
-CJ_UPDATE_DEADZONE_MM = 5.0
 INITIAL_LOCK_TIMEOUT_S = 30.0
-# `cj`'s firmware parser reads direction components as integers (sscanf
-# %ld) then normalizes the vector on-device -- only the ratio matters, but
-# a sub-1mm error would round straight to 0 and lose its direction without
-# this scale-up.
-CJ_INT_SCALE = 1000
 
 PREVIEW_WINDOW = "track_cube preview (q or Esc to stop)"
 COLOR_BGR = {
@@ -261,24 +281,33 @@ def speed_for_distance(dist_mm: float) -> int:
     return int(round(SPEED_NEAR_US + t * (SPEED_FAR_US - SPEED_NEAR_US)))
 
 
-def report_firmware_lines(ser, buf: list[str], verbose: bool) -> TcpPose | None:
-    """Drain and print firmware chatter; return the newest TCP pose seen, if any.
+def report_firmware_lines(
+    ser, buf: list[str], verbose: bool
+) -> tuple[TcpPose | None, bool]:
+    """Drain and print firmware chatter; return the newest TCP pose seen (if
+    any) and whether an `mp` reply (`ok mp` or any `err ...`) showed up.
 
     A `?` query's reply (a `tcp x=... y=... ...` line among others) may show
     up here on a later tick than the one that sent it -- that's the point:
     the query is fired async (send_quick) rather than blocked on, so this is
-    where the answer gets picked up whenever it actually arrives.
+    where the answer gets picked up whenever it actually arrives. Same idea
+    for `mp`'s reply: run_tracking_loop uses it to know when the firmware is
+    actually done with the last one and ready for another (see
+    awaiting_mp_ack there).
     """
     latest_tcp: TcpPose | None = None
+    mp_acked = False
     for line in drain_lines(ser, buf):
         tcp = parse_tcp_line(line)
         if tcp is not None:
             latest_tcp = tcp
+        if line == "ok mp" or line.startswith("err "):
+            mp_acked = True
         if line.startswith("err ") or line.startswith("lim "):
             print(line)
         elif verbose:
             print(line, file=sys.stderr)
-    return latest_tcp
+    return latest_tcp, mp_acked
 
 
 def draw_preview(
@@ -324,6 +353,7 @@ def run_tracking_loop(
     *,
     seed: tuple[float, float, float],
     seed_tcp_xyz: tuple[float, float, float],
+    seed_tcp_j4: float,
     hover_z: float,
     deadband_mm: float,
     lost_grace_s: float,
@@ -337,11 +367,18 @@ def run_tracking_loop(
     buf: list[str] = [""]
     _t0, x0, y0 = seed
     current_tcp_x, current_tcp_y, current_tcp_z = seed_tcp_xyz
+    # Passed straight back as `mp`'s j4_deg every tick so start_absolute_move
+    # treats orientation as held (hold_ws_orient) rather than something to
+    # actively rotate toward -- there's no wrist target here, tracking only
+    # ever moves xyz.
+    current_tcp_j4 = seed_tcp_j4
 
     last_known = (x0, y0)
     lost_since: float | None = None
-    jogging = False
-    last_sent_error: tuple[float, float, float] | None = None
+    moving = False
+    # True from the moment an `mp` is sent until its reply (`ok mp` or any
+    # `err ...`) is seen -- see the dist>=deadband_mm branch below for why.
+    awaiting_mp_ack = False
     last_telemetry = 0.0
 
     try:
@@ -350,15 +387,16 @@ def run_tracking_loop(
                 print("Reached --max-seconds, stopping.")
                 return
             if console_focused() and key_down("h"):
-                if jogging:
+                if moving:
                     send_quick(ser, "stop")
-                    jogging = False
-                    last_sent_error = None
+                    moving = False
+                    awaiting_mp_ack = False
                 print("Homing (h)...")
                 run_home(ser, buf, j1_center, j2_pull, verbose)
-                new_tcp = report_firmware_lines(ser, buf, verbose)
+                new_tcp, _mp_acked = report_firmware_lines(ser, buf, verbose)
                 if new_tcp is not None:
                     current_tcp_x, current_tcp_y, current_tcp_z = new_tcp.x, new_tcp.y, new_tcp.z
+                    current_tcp_j4 = new_tcp.j4
                 lost_since = time.monotonic()
                 continue
             # min_advance=1 (not FrameStream's default of 2): the camera
@@ -385,16 +423,18 @@ def run_tracking_loop(
                 lost_since = now
 
             if lost_since is not None and now - lost_since > lost_grace_s:
-                if jogging:
+                if moving:
                     send_quick(ser, "stop")
-                    jogging = False
+                    moving = False
+                    awaiting_mp_ack = False
                     print(
                         f"Lost {color} cube -- holding position, watching for "
                         f"reacquire near ({last_known[0]:.1f}, {last_known[1]:.1f})"
                     )
-                new_tcp = report_firmware_lines(ser, buf, verbose)
+                new_tcp, _mp_acked = report_firmware_lines(ser, buf, verbose)
                 if new_tcp is not None:
                     current_tcp_x, current_tcp_y, current_tcp_z = new_tcp.x, new_tcp.y, new_tcp.z
+                    current_tcp_j4 = new_tcp.j4
                 if _emit_preview(
                     frame, detections, match, color, lost_since, None,
                     preview=preview, recorder=recorder,
@@ -410,64 +450,52 @@ def run_tracking_loop(
             # skips `?`'s multi-line status dump (mode, limits, gripper,
             # header/footer) that we don't need every tick.
             send_quick(ser, "pos")  # fire-and-forget; picked up below whenever it lands
-            new_tcp = report_firmware_lines(ser, buf, verbose)
+            new_tcp, mp_acked = report_firmware_lines(ser, buf, verbose)
+            if mp_acked:
+                awaiting_mp_ack = False
             if new_tcp is not None:
                 current_tcp_x, current_tcp_y, current_tcp_z = new_tcp.x, new_tcp.y, new_tcp.z
+                current_tcp_j4 = new_tcp.j4
 
             err_x = target_x - current_tcp_x
             err_y = target_y - current_tcp_y
-            err_z = hover_z - current_tcp_z
             dist = math.hypot(err_x, err_y)
 
             if dist < deadband_mm:
-                if jogging:
-                    send_quick(ser, "stop")
-                    jogging = False
-                    last_sent_error = None
+                # Close enough: stop re-targeting and let whatever `mp` is
+                # already in flight arrive and hold on its own. No `stop`
+                # here -- `mp` is a bounded move with its own decel ramp, so
+                # forcing a stop would trade a smooth arrival for an abrupt
+                # one for no reason.
+                moving = False
             else:
-                # Raw distance-scheduled target every tick -- the firmware
-                # (opted into ramping via `cjramp` above) smooths this toward
-                # whatever it's currently doing on its own steady clock, so
-                # there's nothing left to step/cap here in Python.
-                send_quick(ser, f"cjspeed {speed_for_distance(dist)}")
-
-                # Every `cj` -- including a resend of an unchanged direction
-                # -- re-arms the firmware's DDA and resets its per-axis step
-                # accumulator (motion.cpp setup_cartesian_jog -> dda_arm ->
-                # dda_clear_axes), which the firmware's own 40ms auto-refresh
-                # (refresh_cartesian_jog_if_due) already does on its own for
-                # an unchanged direction, so resending here on top of that
-                # just adds extra resets without changing what the arm is
-                # actually doing.
-                #
-                # Gate resends on how far the error vector's tip has moved
-                # (mm) since the last cj actually sent, rather than on the
-                # angle between them: by the law of cosines a tip-distance
-                # threshold catches both a direction swing and a magnitude
-                # change in one test, and unlike an angular threshold it
-                # doesn't get oversensitive as the error shrinks near the
-                # deadband (a tiny absolute wobble there is a large angle at
-                # small radius, which would otherwise trigger constant
-                # resends exactly where we want the least twitchiness).
-                if last_sent_error is None:
-                    direction_changed = True
-                else:
-                    lsx, lsy, lsz = last_sent_error
-                    tip_shift = math.sqrt(
-                        (err_x - lsx) ** 2 + (err_y - lsy) ** 2 + (err_z - lsz) ** 2
+                # Only send a new `mp` once the previous one has actually
+                # been acknowledged. `mp` now costs ~65-110ms of blocking
+                # firmware time (see motion.cpp) -- right at the edge of
+                # this loop's own ~100ms camera-paced tick, so firing a new
+                # one every tick regardless (send_quick never waits for a
+                # reply) let Python outpace what firmware could actually
+                # absorb: commands queued up faster than they drained,
+                # and the arm executed an ever-growing backlog of already-
+                # stale targets in an uneven rhythm -- confirmed live as a
+                # steady small-move/big-move alternation in tcp between
+                # ticks, felt as the arm micro-stepping/jerking even though
+                # each individual retarget is itself smooth. Gating on the
+                # firmware's own ack (rather than a fixed delay or a
+                # position deadzone -- see git history for why a drift-based
+                # gate was tried and reverted) self-paces to whatever rate
+                # firmware can actually sustain and always sends the
+                # freshest known target the moment it's ready, so it can't
+                # build a backlog and can't stall waiting for accumulated
+                # drift either.
+                if not awaiting_mp_ack:
+                    send_quick(
+                        ser,
+                        f"mp {target_x:.1f} {target_y:.1f} {hover_z:.1f} "
+                        f"{current_tcp_j4:.1f} 0 {speed_for_distance(dist)}",
                     )
-                    direction_changed = tip_shift >= CJ_UPDATE_DEADZONE_MM
-                if direction_changed:
-                    # Firmware `cj` parses direction components with sscanf
-                    # %ld -- integers only, no decimals -- then normalizes
-                    # the vector on-device, so only the ratio between
-                    # components matters. Scale the mm error up before
-                    # rounding so small errors don't collapse to 0 and lose
-                    # their direction.
-                    ix, iy, iz = (int(round(v * CJ_INT_SCALE)) for v in (err_x, err_y, err_z))
-                    send_quick(ser, f"cj {ix} {iy} {iz}")
-                    last_sent_error = (err_x, err_y, err_z)
-                jogging = True
+                    awaiting_mp_ack = True
+                moving = True
 
             if _emit_preview(
                 frame, detections, match, color, lost_since, dist,
@@ -589,6 +617,7 @@ def _run(args: argparse.Namespace, calib: Calibration, stream: FrameStream) -> i
     client = Mt4Client(port=args.port, baud=args.baud)
     target: CubeDetection | None = None
     seed_tcp_xyz: tuple[float, float, float] | None = None
+    seed_tcp_j4: float | None = None
     seed: tuple[float, float, float] | None = None
     try:
         client.ensure_connected()
@@ -612,13 +641,17 @@ def _run(args: argparse.Namespace, calib: Calibration, stream: FrameStream) -> i
         client.move_to(tx, ty, hover_z, speed_us=calib.approach_speed_us)
         tcp = client.get_tcp()
         seed_tcp_xyz = (tcp.x, tcp.y, tcp.z)
+        seed_tcp_j4 = tcp.j4
     except Mt4ClientError as exc:
         print(exc, file=sys.stderr)
         return 1
     finally:
         client.close()
 
-    assert target is not None and seed is not None and seed_tcp_xyz is not None
+    assert (
+        target is not None and seed is not None and seed_tcp_xyz is not None
+        and seed_tcp_j4 is not None
+    )
     port = args.port
     baud = args.baud
 
@@ -627,8 +660,6 @@ def _run(args: argparse.Namespace, calib: Calibration, stream: FrameStream) -> i
         with open_serial(port, baud) as ser:
             try:
                 await_firmware_alive(ser, port_label=port or "auto-detected port")
-                send(ser, "orient off", wait=0.2)
-                send(ser, f"cjramp {CJ_RAMP_STEP_US}", wait=0.2)
                 drain_lines(ser, [""])
             except FirmwareNotReadyError as exc:
                 print(exc, file=sys.stderr)
@@ -642,7 +673,8 @@ def _run(args: argparse.Namespace, calib: Calibration, stream: FrameStream) -> i
                 deadline = time.monotonic() + args.max_seconds if args.max_seconds else None
                 run_tracking_loop(
                     ser, stream, calib, target.color,
-                    seed=seed, seed_tcp_xyz=seed_tcp_xyz, hover_z=hover_z,
+                    seed=seed, seed_tcp_xyz=seed_tcp_xyz, seed_tcp_j4=seed_tcp_j4,
+                    hover_z=hover_z,
                     deadband_mm=args.deadband_mm,
                     lost_grace_s=args.lost_grace_s, verbose=args.verbose,
                     deadline=deadline, preview=args.preview, recorder=recorder,
@@ -653,9 +685,6 @@ def _run(args: argparse.Namespace, calib: Calibration, stream: FrameStream) -> i
             finally:
                 try:
                     send_quick(ser, "stop")
-                    # Leave the firmware in its default (un-ramped) state for
-                    # whatever runs next on this port -- see CJ_RAMP_STEP_US.
-                    send_quick(ser, "cjramp 0")
                 except SerialGoneError:
                     pass
     except SerialGoneError as exc:

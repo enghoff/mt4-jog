@@ -210,6 +210,11 @@ static struct {
   uint16_t next_seg;
   uint16_t num_segments;
   uint8_t num_pieces;
+  // Which route this path took: -1 = straight chord, else the index into
+  // MT4_ROUTE_RADIUS_MM whose detour arc passed planning. An in-flight
+  // retarget reuses this radius without re-running the feasibility sweep --
+  // see plan_mp_xy_route.
+  int8_t route_radius_idx;
   float total_xy_len;
   float sz, ez;
   float sj4_ws, ej4_ws;
@@ -227,6 +232,7 @@ static void mp_path_cancel() {
   mp_path.next_seg = 0;
   mp_path.num_segments = 0;
   mp_path.num_pieces = 0;
+  mp_path.route_radius_idx = -1;
   mp_drivers_ready = false;
 }
 
@@ -415,17 +421,12 @@ static bool route_joints_feasible(const MpPiece *pieces, uint8_t num_pieces,
   }
   const float cart =
       sqrtf(xy_len * xy_len + (z1 - z0) * (z1 - z0));
-  uint16_t n = static_cast<uint16_t>(ceilf(cart / MP_CART_SEGMENT_MM));
+  uint16_t n = static_cast<uint16_t>(ceilf(cart / MP_FEASIBILITY_SAMPLE_MM));
   if (n < 1) {
     n = 1;
   }
-  if (n > MP_MAX_SEGMENTS) {
-    n = MP_MAX_SEGMENTS;
-  }
-  // Cap preflight cost on long paths; still denser than the failure modes
-  // we care about (soft-limit peaks span many mm).
-  if (n > 40) {
-    n = 40;
+  if (n > MP_FEASIBILITY_MAX_SAMPLES) {
+    n = MP_FEASIBILITY_MAX_SAMPLES;
   }
 
   JointAnglesDeg near = *near0;
@@ -458,18 +459,56 @@ static bool route_joints_feasible(const MpPiece *pieces, uint8_t num_pieces,
 static uint8_t plan_mp_xy_route(float sx, float sy, float ex, float ey,
                                float z0, float z1, float j4_ws0, float j4_ws1,
                                bool hold_ws, const JointAnglesDeg *near,
-                               MpPiece *out, float *total_len) {
+                               bool retarget, int8_t prev_radius_idx,
+                               int8_t *chosen_radius_idx, MpPiece *out,
+                               float *total_len) {
   MpPiece trial[MP_MAX_PIECES];
   float len = 0.0f;
 
-  // Straight chord when it clears the physical keep-out.
+  // `retarget` (an in-flight retarget, see start_absolute_move) accepts a
+  // route on geometry alone, without the IK/soft-limit feasibility sweep:
+  // the sweep's cost scales with distance (measured 26-64ms of blocking at
+  // 8mm spacing, and several times that when multiple candidate radii get
+  // swept before one passes) and it would run on EVERY retarget while the
+  // arm is mid-motion with only the currently armed ~2mm segment of runway
+  // -- longer than that and the arm visibly hitches while loop() is stuck
+  // planning. Skipping it is safe because the same limits are re-checked
+  // per segment at execution time (mp_execute_segment aborts with "err mp
+  // segment") and per step in the ISR (motion_step_allowed); worst case an
+  // infeasible route aborts mid-move instead of erroring upfront -- and a
+  // tracker retargets again a tick later anyway (an abort clears
+  // jog_active, so that next `mp` is a cold start and replans with full
+  // sweeps). For detour routes the sweep normally also picks WHICH radius
+  // to use, so a retarget can't just take the smallest geometrically valid
+  // one blindly -- instead it reuses prev_radius_idx, the radius the
+  // still-in-flight path already passed planning with a tick or two ago
+  // from nearly the same position. That can hold a detour on a
+  // larger-than-necessary radius until the chord straightens or the move
+  // cold-starts -- a slightly longer path, never an unsafe one. Cold
+  // starts (retarget false) keep the full sweeps.
   if (seg_dist_origin(sx, sy, ex, ey) >= MT4_KEEPOUT_RADIUS_MM - 0.25f) {
     len = mp_piece_line(&trial[0], sx, sy, ex, ey);
-    if (route_joints_feasible(trial, 1, len, z0, z1, j4_ws0, j4_ws1, hold_ws,
+    if (retarget ||
+        route_joints_feasible(trial, 1, len, z0, z1, j4_ws0, j4_ws1, hold_ws,
                               near)) {
       out[0] = trial[0];
       *total_len = len;
+      *chosen_radius_idx = -1;
       return 1;
+    }
+  }
+
+  if (retarget && prev_radius_idx >= 0 &&
+      prev_radius_idx < static_cast<int8_t>(MT4_ROUTE_RADIUS_COUNT)) {
+    const float R = MT4_ROUTE_RADIUS_MM[prev_radius_idx];
+    const uint8_t n = plan_cylinder_path(sx, sy, ex, ey, R, trial, &len);
+    if (n != 0) {
+      for (uint8_t k = 0; k < n; ++k) {
+        out[k] = trial[k];
+      }
+      *total_len = len;
+      *chosen_radius_idx = prev_radius_idx;
+      return n;
     }
   }
 
@@ -485,6 +524,7 @@ static uint8_t plan_mp_xy_route(float sx, float sy, float ex, float ey,
         out[k] = trial[k];
       }
       *total_len = len;
+      *chosen_radius_idx = static_cast<int8_t>(i);
       return n;
     }
   }
@@ -577,32 +617,35 @@ static bool mp_segment_target(uint16_t seg, const JointAnglesDeg *near,
   return true;
 }
 
-/* Sum per-segment master ticks along the planned Cartesian path so the
- * accel/decel ramp tracks detours and segmentation, not a straight
- * joint-space chord to the final pose. */
-static int32_t mp_estimate_path_ticks(void) {
-  long sim[MT4_NUM_JOINTS];
-  const JointAnglesDeg q0 = angles_from_steps();
-  angles_to_joint_steps(&q0, sim);
-
-  int32_t total = 0;
-  for (uint16_t seg = 1; seg <= mp_path.num_segments; ++seg) {
-    const JointAnglesDeg near = angles_from_joint_steps(sim);
-    JointAnglesDeg target;
-    if (!mp_segment_target(seg, &near, &target)) {
-      return 0;
-    }
-    int32_t deltas[MT4_NUM_JOINTS];
-    int32_t master = 0;
-    if (!joint_steps_to_deltas(sim, &target, deltas, &master)) {
-      return 0;
-    }
-    total += master;
-    for (uint8_t i = 0; i < MT4_NUM_JOINTS; ++i) {
-      sim[i] += deltas[i];
-    }
+/* Master-tick estimate for the whole planned `mp` move, used only to time
+ * dda_set_ramp()/dda_continue_ramp()'s cruise/decel schedule -- NOT the
+ * actual per-segment step commands, which mp_execute_segment() computes
+ * fresh via live IK against the real (possibly curved, keep-out-detouring)
+ * route as each segment runs.
+ *
+ * This used to sum a full IK solve per ~2mm segment along the planned
+ * route (up to ~125 for a full-workspace move) to account for detours and
+ * segmentation precisely. Measured live at 55-420ms depending on distance
+ * -- long enough that start_absolute_move()'s in-flight-retarget path
+ * (which deliberately doesn't stop the arm while this runs, to avoid an
+ * abrupt halt) let the arm physically outrun the route snapshot this was
+ * planned against before the new path was even armed: the freshly-armed
+ * segment 1 target could already be behind the arm's real position by the
+ * time "ok mp" was even printed, seen live as the arm freezing for several
+ * ticks then jerking forward once a later, no-longer-stale retarget
+ * finally landed. The straight joint-space chord between the current pose
+ * and the final target (both already solved by the time this is called)
+ * is a cheap substitute -- one delta computation, no IK, no per-segment
+ * loop. It can't predict a curved detour's true joint travel as precisely,
+ * but a slightly mistimed decel point is a bounded/safe cosmetic
+ * difference, unlike the multi-hundred-ms block it replaces. */
+static int32_t mp_estimate_path_ticks(const JointAnglesDeg *target) {
+  int32_t deltas[MT4_NUM_JOINTS];
+  int32_t master = 0;
+  if (!joint_angles_to_deltas(target, deltas, &master)) {
+    return 0;
   }
-  return total;
+  return master;
 }
 
 /* Arm one Cartesian-linear `mp` segment (seg is 1..num_segments). Returns
@@ -638,7 +681,16 @@ static bool mp_execute_segment(uint16_t seg) {
     mp_drivers_ready = true;
   }
   dda_arm(master, deltas, true);
-  dda_engage();
+  // Mirrors start_cartesian_jog()'s was_active split: if the timer's
+  // already running (a live retarget spliced this segment in without a
+  // dda_stop() first -- see start_absolute_move()), just repoint the DIR
+  // pins and keep stepping; only a genuinely fresh start needs the
+  // stop-then-engage timer reset.
+  if (jog_active) {
+    dda_refresh_pins();
+  } else {
+    dda_engage();
+  }
   return true;
 }
 
@@ -1002,8 +1054,21 @@ bool start_absolute_move(float x, float y, float z, float j4_deg, long g,
     return false;
   }
 
-  motion_cancel_move();
-  dda_stop();
+  // A tracker re-targeting every tick sends a new `mp` before the previous
+  // one has finished stepping; detect that (previous path still active and
+  // still actually running) BEFORE motion_cancel_move()/dda_stop() below
+  // would clear/kill it, so the arm can be spliced onto the new path at
+  // whatever speed it's already going instead of hard-stopping and
+  // re-accelerating from MP_ACCEL_START_US every single retarget -- that
+  // stop/slow-restart cycle is what produced the sawtooth speed jerk on
+  // every retarget before this fix. A genuinely fresh start (idle, or
+  // interrupting `cj`/`m`) is untouched: it still stops and ramps from
+  // MP_ACCEL_START_US exactly as before.
+  const bool retarget_in_flight = mp_path.active && jog_active;
+  if (!retarget_in_flight) {
+    motion_cancel_move();
+    dda_stop();
+  }
 
   if (speed_us != 0) {
     dda_set_speed_us_quiet(speed_us);
@@ -1042,9 +1107,12 @@ bool start_absolute_move(float x, float y, float z, float j4_deg, long g,
   mt4_fk_tcp(&near, &start_tcp);
 
   float xy_len = 0.0f;
+  int8_t route_radius_idx = -1;
   const uint8_t num_pieces = plan_mp_xy_route(
       start_tcp.x, start_tcp.y, x, y, start_tcp.z, z, ws_j4_now, j4_deg,
-      hold_ws_orient, &near, mp_path.pieces, &xy_len);
+      hold_ws_orient, &near, retarget_in_flight,
+      retarget_in_flight ? mp_path.route_radius_idx : -1, &route_radius_idx,
+      mp_path.pieces, &xy_len);
   if (num_pieces == 0) {
     Serial.println(F("err mp route"));
     return false;
@@ -1068,12 +1136,18 @@ bool start_absolute_move(float x, float y, float z, float j4_deg, long g,
   mp_path.ej4_ws = j4_deg;
   mp_path.hold_ws_orient = hold_ws_orient;
   mp_path.num_pieces = num_pieces;
+  mp_path.route_radius_idx = route_radius_idx;
   mp_path.total_xy_len = xy_len;
   mp_path.num_segments = num_segments;
 
-  const int32_t master_total = mp_estimate_path_ticks();
-  dda_set_ramp(MP_ACCEL_START_US, dda_get_speed_us(), master_total,
-               MP_ACCEL_RAMP_TICKS);
+  const int32_t master_total = mp_estimate_path_ticks(&target);
+  if (retarget_in_flight) {
+    dda_continue_ramp(dda_get_speed_us(), MP_ACCEL_START_US, master_total,
+                      MP_ACCEL_RAMP_TICKS);
+  } else {
+    dda_set_ramp(MP_ACCEL_START_US, dda_get_speed_us(), master_total,
+                 MP_ACCEL_RAMP_TICKS);
+  }
 
   cart_jog_mode = false;
   move_done_is_mp = true;
