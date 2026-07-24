@@ -357,6 +357,33 @@ def stack_candidates(
     return out
 
 
+def select_stack_cube(
+    cands: list[CubeDetection], current_color: str | None
+) -> tuple[CubeDetection, str]:
+    """Pick from the most-abundant color among reachable candidates.
+
+    Stacking by color reads cleaner: e.g. 3 reachable red vs. 2 blue/green
+    each -> take red first. ``current_color`` is the color committed to by
+    the previous pick; as long as that color still has a reachable cube we
+    stick with it, so a scan-to-scan count tie (3 red -> 2 red/2 blue/2
+    green after one red is placed) can't bounce the pick to another color
+    before red is actually exhausted. Only once ``current_color`` has no
+    candidates left do we re-rank by abundance and commit to a new color.
+    """
+    if current_color is not None:
+        same_color = [c for c in cands if c.color == current_color]
+        if same_color:
+            return same_color[0], current_color
+    counts: dict[str, int] = {}
+    for c in cands:
+        counts[c.color] = counts.get(c.color, 0) + 1
+    best_color = max(counts, key=lambda color: counts[color])
+    for c in cands:
+        if c.color == best_color:
+            return c, best_color
+    return cands[0], cands[0].color
+
+
 def release_z_for_level(calib, level: int) -> float:
     """TCP release height: 4mm above the current stack top.
 
@@ -569,6 +596,7 @@ def main() -> int:
 
         # --- Build the stack ---------------------------------------------------
         built = 0
+        current_color: str | None = None
         for level in range(1, args.max_levels + 1):
             tz = travel_z_for_level(calib, level)
             rz = release_z_for_level(calib, level)
@@ -626,7 +654,7 @@ def main() -> int:
                         print("Resuming...")
                         continue
 
-                    cube = cands[0]
+                    cube, current_color = select_stack_cube(cands, current_color)
                     print(
                         f"\nLevel {level}: align-pick {cube.color} at "
                         f"({cube.x:.1f},{cube.y:.1f}) yaw={cube.yaw_deg:.0f}"
