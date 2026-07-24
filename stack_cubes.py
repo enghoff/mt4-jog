@@ -5,7 +5,9 @@ The stack site is a marker id passed on the CLI (required -- no default).
 Any cubes within SITE_CLEAR_MM of that marker are nudged aside along the
 marker→cube direction to CLEAR_PARK_MM (keep-clear + margin) first, preferring
 landings that stay inside the pick hull and out of the stack camera-shadow
-corridor (with open-table free slots as fallback). Each stack cube is taken
+corridor. A full-circle angle sweep backs up the primary push direction, and
+open-table free slots (or, failing those, a full annulus grid scan) are the
+fallback when nothing near the site itself qualifies. Each stack cube is taken
 with the calibrate_height centering
 sequence (yaw-pick → release → lift → rotate J4 90° → re-grip) via
 ``pick_centered``, then placed at the marker's calibrated XY by dead
@@ -101,6 +103,28 @@ STACK_SHADOW_LATERAL_PER_LEVEL_MM = 10.0
 STACK_SHADOW_ALONG_MIN_MM = 25.0
 STACK_SHADOW_ALONG_PER_LEVEL_MM = 35.0
 STACK_SHADOW_ALONG_FLOOR_MM = 90.0
+
+
+def _expanding_angles_deg(step: float = 20.0) -> tuple[float, ...]:
+    """0, then +-step, +-2*step, ... out to +-180 (a full-circle sweep that
+    tries the straightest push first)."""
+    angles = [0.0]
+    a = step
+    while a < 180.0:
+        angles.append(a)
+        angles.append(-a)
+        a += step
+    angles.append(180.0)
+    return tuple(angles)
+
+
+# Field case 2026-07-24: the old +-110 deg cap only ever tried a narrow fan
+# off the marker->cube bearing. At a corner site (marker 0) that fan mostly
+# fell outside the pick hull, leaving exactly one valid landing -- which the
+# previously-cleared cube had just taken, stranding the next clear with
+# "no reachable clear spot" even though open table space existed elsewhere
+# around the site. A full-circle sweep finds those spots.
+_CLEAR_ANGLES_DEG = _expanding_angles_deg()
 
 
 def marker_by_id(calib, marker_id: int) -> MarkerSlot:
@@ -258,9 +282,8 @@ def clear_aside_xy(
         dx, dy = sx, sy
         r = math.hypot(dx, dy) or 1.0
     ux, uy = dx / r, dy / r
-    # Cap how far we push: +60 often exits the pick hull on edge markers.
     for dist in (CLEAR_PARK_MM, CLEAR_PARK_MM + 25.0, CLEAR_PARK_MM + 45.0):
-        for angle_deg in (0.0, 35.0, -35.0, 70.0, -70.0, 110.0, -110.0):
+        for angle_deg in _CLEAR_ANGLES_DEG:
             ang = math.radians(angle_deg)
             ca, sa = math.cos(ang), math.sin(ang)
             vx, vy = ux * ca - uy * sa, ux * sa + uy * ca
@@ -274,6 +297,28 @@ def clear_aside_xy(
     return None
 
 
+def _park_grid_candidates(step_mm: float = 40.0) -> list[tuple[float, float]]:
+    """Rings of points spanning the whole reachable annulus, not just the
+    8 fixed PLACEMENT_SLOTS. Those slots double as where stock cubes for the
+    build get staged, so all 8 can be occupied (or, near a corner marker,
+    outside the pick hull) at once -- see _CLEAR_ANGLES_DEG above for the
+    matching field case. This is the fallback of last resort, so it trades
+    a few dozen cheap arithmetic checks for never reporting "no clear spot"
+    while open table space remains."""
+    pts: list[tuple[float, float]] = []
+    r = CLEAR_MIN_RADIUS_MM
+    while r <= MAX_REACH_MM:
+        steps = max(1, round(2 * math.pi * r / step_mm))
+        for i in range(steps):
+            ang = 2 * math.pi * i / steps
+            pts.append((r * math.cos(ang), r * math.sin(ang)))
+        r += step_mm
+    return pts
+
+
+_PARK_GRID = _park_grid_candidates()
+
+
 def choose_park_slot(
     scene: Scene,
     sx: float,
@@ -284,18 +329,24 @@ def choose_park_slot(
     behind_u: tuple[float, float] | None = None,
     shadow_levels: int = 8,
 ) -> tuple[float, float] | None:
-    """Nearest free open-table slot well clear of the stack site."""
+    """Nearest free open-table slot well clear of the stack site.
+
+    Prefers the fixed PLACEMENT_SLOTS (cheap, and already known to be sane
+    staging spots); falls back to a full annulus grid scan when none of
+    those are free.
+    """
     avoid = avoid or []
-    candidates = [
-        (x, y)
-        for x, y in scene.free_slots
-        if dist_mm(x, y, sx, sy) >= CLEAR_PARK_MM
-        and _clear_landing_ok(
+
+    def _valid(x: float, y: float) -> bool:
+        return dist_mm(x, y, sx, sy) >= CLEAR_PARK_MM and _clear_landing_ok(
             x, y, sx=sx, sy=sy, occupied=avoid,
             markers=markers, behind_u=behind_u,
             shadow_levels=shadow_levels,
         )
-    ]
+
+    candidates = [(x, y) for x, y in scene.free_slots if _valid(x, y)]
+    if not candidates:
+        candidates = [(x, y) for x, y in _PARK_GRID if _valid(x, y)]
     if not candidates:
         return None
     return min(candidates, key=lambda p: dist_mm(p[0], p[1], sx, sy))

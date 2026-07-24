@@ -34,6 +34,7 @@ Homed FK TCP is about **(190, 0, 226)**; J1 keep-out **140 mm**; soft ground **1
 - **Pick/place “failed” with no vision symptom** — motion planning failure, not mis-detection.
 - **Empty scene / no cubes** — arm blocking camera, wrong camera index, or cold camera frame.
 - **Serial busy** — stop MCP and other clients before flash or a second script.
+- **`stack_cubes.py`: "No reachable clear spot for <color>"** — the clear/park search came up empty near the stack site; fixed 2026-07-24 (full-circle angle sweep in `clear_aside_xy` + annulus grid fallback in `choose_park_slot`, since corner markers and 8 fixed `PLACEMENT_SLOTS` could exhaust all candidates). If it recurs, the site is likely boxed in on all sides (occupied + hull + shadow), not a hardware fault.
 
 ## Project context
 
